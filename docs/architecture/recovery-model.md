@@ -1,294 +1,138 @@
-# Recovery Model — Agent Harness
+# Recovery Model v3 — Agent Harness
 
-> **文档类型**: 架构规范
-> **版本**: v1.0
-> **日期**: 2026-07-14
-
----
-
-## 1. 恢复模型概述
-
-Agent Harness 必须在进程崩溃、系统重启、Agent 子进程异常退出等场景下保证状态一致性。恢复分为三个层次：
-
-1. **进程内恢复**：Agent 异常退出，Harness 仍在运行
-2. **进程崩溃恢复**：Harness 自身崩溃或被杀
-3. **系统重启恢复**：操作系统重启后
-
-Foundation Release 实现层次 1 和 2。层次 3 是层次 2 的自然延伸（从 SQLite 恢复）。
+> **版本**: v3.0
+> **日期**: 2026-07-15
+> **修订**: LOST vs ORPHANED, Supervisor 崩溃恢复, Operation reconciliation
 
 ---
 
-## 2. 数据恢复保证
+## 1. 两种异常类型
 
-### 2.1 从不丢失的数据
-
-- **event_log**：SQLite 中的 append-only 事件，WAL 模式保证 crash-safe
-- **audit_log**：与 event_log 在同一事务中写入
-- **已保存的 commit hash**：写入 event_log 前已在 Git 中创建
-
-### 2.2 可能丢失的数据
-
-- **Agent Stream Event**：未及时持久化的 Agent 输出（丢失最后几秒）
-- **agent_events 表**：与 event_log 不是同一事务（性能考虑）
-- **文件系统日志**：Agent transcript 的临时文件
-
-### 2.3 可以完全重建的数据
-
-- **projections**：从 event_log 完全重建
-- **agent_events**：从 Agent transcript 日志文件重建（如有）
+| 类型 | 原因 | 谁检测 | Agent 子进程 | 恢复方式 |
+|------|------|--------|-------------|---------|
+| **ORPHANED** | Agent 子进程自身异常退出 | Supervisor (仍在运行) | 已退出 | 同 Execution chain: retry 或 fail |
+| **LOST** | Supervisor 崩溃 | 新 Supervisor (启动时) | 被 watchdog 终止 | 新建 Execution + `--resume` (保存的 native_session_id) |
 
 ---
 
-## 3. Reconciliation 流程
+## 2. Supervisor 崩溃恢复
 
-### 3.1 触发条件
+### 2.1 假设
 
-- Harness 进程启动
-- `harness resume` 命令
-- 检测到子进程异常退出（SIGCHLD / process.on('exit')）
+- **不能重新接管仍存活的 Agent 子进程** — stdin/stdout pipe 已断开
+- Agent 子进程通过 watchdog 终止
+- 如果 supervisor 崩溃, Agent 子进程**必定**被终止
 
-### 3.2 恢复步骤
+### 2.2 恢复流程
 
-```typescript
-async function reconcile(state: AppState): Promise<ReconciliationReport> {
-  const report: ReconciliationReport = { orphanedTasks: [], recoveredTasks: [], failedTasks: [] };
+```
+1. 用户执行 harness attach {run_id}
+2. 检测 supervisor.json:
+   a. PID 不存在 → supervisor 已崩溃
+3. 新 supervisor 启动
+4. 读取 SQLite current_state
+5. Reconciliation:
+   a. 查询 execution_attempts WHERE lifecycle IN ('CREATED', 'RUNNING')
+   b. 对每个:
+      → lifecycle = LOST
+      → 原因 = 'supervisor_crash'
+   c. 对每个关联的 WorkspaceLease:
+      → lifecycle = EXPIRED
+6. 对每个 LOST Execution:
+   a. retry_count < max:
+      → 创建新 Execution Attempt (attempt_number + 1)
+      → 设置 native_session_id = 旧 Execution 的 session_id
+      → 新 Execution → CREATED → RUNNING (--resume)
+   b. retry_count ≥ max:
+      → Execution → FAILED
+      → Task → FAILED
+7. 清理 orphan worktree (参见 git-workspace-model.md §4)
+8. 新 supervisor 写入 supervisor.json
+9. 继续正常运作
+```
 
-  // 1. 查询所有非终端状态的 Project
-  const activeProjects = await projectionRepo.getNonTerminalProjects();
+### 2.3 Watchdog 机制
 
-  for (const project of activeProjects) {
-    // 2. 查询该 Project 下所有非终端状态的 Task
-    const activeTasks = await projectionRepo.getNonTerminalTasks(project.id);
+```
+Supervisor 启动 → spawn watchdog 子进程
 
-    for (const task of activeTasks) {
-      switch (task.status) {
-        case "LEASED":
-        case "RUNNING": {
-          // 3. 检查子进程是否仍存活
-          const isAlive = await processManager.isProcessAlive(task.lastKnownPid);
-          if (!isAlive) {
-            await transitionService.transitionTask(task.id, "ORPHANED", {
-              actor: "system",
-              reason: `Process ${task.lastKnownPid} not found during reconciliation`,
-              idempotencyKey: `reconcile-orphan-${task.id}-${Date.now()}`
-            });
+Watchdog:
+  - 唯一职责: 检测父进程 (supervisor) 是否存活
+  - 不操作 SQLite, Git, Adapter
+  - 父进程死亡 → 枚举 Agent 子进程 (从 execution_attempts 表 + 进程树)
+    → SIGTERM → 5s timeout → SIGKILL
+  - Windows: Job Object 自动终止 (不依赖 watchdog)
+  - 退出
 
-            // 4. 决定是否重试
-            if (task.retryCount < task.maxRetries) {
-              await transitionService.transitionTask(task.id, "READY", {
-                actor: "system",
-                reason: "Orphaned task returned to READY for retry",
-                idempotencyKey: `reconcile-retry-${task.id}-${Date.now()}`
-              });
-              report.recoveredTasks.push(task.id);
-            } else {
-              await transitionService.transitionTask(task.id, "FAILED_TERMINAL", {
-                actor: "system",
-                reason: `Max retries (${task.maxRetries}) exhausted`,
-                idempotencyKey: `reconcile-terminal-${task.id}-${Date.now()}`
-              });
-              report.failedTasks.push(task.id);
-            }
-          }
-          break;
-        }
-
-        case "VERIFYING":
-        case "COMMITTING":
-        case "MERGING": {
-          // 5. 检查是否有部分完成的工作
-          const checkpoint = await checkpointStore.getLatest(task.id);
-          if (checkpoint) {
-            // 从中断点继续
-            await resumeFromCheckpoint(task, checkpoint);
-            report.recoveredTasks.push(task.id);
-          } else {
-            // 回退到安全状态
-            await transitionService.transitionTask(task.id, "SUBMITTED", {
-              actor: "system",
-              reason: "Interrupted during critical phase, rolling back to SUBMITTED",
-              idempotencyKey: `reconcile-rollback-${task.id}-${Date.now()}`
-            });
-            report.recoveredTasks.push(task.id);
-          }
-          break;
-        }
-      }
-    }
-
-    // 6. 更新 Project 状态
-    await reconcileProjectStatus(project.id);
-  }
-
-  return report;
-}
+Agent 子进程全部终止 → Execution → LOST
 ```
 
 ---
 
-## 4. Checkpoint 策略
+## 3. Operation Reconciliation
 
-### 4.1 检查点触发时机
-
-- 任务状态变为 `VERIFIED` 时
-- 任务状态变为 `COMMITTED` 时
-- 任务状态变为 `MERGED` 时
-- 每 N 分钟心跳（对长时间运行的 RUNNING 任务）
-- 用户请求暂停时
-
-### 4.2 检查点内容
-
-```typescript
-interface Checkpoint {
-  id: string;
-  projectId: string;
-  taskId: string;
-  createdAt: string;
-
-  // 当前状态
-  projectStatus: ProjectStatus;
-  taskStatus: TaskStatus;
-
-  // 关键数据引用
-  commitHash?: string;
-  verificationEvidenceRefs: string[];
-  workspaceLeaseId?: string;
-
-  // 恢复信息
-  lastCompletedStep: string;      // 上一个成功完成的操作名
-  nextStep: string;                // 下一个要执行的操作名
-  resumeData: Record<string, unknown>;  // 步骤特定的恢复数据
-
-  // Agent 状态（如适用）
-  agentSessionId?: string;
-  nativeSessionId?: string;
-
-  // Git 状态
-  branchName?: string;
-  worktreePath?: string;
-  baseCommitHash?: string;
-}
-```
-
-### 4.3 检查点保存
+### 3.1 长期 PENDING/RUNNING Operations
 
 ```
-.harness/checkpoints/{projectId}/{taskId}/
-├── v001_verified.json
-├── v002_committed.json
-├── v003_merged.json
-└── latest.json              # 指向最新版本的符号链接或副本
+启动时:
+  SELECT * FROM operations
+  WHERE status IN ('PENDING', 'RUNNING')
+    AND started_at < datetime('now', '-60 seconds')
+
+对每个:
+  git_commit operation:
+    → git log --grep "harness-operation-id: {id}"
+    → 找到 commit → UPDATE COMPLETED + commit_hash
+    → 未找到 → 检查 worktree 状态 → 重试或 FAILED
+
+  git_merge / git_cherry_pick operation:
+    → git branch --contains {commit_hash}
+    → 包含 → UPDATE COMPLETED
+    → 不包含 → 重试或 FAILED
+
+  acceptance_check operation:
+    → 检查测试输出文件是否存在
+    → 存在 + exit code 已知 → UPDATE COMPLETED/FAILED
+    → 不存在 → 重试
+```
+
+### 3.2 幂等重试
+
+```
+重试执行前:
+  1. 检查 operation 是否已 COMPLETED (可能被之前的 reconciliation 完成)
+  2. 检查外部是否有完成证据 (git trailer, test output)
+  3. 有证据 → 补充数据库记录
+  4. 无证据 → 重新执行 (幂等操作)
 ```
 
 ---
 
-## 5. 进程管理器
-
-### 5.1 子进程注册
-
-```typescript
-class ProcessManager {
-  /** 启动 Agent 子进程 */
-  async spawn(
-    taskId: string,
-    adapter: AgentAdapter,
-    session: AgentSession,
-    options: SpawnOptions
-  ): Promise<ProcessHandle>;
-
-  /** 检查进程是否存活 */
-  async isProcessAlive(pid: number): Promise<boolean>;
-
-  /** 通过 taskId 终止进程（先 SIGTERM，超时后 SIGKILL） */
-  async terminate(taskId: string, gracefulTimeoutMs?: number): Promise<void>;
-
-  /** 强制终止进程（SIGKILL，不做优雅清理） */
-  async kill(pid: number): Promise<void>;
-
-  /** 列出所有已知的活跃子进程 */
-  listActiveProcesses(): ProcessInfo[];
-
-  /** 终止所有已知的活跃子进程（用于 shutdown） */
-  async killAll(timeoutMs?: number): Promise<void>;
-}
-```
-
-### 5.2 子进程健康监控
-
-- 每 N 秒检查进程是否存活（通过 pid + OS API）
-- 如果进程已退出但任务状态仍为 RUNNING → 触发 reconciliation
-- 超时 → 发送 SIGTERM → 等待 graceful timeout → SIGKILL → 触发 reconciliation
-
----
-
-## 6. 幂等操作保证
-
-### 6.1 需要幂等的操作
-
-| 操作 | 幂等策略 |
-|------|---------|
-| Git worktree 创建 | 检查目录是否已存在且配置正确 |
-| Git commit | 检查是否已存在相同内容的 commit |
-| Git merge | 检查目标分支是否已包含源分支 |
-| 状态转换 | idempotencyKey 去重 |
-| 文件创建 | 检查文件是否已存在且内容一致 |
-| Acceptance check 执行 | 检查是否已有相同参数的结果 |
-
-### 6.2 Idempotency Key 格式
+## 4. 数据库成功但外部失败 — 处理
 
 ```
-{operation}-{resource_id}-{timestamp_or_nonce}
+Scenario: Phase 3 COMMIT 成功 (operations SET COMPLETED), 但 git 实际未完成
 
-示例:
-  transition-task-TASK-014-20260714-001
-  git-commit-TASK-014-a1b2c3d4
-  verify-TASK-014-run1
+原因: 少见 — Phase 3 只做数据库写入。如果是 Phase 2 极早退出:
+  - git 操作返回成功但实际未落盘 → 这是 git 自身的保证
+  - 如果 git 返回失败 → Phase 3 记录 FAILED
+
+如果在 Phase 2 和 Phase 3 之间崩溃:
+  - Operation 状态 = RUNNING (Phase 1 写入)
+  - Reconciliation → 检测到操作未完成 → 重试 (幂等)
 ```
 
 ---
 
-## 7. 崩溃场景矩阵
-
-| 崩溃时机 | 影响 | 恢复方式 |
-|---------|------|---------|
-| Agent 正在执行 (RUNNING) | 子进程退出，部分文件已修改 | reconciliation → ORPHANED → READY（重试） |
-| Agent 刚返回结果 (SUBMITTED) | TaskResult 已保存 | 从 SUBMITTED 继续 → VERIFYING |
-| 验收检查执行中 (VERIFYING) | 部分检查可能已执行 | 重新执行全部验收检查（幂等） |
-| Git commit 执行中 (COMMITTING) | commit 可能已创建也可能未创建 | 检查是否存在 → 有则继续，无则重做 |
-| Merge 执行中 (MERGING) | 合并可能部分完成 | 检查分支状态 → 恢复或回滚 |
-| Harness 自身崩溃 | 所有状态在 SQLite | 启动时全量 reconciliation |
-| 系统断电 | SQLite WAL 保证 event_log 完整 | 启动时重放 WAL → reconciliation |
-
----
-
-## 8. 数据完整性
-
-### 8.1 SQLite WAL 模式
-
-```sql
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
-PRAGMA foreign_keys=ON;
-```
-
-WAL 模式保证：崩溃后数据库不损坏，已提交的事务不丢失。
-
-### 8.2 事务边界
-
-- 每个 Command → Domain Event(s) → Projection update 在一个 SQLite 事务中
-- Git 操作不在数据库中事务化（Git 自身保证原子性）
-- Agent Stream Event 的持久化在单独事务中（允许少量丢失）
-
-### 8.3 不变量检查
-
-恢复完成后执行不变量检查：
+## 5. 并发 Execution 恢复
 
 ```
-✅ 所有非终端 Task 的依赖任务都是 MERGED
-✅ 所有 LEASED Task 有唯一有效的 WorkspaceLease
-✅ 所有 MERGED Task 有非空 commitHash
-✅ Project 状态与其所有 Task 状态一致
-✅ 没有两个 Task 持有相同路径的活跃 WorkspaceLease
-```
+Task A: Execution 1 LOST → 新 Execution 2 (--resume)
+Task B: Execution 1 COMPLETED (正常完成)
 
-不变量失败 → 记录 CRITICAL 日志 → 尝试自动修复 → 无法修复则标记 Project 为 FAILED
+恢复:
+  Task A: 新 Execution 开始 → 从 SQLite 读取 native_session_id → --resume
+  Task B: 已 COMPLETED → 继续 SUBMITTED → VERIFIED 流程
+
+Task A 和 B 的恢复独立，不互相影响
+```

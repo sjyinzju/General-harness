@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/harness-core",
+    "crates/harness-runtime",
+    "crates/harness-adapters",
+    "crates/harness-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.80"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+unwrap_used = "warn"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

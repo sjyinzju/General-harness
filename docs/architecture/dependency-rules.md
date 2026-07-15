@@ -1,157 +1,115 @@
-# Dependency Rules — Agent Harness
+# Dependency Rules (Revised) — Agent Harness
 
-> **文档类型**: 架构规范
-> **版本**: v1.0
-> **日期**: 2026-07-14
-
----
-
-## 1. 概述
-
-本文档定义了 Agent Harness 代码库中各层之间的依赖规则。这些规则通过架构设计强制执行，并应在 CI 中通过 lint 规则验证。
+> **版本**: v2.0
+> **日期**: 2026-07-15
+> **修订**: Rust Cargo workspace crates 依赖规则
 
 ---
 
-## 2. 核心规则
-
-### 规则 1：严格分层依赖
+## 1. Crate 依赖图
 
 ```
-依赖只能从上向下：
-
-cli ──────────────┐
-local-api ────────┤
-                  ▼
-infrastructure ───┐
-                  ▼
-application ──────┐
-                  ▼
-domain (contracts + fsm + policies)
+testing-kit ──→ harness-core ←── harness-runtime ←── harness-cli
+                    ↑                  ↑
+                    │                  │
+            harness-adapters ──────────┘
 ```
 
-**具体约束**：
-- `domain/` **禁止**引用任何其他层
-- `application/` **只能**引用 `domain/`
-- `infrastructure/` **只能**引用 `application/` 和 `domain/`
-- `cli/` **只能**引用 `infrastructure/` 和 `local-api/`
-- `local-api/` **只能**引用 `application/`
-- `testing-kit/` **只能**引用 `domain/contracts/`
+## 2. 规则
 
-### 规则 2：Contract 优先
+### Rule 1: harness-core 零外部依赖
 
-- 所有跨层通信**必须**通过 `domain/contracts/` 中定义的接口
-- 具体实现类**不得**被其他层直接 import
-- 使用 interface + 依赖注入，而不是 concrete class import
+`harness-core` 只能依赖：
+- `serde`, `serde_json` (序列化)
+- `chrono` (时间类型)
+- `uuid` (ID 生成)
+- `thiserror` (错误类型)
+- `async_trait` (异步 trait)
 
-**示例**：
-```typescript
-// ✅ 正确：application 使用 domain 接口
-import { AgentAdapter } from '../../domain/contracts/AgentAdapter.js';
-class ProcessManager {
-  constructor(private adapter: AgentAdapter) {}
-}
+**禁止**依赖：`rusqlite`, `tokio` (仅 `async_trait` 宏), `git2`, `ratatui`, `crossterm`
 
-// ❌ 错误：application 直接引用 infrastructure 实现
-import { CodexSdkAdapter } from '../../infrastructure/adapters/codex/CodexSdkAdapter.js';
-```
+### Rule 2: Adapter 只通过 Trait 引用
 
-### 规则 3：禁止循环依赖
+`harness-runtime` 通过 `AgentAdapter` trait 使用 Adapter。**禁止** import 具体 Adapter struct。
 
-- 任何两个模块之间**禁止**相互 import
-- 如果 A import B，则 B 不得 import A（直接或传递）
-- 使用依赖倒转（DIP）打破循环
+### Rule 3: 无循环依赖
 
-### 规则 4：Domain 零依赖
+Cargo 编译检查自动防止。PR CI 中不需要额外工具。
 
-`domain/` 目录只能依赖：
-- TypeScript 标准类型
-- Zod（仅用于 Schema 定义和运行时校验）
-- Node.js 标准库中的纯类型（如 `Buffer`、`Error`）
+### Rule 4: 无字符串分发
 
-**禁止**依赖：
-- 文件系统（`fs`, `path`）
-- 网络（`http`, `net`）
-- 数据库驱动
-- 子进程管理
-- 任何第三方服务 SDK
+**禁止**通过 agent/adapter 名称字符串做 `match` / `if-else`：
 
-### 规则 5：避免字符串分发
-
-**禁止**通过 agent name 字符串做 if-else：
-
-```typescript
+```rust
 // ❌ 禁止
-if (profile.agentKind === "claude-code") {
-  // 特殊处理
-} else if (profile.agentKind === "codex") {
-  // 特殊处理
+match profile.agent_kind.as_str() {
+    "claude-code" => { /* special */ }
+    "codex" => { /* special */ }
+    _ => {}
 }
 
-// ✅ 正确：通过 RuntimeProfile + AgentAdapter 接口多态
-const adapter = this.adapterRegistry.getAdapter(profile.adapterKind);
-await adapter.sendTask(session, envelope);
+// ✅ 正确：通过 AdapterRegistry + AgentAdapter trait 多态
+let adapter = registry.get(&profile.adapter_kind)?;
+adapter.start_session(&profile, &opts).await
 ```
 
-唯一的例外：`AgentDiscoveryService` 和 Adapter 工厂方法中使用 `adapterKind` 做路由（因为这是工厂的固有职责）。
+唯一例外：Adapter 工厂和 AgentDiscoveryService。
 
-### 规则 6：无隐式全局状态
+### Rule 5: 无隐式全局状态
 
-- 所有模块**不得**依赖隐式全局变量或单例
-- 需要共享状态时，通过显式的依赖注入传入
-- SQLite 连接、配置对象等通过构造函数注入
+- 所有状态通过显式参数或依赖注入传递
+- 禁止 `lazy_static!` / `once_cell::sync::Lazy` 保存可变状态
+- 配置对象通过 `Arc<Config>` 在初始化时注入
 
-### 规则 7：Schema 边界
+### Rule 6: Schema 边界
 
-- 所有跨模块/跨进程的数据**必须**经过 Zod Schema 校验
-- 从 Agent 子进程接收的数据**必须**在校验后才进入 domain 模型
-- 从 SQLite 读取的数据**必须**在校验后才返回给调用方
+- 所有跨 crate 的数据类型实现 `Serialize + Deserialize`
+- 从 Agent 子进程接收的 JSON 必须经过 `serde_json::from_str::<T>()` 校验
+- 从 SQLite 读取的 JSON 字段必须经过反序列化校验
+- 使用 `#[serde(deny_unknown_fields)]` 防止未识别的字段静默通过
+
+### Rule 7: Trait 必须有调用方
+
+- 每个 `pub trait` 至少有一个实现 + 一个调用方 **或** 在 testing-kit 中有 contract test
+- 每个 `pub fn` 至少被一个测试调用
+- **禁止** "为未来准备的" trait 方法
 
 ---
 
-## 3. enforcement（执行）
+## 3. CI 强制
 
-### ESLint Rules
-
-```json
-{
-  "rules": {
-    "import/no-cycle": "error",
-    "import/no-self-import": "error",
-    "no-restricted-imports": [
-      "error",
-      {
-        "patterns": [
-          {
-            "group": ["../../../infrastructure/*"],
-            "message": "domain/ 不得引用 infrastructure/"
-          }
-        ]
-      }
-    ]
-  }
-}
+```toml
+# 通过 Cargo.toml 的 [dependencies] 自动强制执行依赖规则
+# harness-core/Cargo.toml — 不包含 rusqlite, tokio, git2
+# harness-runtime/Cargo.toml — 不包含 harness-adapters, harness-cli
 ```
 
-### Project References 检查
+```yaml
+# CI: 检查无用依赖
+- name: Check unused dependencies
+  run: cargo udeps --all-targets
 
-未来如果引入 TypeScript Project References，通过 `tsc --build` 自动验证分层。
-
-### Code Review Checklist
-
-- [ ] 新 import 是否跨越了禁止的层级？
-- [ ] 是否通过字符串判断 Agent 类型？
-- [ ] 跨模块数据是否经过 Schema 校验？
-- [ ] 是否有隐式的全局状态依赖？
-- [ ] import 图是否引入了循环？
+# CI: 检查循环依赖 (Cargo 编译时自动检测)
+- name: Build check
+  run: cargo check --workspace
+```
 
 ---
 
-## 4. 例外情况
+## 4. 例外登记
 
-| 例外 | 条件 | 审批 |
-|------|------|------|
-| `testing-kit/` 引用具体 Adapter | 仅用于集成测试 fixture | ADR 记录 |
-| `infrastructure/adapters/` 内部共享工具类 | 同一类 Adapter 之间（如同在 `codex/` 内） | 代码审查 |
-| CLI 中硬编码 Adapter 注册 | Foundation Release 期间 | 后续版本改为配置驱动 |
+| 例外 | 条件 | ADR |
+|------|------|-----|
+| Adapter 工厂中 `match adapter_kind` | 仅在 `harness-adapters/src/mod.rs` 注册处 | ADR-004 |
+| `AgentDiscoveryService` 调用具体检测方法 | 发现阶段的特例 | ADR-004 |
+| Sidecar 子进程（未来） | 需要 TypeScript/Python runtime 时 | 需要新 ADR |
 
-所有例外必须在 ADR 中记录，并注明移除条件。
+---
+
+## 5. 未来 Crate 添加规则
+
+添加第 5+ 个 crate 前：
+1. 写 ADR 说明为什么不能放在现有 4 个 crate 中
+2. 明确依赖方向（依赖 haram-core 和/或 harness-runtime）
+3. 检查不会引入循环依赖
+4. Foundation Release 中不允许超过 6 个 crate

@@ -274,7 +274,8 @@ Foundation Release 实现的 Adapter：
 ├─────────────────────────────────────────────────────────────┤
 │  定义边界但不在 Foundation 实现：                              │
 │  - ClaudeSdkAdapter   (需解决 SDK 认证 ≠ CLI 登录的问题)       │
-│  - CodexAppServerAdapter (Deep Integration，后续版本)         │
+│  - CodexCliAdapter (`codex exec --json`, 当前版本)            │
+│  - CodexAppServerAdapter (Deep Integration via app-server, 后续版本) │
 │  - AcpAdapter          (标准化 ACP 协议，后续版本)             │
 │  - GeminiAdapter       (后续版本)                             │
 │  - PtyAdapter          (最后兼容手段，后续版本)                │

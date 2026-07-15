@@ -1,300 +1,274 @@
-# Container & Module Design — Agent Harness
+# Container & Module Design (Revised) — Agent Harness
 
-> **文档类型**: 架构文档 (C4 Level 2)
-> **版本**: v1.0
-> **日期**: 2026-07-14
-
----
-
-## 1. 设计目标
-
-- **长期可维护**：模块边界清晰，依赖方向严格单向
-- **可测试**：核心逻辑不依赖外部进程、文件系统或数据库
-- **可扩展**：新 Agent Adapter 可以通过实现契约接口添加
-- **单一进程**：Foundation Release 整个 Harness 作为单个 Node.js 进程运行
+> **版本**: v2.0
+> **日期**: 2026-07-15
+> **修订**: Rust 实现，Cargo workspace crates，替换单 TypeScript package
 
 ---
 
-## 2. 容器视图
+## 1. Cargo Workspace 结构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Agent Harness Process                    │
-│                      (Single Node.js)                        │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌───────────────────────────────────────────────────────┐ │
-│  │                    CLI / Local API                     │ │
-│  │  (用户界面层 - 唯一的入口点)                             │ │
-│  └────────────────────────┬──────────────────────────────┘ │
-│                           │                                 │
-│  ┌────────────────────────▼──────────────────────────────┐ │
-│  │               Application Layer                        │ │
-│  │  ┌──────────┐ ┌──────────┐ ┌───────────────────────┐ │ │
-│  │  │ Command   │ │ Services │ │ Orchestration          │ │ │
-│  │  │ Handlers  │ │(Scheduler│ │ (FakePlanningProvider) │ │ │
-│  │  │           │ │ Verifier │ │                        │ │ │
-│  │  └──────────┘ └──────────┘ └───────────────────────┘ │ │
-│  └────────────────────────┬──────────────────────────────┘ │
-│                           │                                 │
-│  ┌────────────────────────▼──────────────────────────────┐ │
-│  │               Domain Layer                             │ │
-│  │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐  │ │
-│  │  │ Contracts    │ │ State Machine│ │ Policies     │  │ │
-│  │  │ (接口+类型)   │ │ (21+17状态)  │ │(类型定义)     │  │ │
-│  │  └──────────────┘ └──────────────┘ └──────────────┘  │ │
-│  └────────────────────────┬──────────────────────────────┘ │
-│                           │                                 │
-│  ┌────────────────────────▼──────────────────────────────┐ │
-│  │               Infrastructure Layer                     │ │
-│  │  ┌──────────┐ ┌────────────┐ ┌────────────────────┐  │ │
-│  │  │Persistence│ │ Adapters   │ │ Workspace + Process│  │ │
-│  │  │(SQLite)  │ │(Fake/Codex/│ │(Worktree, Lease,   │  │ │
-│  │  │          │ │ Claude CLI)│ │ ProcessManager)    │  │ │
-│  │  └──────────┘ └────────────┘ └────────────────────┘  │ │
-│  │  ┌──────────┐ ┌────────────┐ ┌────────────────────┐  │ │
-│  │  │Policy    │ │ Discovery  │ │ Logging            │  │ │
-│  │  │Engine    │ │(Agent      │ │(StructuredLogger)  │  │ │
-│  │  │          │ │ Discovery) │ │                    │  │ │
-│  │  └──────────┘ └────────────┘ └────────────────────┘  │ │
-│  └───────────────────────────────────────────────────────┘ │
-│                                                             │
-│  ┌───────────────────────────────────────────────────────┐ │
-│  │                  Testing Kit                           │ │
-│  │  (AdapterContractTest, FakeAgentFactory, TestFixtures) │ │
-│  └───────────────────────────────────────────────────────┘ │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 3. 模块详细设计
-
-### 3.1 Domain Layer (`src/domain/`)
-
-**不依赖任何外部系统或库（仅 TypeScript + Zod）**
-
-```
-domain/
-├── contracts/                    # 核心接口和类型
-│   ├── AgentAdapter.ts           # AgentAdapter 接口
-│   ├── AgentIdentity.ts          # AgentIdentity, AgentKind
-│   ├── RuntimeProfile.ts         # RuntimeProfile, CapabilitySet, ProbeResult
-│   ├── TaskEnvelope.ts           # TaskEnvelope, FileScope
-│   ├── TaskResult.ts             # TaskResult (Worker 返回的声明)
-│   ├── GoalContract.ts           # GoalContractVersion, ChangeRequest
-│   ├── Project.ts                # Project, ProjectStatus
-│   ├── Task.ts                   # Task, TaskStatus, TaskDependency
-│   ├── Workspace.ts              # Workspace, WorkspaceLease
-│   ├── Artifact.ts               # Artifact, ArtifactReference
-│   ├── DomainEvent.ts            # DomainEvent, EventEnvelope, Command
-│   ├── AgentEvent.ts             # AgentEvent, AgentToolEvent
-│   ├── AcceptanceCheck.ts        # AcceptanceCheck
-│   ├── VerificationEvidence.ts   # VerificationEvidence
-│   ├── ApprovalRequest.ts        # ApprovalRequest
-│   ├── Checkpoint.ts             # Checkpoint
-│   └── index.ts                  # barrel export
-
-├── state-machine/                # 纯函数状态机
-│   ├── project-fsm.ts            # 项目级 FSM
-│   ├── task-fsm.ts               # 任务级 FSM
-│   └── transition-rules.ts       # 转换规则定义
-
-└── policies/                     # 策略类型定义
-    ├── BudgetPolicy.ts
-    ├── PermissionPolicy.ts
-    ├── CommandPolicy.ts
-    └── FileScopePolicy.ts
-```
-
-### 3.2 Application Layer (`src/application/`)
-
-**依赖 domain/contracts、domain/state-machine、domain/policies**
-
-```
-application/
-├── commands/                     # Command Handler (每个 command 一个文件)
-│   ├── create-project.ts
-│   ├── create-goal-contract.ts
-│   ├── approve-plan.ts
-│   ├── dispatch-task.ts
-│   ├── submit-task-result.ts
-│   ├── verify-task.ts
-│   ├── commit-task.ts
-│   ├── merge-task.ts
-│   └── cancel-project.ts
-
-├── services/                     # 应用服务
-│   ├── transition-service.ts     # 唯一的状态转换入口
-│   ├── scheduler.ts              # DAG 拓扑排序 + 就绪任务判定
-│   ├── verification.ts           # 验收检查执行
-│   ├── reconciliation.ts         # 崩溃恢复协调
-│   └── event-publisher.ts        # 事件发布（内存）
-
-└── orchestration/                # 编排（Foundation: 简单确定性实现）
-    └── fake-planning-provider.ts  # 返回手工 Task DAG
-```
-
-### 3.3 Infrastructure Layer (`src/infrastructure/`)
-
-**依赖 application + domain**
-
-```
-infrastructure/
-├── persistence/
-│   ├── sqlite/
-│   │   ├── connection.ts         # SQLite 连接管理
-│   │   ├── event-store.ts        # Append-only event log
-│   │   ├── projections.ts        # Current state projection
-│   │   ├── audit-store.ts        # 审计日志
-│   │   ├── agent-event-store.ts  # Agent 运行时事件
-│   │   └── migrations/
-│   │       ├── 001_initial.ts
-│   │       └── index.ts          # Migration runner
-│   └── file/
-│       ├── checkpoint-store.ts
-│       ├── artifact-store.ts
-│       └── log-store.ts
-
-├── adapters/
-│   ├── fake/
-│   │   └── FakeAgentAdapter.ts   # 可脚本化控制的测试 Adapter
-│   ├── codex/
-│   │   └── CodexSdkAdapter.ts    # Codex SDK 子进程 Adapter
-│   └── claude/
-│       └── ClaudeCliAdapter.ts   # Claude stream-json Adapter
-
-├── workspace/
-│   ├── WorktreeManager.ts        # git worktree 生命周期
-│   ├── WorkspaceLease.ts         # 租约管理（防并发）
-│   └── GitInspector.ts           # git status/diff/log 查询
-
-├── process/
-│   ├── ProcessManager.ts         # 子进程管理
-│   └── cancellation.ts           # 超时 + 取消传播
-
-├── policy-engine/
-│   ├── CommandPolicyEngine.ts    # 命令过滤
-│   ├── FileScopeValidator.ts     # 路径验证
-│   └── SecretScanner.ts          # 密钥扫描
-
-├── discovery/
-│   └── AgentDiscoveryService.ts  # Agent 扫描 + 探测
-
-└── logging/
-    └── StructuredLogger.ts       # JSON 格式日志
-```
-
-### 3.4 CLI Layer (`src/cli/`)
-
-**依赖 infrastructure**
-
-```
-cli/
-├── main.ts                       # 入口 + 命令路由
-├── commands/
-│   ├── run.ts                    # harness run
-│   ├── status.ts                 # harness status
-│   ├── approve.ts                # harness approve
-│   ├── cancel.ts                 # harness cancel
-│   └── config.ts                 # harness config
-└── output.ts                     # 终端输出格式化
-```
-
-### 3.5 Local API (`src/local-api/`)
-
-**依赖 application**
-
-```
-local-api/
-└── HarnessApi.ts                 # 内部 API facade（供测试 + 未来 TUI/HTTP）
-```
-
-### 3.6 Testing Kit (`src/testing-kit/`)
-
-**依赖 domain/contracts**
-
-```
-testing-kit/
-├── AdapterContractTest.ts        # Adapter 契约测试套件
-├── FakeAgentFactory.ts           # FakeAdapter 工厂辅助
-└── TestFixtures.ts               # 共享测试数据
+harness/
+├── Cargo.toml                    # workspace root
+├── crates/
+│   ├── harness-core/             # 领域模型 + 契约
+│   │   ├── Cargo.toml            # 依赖: serde, serde_json, chrono, uuid
+│   │   └── src/
+│   │       ├── contracts/        # 接口 & 类型
+│   │       │   ├── mod.rs
+│   │       │   ├── agent_adapter.rs
+│   │       │   ├── runtime_profile.rs
+│   │       │   ├── task_envelope.rs
+│   │       │   ├── task_result.rs
+│   │       │   ├── goal_contract.rs
+│   │       │   ├── project.rs
+│   │       │   ├── task.rs
+│   │       │   ├── workspace.rs
+│   │       │   ├── agent_event.rs
+│   │       │   ├── domain_event.rs
+│   │       │   └── acceptance_check.rs
+│   │       ├── state_machine/    # 状态机（纯函数）
+│   │       │   ├── mod.rs
+│   │       │   ├── project_fsm.rs
+│   │       │   ├── task_fsm.rs
+│   │       │   └── transition_rules.rs
+│   │       └── policies/         # 策略类型
+│   │           ├── mod.rs
+│   │           ├── budget.rs
+│   │           ├── command.rs
+│   │           └── file_scope.rs
+│   │
+│   ├── harness-runtime/          # 应用 + 基础设施
+│   │   ├── Cargo.toml            # 依赖: harness-core, rusqlite, tokio, git2
+│   │   └── src/
+│   │       ├── persistence/      # SQLite (current-state + event log)
+│   │       │   ├── mod.rs
+│   │       │   ├── connection.rs
+│   │       │   ├── event_store.rs
+│   │       │   ├── project_repo.rs
+│   │       │   ├── task_repo.rs
+│   │       │   ├── profile_repo.rs
+│   │       │   ├── audit_store.rs
+│   │       │   └── migrations/
+│   │       ├── scheduler/        # DAG + 调度
+│   │       │   ├── mod.rs
+│   │       │   ├── dag.rs
+│   │       │   └── dispatcher.rs
+│   │       ├── process/          # 子进程管理
+│   │       │   ├── mod.rs
+│   │       │   ├── manager.rs
+│   │       │   └── cancellation.rs
+│   │       ├── workspace/        # Git worktree
+│   │       │   ├── mod.rs
+│   │       │   ├── worktree.rs
+│   │       │   ├── lease.rs
+│   │       │   └── git_inspector.rs
+│   │       ├── verification/     # 验收
+│   │       │   ├── mod.rs
+│   │       │   ├── checks.rs
+│   │       │   └── diff_inspector.rs
+│   │       ├── policy_engine/    # 策略执行
+│   │       │   ├── mod.rs
+│   │       │   ├── command_filter.rs
+│   │       │   ├── path_validator.rs
+│   │       │   └── secret_scanner.rs
+│   │       ├── recovery/         # 崩溃恢复
+│   │       │   ├── mod.rs
+│   │       │   └── reconciliation.rs
+│   │       ├── checkpoint/       # 检查点
+│   │       │   └── mod.rs
+│   │       └── logging/          # 结构化日志
+│   │           └── mod.rs
+│   │
+│   ├── harness-adapters/         # Agent Adapter 实现
+│   │   ├── Cargo.toml            # 依赖: harness-core, tokio, serde_json
+│   │   └── src/
+│   │       ├── mod.rs            # AdapterRegistry
+│   │       ├── fake/             # FakeAgentAdapter
+│   │       │   ├── mod.rs
+│   │       │   └── adapter.rs
+│   │       ├── claude_cli/       # ClaudeCliAdapter
+│   │       │   ├── mod.rs
+│   │       │   ├── adapter.rs
+│   │       │   └── stream_json.rs
+│   │       ├── codex_cli/        # CodexCliAdapter
+│   │       │   ├── mod.rs
+│   │       │   ├── adapter.rs
+│   │       │   └── jsonl.rs
+│   │       └── discovery/        # AgentDiscoveryService
+│   │           ├── mod.rs
+│   │           ├── scanner.rs
+│   │           └── probe.rs
+│   │
+│   ├── harness-cli/              # CLI + Interactive Shell
+│   │   ├── Cargo.toml            # 依赖: harness-runtime, harness-adapters, ratatui, crossterm
+│   │   └── src/
+│   │       ├── main.rs           # 入口点
+│   │       ├── commands/         # 命令处理器
+│   │       │   ├── mod.rs
+│   │       │   ├── run.rs
+│   │       │   ├── attach.rs
+│   │       │   ├── status.rs
+│   │       │   ├── approve.rs
+│   │       │   ├── pause.rs
+│   │       │   ├── resume.rs
+│   │       │   ├── cancel.rs
+│   │       │   └── config.rs
+│   │       ├── interactive/      # 交互式 Shell
+│   │       │   ├── mod.rs
+│   │       │   ├── app.rs
+│   │       │   ├── event_loop.rs
+│   │       │   └── views/
+│   │       │       ├── mod.rs
+│   │       │       ├── status_bar.rs
+│   │       │       ├── task_list.rs
+│   │       │       └── agent_panel.rs
+│   │       └── output.rs         # 终端格式化
+│   │
+│   └── testing-kit/              # 测试工具包
+│       ├── Cargo.toml            # 依赖: harness-core
+│       └── src/
+│           ├── lib.rs
+│           ├── adapter_contract_test.rs  # 可复用的 Adapter 契约测试
+│           ├── fake_agent_factory.rs
+│           └── test_fixtures.rs
+│
+├── tests/                        # 集成 & E2E 测试
+│   ├── integration/
+│   │   ├── golden_path_fake.rs
+│   │   ├── golden_path_parallel.rs
+│   │   ├── crash_recovery.rs
+│   │   └── agent_unavailable.rs
+│   └── contract/
+│       └── adapter_contract_suite.rs
+│
+└── docs/                         # 规划文档（已存在）
 ```
 
 ---
 
-## 4. 依赖方向可视化
+## 2. Crate 依赖方向
 
 ```
-                        cli/           local-api/
-                         │                │
-                         ▼                ▼
-                    ┌────────────────────────┐
-                    │    infrastructure/      │
-                    │  (adapters, persistence,│
-                    │   workspace, process,   │
-                    │   policy-engine,        │
-                    │   discovery, logging)   │
-                    └───────────┬────────────┘
-                                │
-                                ▼
-                    ┌────────────────────────┐
-                    │    application/         │
-                    │  (commands, services,   │
-                    │   orchestration)        │
-                    └───────────┬────────────┘
-                                │
-                                ▼
-                    ┌────────────────────────┐
-                    │    domain/              │
-                    │  (contracts, fsm,       │
-                    │   policies)             │
-                    └────────────────────────┘
-                                ▲
-                                │
-                    ┌────────────────────────┐
-                    │    testing-kit/         │
-                    └────────────────────────┘
+testing-kit ──→ harness-core ←── harness-runtime ←── harness-cli
+                    ↑                  ↑
+                    │                  │
+            harness-adapters ──────────┘
+```
+
+### 严格规则
+
+```
+✅ harness-core: 零外部依赖（仅 serde + uuid + chrono + thiserror）
+✅ harness-runtime: 依赖 harness-core + rusqlite + tokio + git2
+✅ harness-adapters: 依赖 harness-core + tokio
+✅ harness-cli: 依赖 harness-runtime + harness-adapters + ratatui + crossterm
+✅ testing-kit: 仅依赖 harness-core
+
+❌ harness-core 禁止依赖 harness-runtime / harness-adapters / harness-cli
+❌ harness-runtime 禁止依赖 harness-adapters / harness-cli
+❌ harness-adapters 禁止依赖 harness-runtime / harness-cli
+❌ 禁止循环依赖
 ```
 
 ---
 
-## 5. 关键模块耦合度分析
+## 3. Crate 职责边界
 
-| 模块 A | 模块 B | 耦合度 | 说明 |
-|--------|--------|--------|------|
-| domain/contracts | domain/state-machine | 低 | state-machine 只使用 contracts 中的状态枚举 |
-| domain/contracts | domain/policies | 低 | policies 只使用 contracts 中的基础类型 |
-| application/commands | domain/contracts | 中 | 每个 command 返回正确的 event 类型 |
-| application/commands | infrastructure/persistence | 中 | command handler 调用 event-store 写入 |
-| application/services | domain/state-machine | 高（合理） | transition-service 封装所有状态转换 |
-| infrastructure/adapters | domain/contracts | 低 | 只实现 AgentAdapter 接口 |
-| infrastructure/workspace | infrastructure/process | 低 | 各自独立 |
-| cli | infrastructure | 中 | CLI 组合 infrastructure 各模块 |
+### harness-core
+
+- 所有领域类型与接口（struct、enum、trait）
+- 状态机纯函数（`ProjectFsm::can_transition()`, `TaskFsm::can_transition()`）
+- 策略类型定义
+- **不依赖**：SQLite、Git、文件系统、子进程、TUI、任何 Agent
+
+### harness-runtime
+
+- SQLite 持久化（current_state + event_log + audit_log）
+- Scheduler（DAG 拓扑 + 并发控制）
+- ProcessManager（子进程生命周期）
+- WorktreeManager + WorkspaceLease
+- VerificationService + DiffInspector
+- PolicyEngine（命令过滤、路径验证、密钥扫描）
+- Reconciliation（崩溃恢复）
+- Checkpoint
+- 通过 `AgentAdapter` trait 接口使用 Adapter（不直接依赖具体 Adapter 实现）
+
+### harness-adapters
+
+- FakeAgentAdapter
+- ClaudeCliAdapter（stream-json 子进程）
+- CodexCliAdapter（`codex exec --json` 子进程, stdout JSONL）
+- AgentDiscoveryService
+- AdapterRegistry
+- 不操作数据库、不管理 worktree、不执行验证
+
+### harness-cli
+
+- 所有 CLI 命令
+- 交互式 Shell (ratatui)
+- HarnessApi trait 的实现（将 API 调用委托给 harness-runtime）
+- 终端输出格式化和日志显示
 
 ---
 
-## 6. 为什么选择单 Package 分层
+## 4. 关键接口（trait）
 
-| 考量 | 分析 |
+```rust
+// harness-core: Agent Adapter 契约
+#[async_trait]
+pub trait AgentAdapter: Send + Sync {
+    fn kind(&self) -> &'static str;
+    async fn detect(&self, binary_path: Option<&Path>) -> Result<DetectionResult>;
+    async fn get_version(&self) -> Result<String>;
+    async fn inspect_configuration(&self) -> Result<AgentConfigInfo>;
+    async fn check_authentication(&self) -> Result<AuthCheckResult>;
+    async fn probe(&self, temp_dir: &Path) -> Result<ProbeResult>;
+    async fn start_session(&self, profile: &RuntimeProfile, opts: &SessionOptions) -> Result<Box<dyn AgentSession>>;
+}
+
+#[async_trait]
+pub trait AgentSession: Send {
+    fn session_id(&self) -> &str;
+    fn is_active(&self) -> bool;
+    async fn send_task(&mut self, envelope: &TaskEnvelope) -> Result<()>;
+    async fn receive_events(&mut self) -> Result<mpsc::Receiver<AgentEvent>>;
+    async fn interrupt(&self) -> Result<()>;
+    async fn cancel(&self) -> Result<()>;
+    async fn dispose(&mut self) -> Result<()>;
+}
+
+// harness-core: Application Facade (CLI/TUI 使用)
+#[async_trait]
+pub trait HarnessApi: Send + Sync {
+    async fn create_run(&self, objective: &str) -> Result<RunHandle>;
+    async fn attach_run(&self, run_id: &str) -> Result<RunHandle>;
+    // ... (完整接口见 cli-architecture.md)
+}
+```
+
+---
+
+## 5. 禁止的模式
+
+```
+❌ harness-core 引用 rusqlite / tokio / ratatui
+❌ harness-runtime 引用具体 Adapter struct（只能引用 AgentAdapter trait）
+❌ harness-adapters 引用 harness-runtime::persistence
+❌ 任何 crate 通过字符串 "claude-code"/"codex" 做 if-else 分发
+❌ 空壳 crate（Cargo.toml 存在但 src/ 无实质代码）
+❌ 两个 crate 互相依赖（循环）
+❌ 未使用的 trait 方法
+❌ 公开接口没有调用方或 contract test
+```
+
+## 6. 为什么是 4 个 Crates（不是更多）
+
+| 考量 | 决策 |
 |------|------|
-| Foundation Release 模块数量 | ~15 个模块，单 package 足够 |
-| 构建复杂性 | 单 package 零构建配置开销 |
-| 循环依赖检测 | TypeScript project references 或 eslint import/no-cycle |
-| 发布需求 | Foundation 不发布独立 npm 包 |
-| 未来扩展 | 当 Adapter 需要独立发布时，拆分 `@harness/adapter-*` |
-| 测试速度 | 单 package 共享 tsconfig，无跨 package 编译 |
-
----
-
-## 7. 禁止的模式
-
-```
-❌ domain/ 引用 infrastructure/
-❌ domain/ 引用 application/
-❌ application/ 引用 infrastructure/
-❌ contracts 引用具体 Adapter 实现
-❌ 任何模块直接通过字符串 "claude-code"/"codex" 做 if-else 分发
-   （必须通过 AgentAdapter 接口 + RuntimeProfile 多态）
-```
+| 构建时间 | 4 crates 并行编译，无需过度拆分 |
+| 依赖隔离 | core 零依赖保证可测试性 |
+| 发布粒度 | 整个 Harness 作为单个二进制发布，无需独立 crate 版本 |
+| 未来扩展 | 如需独立 adapter crate（如 `harness-adapter-gemini`），可以添加第 5 个 |
+| 碎片化风险 | 超过 6-8 个 crate 前需要 ADR 批准 |

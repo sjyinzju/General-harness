@@ -1,0 +1,21 @@
+pub mod agent_adapter;
+pub mod agent_event;
+pub mod agent_identity;
+pub mod goal_contract;
+pub mod project;
+pub mod runtime_profile;
+pub mod task;
+pub mod task_envelope;
+pub mod task_result;
+pub mod workspace;
+
+pub use agent_adapter::{AgentAdapter, AgentSession, DetectionResult, SessionOptions};
+pub use agent_event::AgentEvent;
+pub use agent_identity::AgentIdentity;
+pub use goal_contract::{ChangeRequest, GoalContractVersion};
+pub use project::{Project, ProjectLifecycle};
+pub use runtime_profile::{CapabilitySet, ProbeResult, RuntimeProfile, RuntimeProfileStatus};
+pub use task::{Task, TaskDependency, TaskLifecycle};
+pub use task_envelope::{FileScope, TaskBudget, TaskEnvelope};
+pub use task_result::TaskResult;
+pub use workspace::{LeaseLifecycle, WorkspaceLease};
