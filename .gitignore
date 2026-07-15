@@ -1,1 +1,8 @@
 reference
+
+# Rust build artifacts
+target/
+
+*.pdb
+# Rust build artifacts
+target/
