@@ -6,9 +6,6 @@ use crate::error::CoreError;
 use super::project::{Project, ProjectLifecycle};
 use super::task::{Task, TaskLifecycle};
 use super::workspace::WorkspaceLease;
-use super::runtime_profile::RuntimeProfile;
-use super::agent_definition::AgentDefinition;
-use super::agent_event::AgentEvent;
 
 // ── Project ──────────────────────────────────────
 
@@ -109,8 +106,10 @@ pub struct EventLogEntry {
     pub stream_version: u32,
     pub event_type: String,
     pub payload_json: String,
-    pub idempotency_key: String,
+    pub schema_version: u32,
     pub correlation_id: String,
+    pub causation_id: Option<String>,
+    pub idempotency_key: String,
     pub timestamp: String,
     pub source: String,
 }

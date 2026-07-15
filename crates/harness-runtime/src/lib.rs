@@ -1,16 +1,10 @@
-//! harness-runtime: Persistence, scheduler, process manager, workspace, verification.
-//! Depends on harness-core, rusqlite, tokio, git2.
+//! harness-runtime: Persistence, repositories, transition service, event log, operations.
+pub mod db;
+pub mod event_log;
+pub mod idempotency;
+pub mod operation;
+pub mod repo;
+pub mod transition;
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        assert_eq!(add(2, 2), 4);
-    }
-}
+pub use db::Database;
+pub use transition::TransitionService;

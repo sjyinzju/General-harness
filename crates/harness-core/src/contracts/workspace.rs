@@ -23,4 +23,5 @@ pub struct WorkspaceLease {
     pub lifecycle: LeaseLifecycle,
     pub worktree_path: String,
     pub branch_name: String,
+    pub expires_at: String,
 }
