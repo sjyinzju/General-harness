@@ -56,49 +56,48 @@ async fn table_count_10_business_tables() {
 async fn idempotency_sequential_duplicate() {
     let db = setup().await;
     let key = ikey();
-    let r1: Result<String, _> = idempotency::execute_once(&db.pool, &key, || async { Ok("first".into()) }).await;
-    let r2: Result<String, _> = idempotency::execute_once(&db.pool, &key, || async { Ok("second".into()) }).await;
-    assert_eq!(r1.unwrap(), "first");
-    assert_eq!(r2.unwrap(), "first"); // cached, not "second"
+    let hash = "hash-seq";
+    let token = idempotency::try_claim(&db.pool, &key, hash, 60).await.unwrap().unwrap();
+    idempotency::complete_claim(&db.pool, &key, &token, r#""first""#).await.unwrap();
+    // Second claim returns None (already completed)
+    let claim2 = idempotency::try_claim(&db.pool, &key, hash, 60).await.unwrap();
+    assert!(claim2.is_none());
+    let result = idempotency::get_result(&db.pool, &key).await.unwrap();
+    assert_eq!(result, Some(r#""first""#.into()));
 }
 
 #[tokio::test]
-async fn idempotency_concurrent_same_key() {
-    // Known limitation: INSERT OR IGNORE allows both concurrent inserts
-    // to proceed if neither sees the other's row before INSERT.
-    // Full PENDING→COMPLETED state model (with CAS) is deferred.
-    // This test verifies the current behavior: both calls succeed,
-    // but the FIRST write to idempotency_records wins for caching.
+async fn idempotency_concurrent_only_one_owner() {
     let db = setup().await;
     let key = ikey();
     let pool = Arc::new(db.pool.clone());
     let pool2 = pool.clone();
-    let key2 = key.clone();
+    let hash = "hash-conc";
 
+    let k1 = key.clone();
+    let k2 = key.clone();
     let (r1, r2) = tokio::join!(
-        idempotency::execute_once(&pool, &key, || async { Ok("first".to_string()) }),
-        idempotency::execute_once(&pool2, &key2, || async { Ok("second".to_string()) }),
+        idempotency::try_claim(&pool, &k1, hash, 60),
+        idempotency::try_claim(&pool2, &k2, hash, 60),
     );
-    // Both succeed (current limitation) — the first INSERT wins for future cache reads
-    assert!(r1.is_ok());
-    assert!(r2.is_ok());
-    // Third call returns cached value
-    let r3: Result<String, _> = idempotency::execute_once(&db.pool, &key, || async { Ok("third".to_string()) }).await;
-    assert!(r3.is_ok());
+    let claimed = r1.as_ref().ok().and_then(|o| o.as_ref()).is_some() as u8
+                + r2.as_ref().ok().and_then(|o| o.as_ref()).is_some() as u8;
+    assert!(claimed <= 1, "At most one concurrent claim should succeed");
 }
 
 #[tokio::test]
-async fn idempotency_error_not_cached_retryable() {
+async fn idempotency_error_retryable_same_hash() {
     let db = setup().await;
     let key = ikey();
-    // First call fails — error is NOT cached, key not consumed
-    let r1: Result<String, _> = idempotency::execute_once(&db.pool, &key, || async {
-        Err(CoreError::new(ErrorCode::ProcessTimeout { duration_ms: 1000 }, "timeout", harness_core::ErrorSource::System))
-    }).await;
-    assert!(r1.is_err());
-    // Second call with same key — succeeds because error was not cached
-    let r2: Result<String, _> = idempotency::execute_once(&db.pool, &key, || async { Ok("retried".to_string()) }).await;
-    assert_eq!(r2.unwrap(), "retried");
+    let hash = "hash-err";
+    let token = idempotency::try_claim(&db.pool, &key, hash, 60).await.unwrap().unwrap();
+    // Fail as retryable
+    idempotency::fail_claim(&db.pool, &key, &token, r#"{"error":"timeout"}"#, false).await.unwrap();
+    // Same hash can retry
+    let token2 = idempotency::try_claim(&db.pool, &key, hash, 60).await.unwrap().unwrap();
+    idempotency::complete_claim(&db.pool, &key, &token2, r#""retried""#).await.unwrap();
+    let result = idempotency::get_result(&db.pool, &key).await.unwrap();
+    assert_eq!(result, Some(r#""retried""#.into()));
 }
 
 // ── TransitionService atomicity ───────────────────
