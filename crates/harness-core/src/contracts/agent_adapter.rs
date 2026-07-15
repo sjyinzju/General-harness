@@ -1,5 +1,4 @@
-//! AgentAdapter contract — CANDIDATE, not frozen.
-//! Will be revised after Codex and Claude CLI spikes.
+//! AgentAdapter contract — v1 FROZEN (Gate C).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -9,18 +8,19 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
+use crate::error::CoreError;
 use super::agent_event::AgentEvent;
 use super::runtime_profile::RuntimeProfile;
 use super::task_envelope::TaskEnvelope;
 
-/// Async event sink — receives AgentEvents without blocking.
+/// Async event sink — receives AgentEvents with backpressure.
 /// Implementations may use tokio::sync::Mutex or other async primitives.
 /// `harness-core` has zero runtime dependency.
 pub trait AgentEventSink: Send {
     fn send(
         &mut self,
         event: AgentEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<(), CoreError>> + Send + '_>>;
 }
 
 #[derive(Debug)]
@@ -60,46 +60,32 @@ pub struct SessionOptions {
     pub extra_args: Vec<String>,
 }
 
-/// Core Agent Adapter trait — CANDIDATE.
+/// Core Agent Adapter trait — v1 FROZEN.
 #[async_trait]
 pub trait AgentAdapter: Send + Sync {
     fn kind(&self) -> &'static str;
 
     // Discovery
-    async fn detect(
-        &self,
-        binary_path: Option<&std::path::Path>,
-    ) -> Result<DetectionResult, String>;
-    async fn get_version(&self) -> Result<String, String>;
-    async fn inspect_configuration(&self) -> Result<AgentConfigInfo, String>;
-    async fn check_authentication(&self) -> Result<AuthCheckResult, String>;
-    async fn probe(
-        &self,
-        temp_dir: &std::path::Path,
-    ) -> Result<super::runtime_profile::ProbeResult, String>;
+    async fn detect(&self, binary_path: Option<&std::path::Path>) -> Result<DetectionResult, CoreError>;
+    async fn get_version(&self) -> Result<String, CoreError>;
+    async fn inspect_configuration(&self) -> Result<AgentConfigInfo, CoreError>;
+    async fn check_authentication(&self) -> Result<AuthCheckResult, CoreError>;
+    async fn probe(&self, temp_dir: &std::path::Path) -> Result<super::runtime_profile::ActiveValidationResult, CoreError>;
 
     // Execution
-    async fn start_session(
-        &self,
-        profile: &RuntimeProfile,
-        opts: &SessionOptions,
-    ) -> Result<Box<dyn AgentSession>, String>;
+    async fn start_session(&self, profile: &RuntimeProfile, opts: &SessionOptions) -> Result<Box<dyn AgentSession>, CoreError>;
 }
 
-/// Core Agent Session trait — CANDIDATE.
+/// Core Agent Session trait — v1 FROZEN.
 #[async_trait]
 pub trait AgentSession: Send {
     fn session_id(&self) -> &str;
     fn is_active(&self) -> bool;
 
-    async fn send_task(&mut self, envelope: &TaskEnvelope) -> Result<(), String>;
+    async fn send_task(&mut self, envelope: &TaskEnvelope) -> Result<(), CoreError>;
     /// Receive events via async sink. Returns when session ends.
-    /// The sink owns backpressure — Adapter awaits each send().
-    async fn receive_events(
-        &mut self,
-        sink: &mut dyn AgentEventSink,
-    ) -> Result<(), String>;
-    async fn interrupt(&self) -> Result<(), String>;
-    async fn cancel(&self) -> Result<(), String>;
-    async fn dispose(&mut self) -> Result<(), String>;
+    async fn receive_events(&mut self, sink: &mut dyn AgentEventSink) -> Result<(), CoreError>;
+    async fn interrupt(&self) -> Result<(), CoreError>;
+    async fn cancel(&self) -> Result<(), CoreError>;
+    async fn dispose(&mut self) -> Result<(), CoreError>;
 }

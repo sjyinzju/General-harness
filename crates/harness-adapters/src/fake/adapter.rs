@@ -12,6 +12,7 @@ use harness_core::contracts::runtime_profile::{
     ActiveProbeChecks, ActiveValidationResult, RuntimeProfile, TriState,
 };
 use harness_core::contracts::task_envelope::TaskEnvelope;
+use harness_core::{CoreError, ErrorCode, ErrorSource};
 
 use super::script::FakeExecutionScript;
 
@@ -36,24 +37,24 @@ impl Default for FakeAgentAdapter {
 impl AgentAdapter for FakeAgentAdapter {
     fn kind(&self) -> &'static str { "fake" }
 
-    async fn detect(&self, _binary_path: Option<&Path>) -> Result<DetectionResult, String> {
+    async fn detect(&self, _binary_path: Option<&Path>) -> Result<DetectionResult, CoreError> {
         Ok(DetectionResult { found: true, binary_path: Some(PathBuf::from("fake-adapter")), error: None })
     }
 
-    async fn get_version(&self) -> Result<String, String> { Ok("fake-1.0.0".into()) }
+    async fn get_version(&self) -> Result<String, CoreError> { Ok("fake-1.0.0".into()) }
 
-    async fn inspect_configuration(&self) -> Result<AgentConfigInfo, String> {
+    async fn inspect_configuration(&self) -> Result<AgentConfigInfo, CoreError> {
         Ok(AgentConfigInfo {
             provider: Some("fake".into()), base_url: None, model: Some("fake-model".into()),
             auth_mode: "none".into(), config_file_path: None, extra: HashMap::new(),
         })
     }
 
-    async fn check_authentication(&self) -> Result<AuthCheckResult, String> {
+    async fn check_authentication(&self) -> Result<AuthCheckResult, CoreError> {
         Ok(AuthCheckResult { authenticated: true, method: Some("none".into()), provider: Some("fake".into()), error: None })
     }
 
-    async fn probe(&self, _temp_dir: &Path) -> Result<ActiveValidationResult, String> {
+    async fn probe(&self, _temp_dir: &Path) -> Result<ActiveValidationResult, CoreError> {
         Ok(ActiveValidationResult {
             validated_at: chrono::Utc::now(),
             smoke_test_passed: true,
@@ -65,7 +66,7 @@ impl AgentAdapter for FakeAgentAdapter {
         })
     }
 
-    async fn start_session(&self, profile: &RuntimeProfile, _opts: &SessionOptions) -> Result<Box<dyn AgentSession>, String> {
+    async fn start_session(&self, profile: &RuntimeProfile, _opts: &SessionOptions) -> Result<Box<dyn AgentSession>, CoreError> {
         let script = self.script.lock().unwrap().clone();
         Ok(Box::new(FakeAgentSession::new(profile.id.clone(), script)))
     }
@@ -89,22 +90,22 @@ impl AgentSession for FakeAgentSession {
     fn session_id(&self) -> &str { &self.session_id }
     fn is_active(&self) -> bool { self.active.load(Ordering::SeqCst) }
 
-    async fn send_task(&mut self, _envelope: &TaskEnvelope) -> Result<(), String> {
-        if !self.is_active() { return Err("Session not active".into()); }
+    async fn send_task(&mut self, _envelope: &TaskEnvelope) -> Result<(), CoreError> {
+        if !self.is_active() { return Err(CoreError::new(ErrorCode::SinkClosed, "Session not active", ErrorSource::Agent)); }
         Ok(())
     }
 
-    async fn receive_events(&mut self, sink: &mut dyn harness_core::contracts::agent_adapter::AgentEventSink) -> Result<(), String> {
-        let script = self.script.as_ref().ok_or("No script configured")?.clone();
+    async fn receive_events(&mut self, sink: &mut dyn harness_core::contracts::agent_adapter::AgentEventSink) -> Result<(), CoreError> {
+        let script = self.script.as_ref().ok_or_else(|| CoreError::new(ErrorCode::ConfigMissing, "No script configured", ErrorSource::Harness))?.clone();
         for file_op in &script.files_to_create {
             if let Some(parent) = file_op.path.parent() { let _ = std::fs::create_dir_all(parent); }
-            std::fs::write(&file_op.path, &file_op.content).map_err(|e| format!("FakeAgent: {e}"))?;
+            std::fs::write(&file_op.path, &file_op.content).map_err(|e| CoreError::new(ErrorCode::Internal, format!("FakeAgent file write: {e}"), ErrorSource::System))?;
         }
         for (i, event) in script.events.iter().enumerate() {
             if let Some(ref failure) = script.failure {
                 if i > failure.after_event_index {
                     self.active.store(false, Ordering::SeqCst);
-                    return Err(failure.error_message.clone());
+                    return Err(CoreError::new(ErrorCode::SinkConsumerFailed, failure.error_message.clone(), ErrorSource::Agent));
                 }
             }
             sink.send(event.clone()).await?;
@@ -113,9 +114,9 @@ impl AgentSession for FakeAgentSession {
         Ok(())
     }
 
-    async fn interrupt(&self) -> Result<(), String> { self.active.store(false, Ordering::SeqCst); Ok(()) }
-    async fn cancel(&self) -> Result<(), String> { self.active.store(false, Ordering::SeqCst); Ok(()) }
-    async fn dispose(&mut self) -> Result<(), String> { self.active.store(false, Ordering::SeqCst); Ok(()) }
+    async fn interrupt(&self) -> Result<(), CoreError> { self.active.store(false, Ordering::SeqCst); Ok(()) }
+    async fn cancel(&self) -> Result<(), CoreError> { self.active.store(false, Ordering::SeqCst); Ok(()) }
+    async fn dispose(&mut self) -> Result<(), CoreError> { self.active.store(false, Ordering::SeqCst); Ok(()) }
 }
 
 #[cfg(test)]

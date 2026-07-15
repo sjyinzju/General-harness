@@ -3,8 +3,10 @@ use crate::contracts::task::TaskLifecycle;
 pub struct TaskFsm;
 
 impl TaskFsm {
+    /// Returns true if `from → to` is a legal state transition.
+    /// Terminal states have NO valid successors.
     pub fn can_transition(from: &TaskLifecycle, to: &TaskLifecycle) -> bool {
-        if from.is_terminal() && !from.allows_retry() {
+        if from.is_terminal() {
             return false;
         }
         matches!(
@@ -15,19 +17,24 @@ impl TaskFsm {
                 | (TaskLifecycle::Ready, TaskLifecycle::Dispatched)
                 | (TaskLifecycle::Ready, TaskLifecycle::Cancelled)
                 | (TaskLifecycle::Dispatched, TaskLifecycle::Running)
-                | (TaskLifecycle::Dispatched, TaskLifecycle::Pending)
+                | (TaskLifecycle::Dispatched, TaskLifecycle::RetryPending) // Agent start failed
                 | (TaskLifecycle::Dispatched, TaskLifecycle::Failed)
                 | (TaskLifecycle::Running, TaskLifecycle::AwaitingInput)
                 | (TaskLifecycle::Running, TaskLifecycle::Submitted)
-                | (TaskLifecycle::Running, TaskLifecycle::Pending)
+                // Execution failed but retries remain → RetryPending
+                | (TaskLifecycle::Running, TaskLifecycle::RetryPending)
                 | (TaskLifecycle::Running, TaskLifecycle::Failed)
                 | (TaskLifecycle::AwaitingInput, TaskLifecycle::Running)
+                | (TaskLifecycle::AwaitingInput, TaskLifecycle::RetryPending)
                 | (TaskLifecycle::AwaitingInput, TaskLifecycle::Failed)
+                // RetryPending → reallocate resources → Dispatched
+                | (TaskLifecycle::RetryPending, TaskLifecycle::Dispatched)
+                | (TaskLifecycle::RetryPending, TaskLifecycle::Failed) // no more retries
+                | (TaskLifecycle::RetryPending, TaskLifecycle::Cancelled)
                 | (TaskLifecycle::Submitted, TaskLifecycle::Verified)
-                | (TaskLifecycle::Submitted, TaskLifecycle::Pending)
+                | (TaskLifecycle::Submitted, TaskLifecycle::RetryPending) // verification failed
+                | (TaskLifecycle::Submitted, TaskLifecycle::Failed)
                 | (TaskLifecycle::Verified, TaskLifecycle::Done)
-                // retry from terminal
-                | (TaskLifecycle::Failed, TaskLifecycle::Pending)
         )
     }
 }
@@ -38,19 +45,43 @@ mod tests {
 
     #[test]
     fn test_terminal_no_transitions() {
-        // Done, Cancelled, Superseded: no transitions (even to Pending)
         for terminal in &[
             TaskLifecycle::Done,
             TaskLifecycle::Cancelled,
             TaskLifecycle::Superseded,
+            TaskLifecycle::Failed,
         ] {
-            assert!(!TaskFsm::can_transition(terminal, &TaskLifecycle::Pending));
-            assert!(!TaskFsm::can_transition(terminal, &TaskLifecycle::Ready));
+            assert!(terminal.is_terminal());
+            for target in &[
+                TaskLifecycle::Pending,
+                TaskLifecycle::Ready,
+                TaskLifecycle::RetryPending,
+            ] {
+                assert!(
+                    !TaskFsm::can_transition(terminal, target),
+                    "{terminal:?} → {target:?} should be illegal"
+                );
+            }
         }
-        // Failed allows retry → Pending
+    }
+
+    #[test]
+    fn test_retry_uses_retry_pending() {
+        // Running → RetryPending (execution failed, retries remain)
         assert!(TaskFsm::can_transition(
+            &TaskLifecycle::Running,
+            &TaskLifecycle::RetryPending
+        ));
+        // RetryPending → Dispatched (new Execution created)
+        assert!(TaskFsm::can_transition(
+            &TaskLifecycle::RetryPending,
+            &TaskLifecycle::Dispatched
+        ));
+        // Failed is terminal — cannot go back to RetryPending
+        assert!(TaskLifecycle::Failed.is_terminal());
+        assert!(!TaskFsm::can_transition(
             &TaskLifecycle::Failed,
-            &TaskLifecycle::Pending
+            &TaskLifecycle::RetryPending
         ));
     }
 
@@ -68,5 +99,22 @@ mod tests {
         for w in path.windows(2) {
             assert!(TaskFsm::can_transition(&w[0], &w[1]));
         }
+        assert!(TaskLifecycle::Done.is_terminal());
+    }
+
+    #[test]
+    fn test_retry_path() {
+        // Simulate: Running → execution fails → RetryPending → re-dispatch → Running
+        let path = [
+            TaskLifecycle::Running,
+            TaskLifecycle::RetryPending,
+            TaskLifecycle::Dispatched,
+            TaskLifecycle::Running,
+        ];
+        for w in path.windows(2) {
+            assert!(TaskFsm::can_transition(&w[0], &w[1]));
+        }
+        // RetryPending is NOT terminal
+        assert!(!TaskLifecycle::RetryPending.is_terminal());
     }
 }

@@ -77,7 +77,7 @@ impl TestSink {
     pub fn into_inner(self) -> Vec<AgentEvent> { self.events.into_inner().unwrap() }
 }
 impl AgentEventSink for TestSink {
-    fn send(&mut self, event: AgentEvent) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+    fn send(&mut self, event: AgentEvent) -> Pin<Box<dyn Future<Output = Result<(), harness_core::CoreError>> + Send + '_>> {
         self.events.lock().unwrap().push(event);
         Box::pin(std::future::ready(Ok(())))
     }
@@ -99,7 +99,7 @@ impl AdapterContractTest {
         match adapter.detect(None).await {
             Ok(r) if r.found => ContractTestResult::pass("detect"),
             Ok(r) => ContractTestResult::fail("detect", format!("not found: {:?}", r.error)),
-            Err(e) => ContractTestResult::fail("detect", e),
+            Err(e) => ContractTestResult::fail("detect", e.to_string()),
         }
     }
 
@@ -107,21 +107,21 @@ impl AdapterContractTest {
         match adapter.get_version().await {
             Ok(v) if !v.is_empty() => ContractTestResult::pass("get_version"),
             Ok(_) => ContractTestResult::fail("get_version", "empty".into()),
-            Err(e) => ContractTestResult::fail("get_version", e),
+            Err(e) => ContractTestResult::fail("get_version", e.to_string()),
         }
     }
 
     async fn test_inspect_config(adapter: &dyn AgentAdapter) -> ContractTestResult {
         match adapter.inspect_configuration().await {
             Ok(_) => ContractTestResult::pass("inspect_configuration"),
-            Err(e) => ContractTestResult::fail("inspect_configuration", e),
+            Err(e) => ContractTestResult::fail("inspect_configuration", e.to_string()),
         }
     }
 
     async fn test_auth(adapter: &dyn AgentAdapter) -> ContractTestResult {
         match adapter.check_authentication().await {
             Ok(_) => ContractTestResult::pass("check_authentication"),
-            Err(e) => ContractTestResult::fail("check_authentication", e),
+            Err(e) => ContractTestResult::fail("check_authentication", e.to_string()),
         }
     }
 
@@ -131,7 +131,7 @@ impl AdapterContractTest {
         match adapter.probe(&tmp).await {
             Ok(r) if r.smoke_test_passed => ContractTestResult::pass("probe"),
             Ok(r) => ContractTestResult::fail("probe", format!("smoke_test_passed: {}", r.smoke_test_passed)),
-            Err(e) => ContractTestResult::fail("probe", e),
+            Err(e) => ContractTestResult::fail("probe", e.to_string()),
         }
     }
 

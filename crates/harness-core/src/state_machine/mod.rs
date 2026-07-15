@@ -27,8 +27,4 @@ impl ExecutionLifecycle {
             Self::Completed | Self::Failed | Self::Lost | Self::Cancelled
         )
     }
-
-    pub fn allows_retry(&self) -> bool {
-        matches!(self, Self::Failed | Self::Lost)
-    }
 }

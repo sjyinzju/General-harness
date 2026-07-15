@@ -4,6 +4,7 @@ pub mod agent_event;
 pub mod agent_identity;
 pub mod goal_contract;
 pub mod project;
+pub mod repository;
 pub mod runtime_profile;
 pub mod task;
 pub mod task_envelope;

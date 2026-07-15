@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use harness_core::contracts::agent_event::AgentEvent;
+use harness_core::contracts::agent_event::{AgentEvent, TerminationReason};
 
 /// Pre-scripted behavior for a fake execution.
 #[derive(Debug, Clone)]
@@ -66,7 +66,9 @@ impl FakeExecutionScript {
                 AgentEvent::SessionEnded {
                     session_id,
                     synthetic: true,
-                    abnormal: false,
+                    termination_reason: TerminationReason::Completed,
+                    result_received: true,
+                    process_exit_received: true,
                 },
             ],
             event_delay: Duration::from_millis(10),
@@ -95,7 +97,9 @@ impl FakeExecutionScript {
                 AgentEvent::SessionEnded {
                     session_id,
                     synthetic: true,
-                    abnormal: true,
+                    termination_reason: TerminationReason::ProcessExited { exit_code: 1, signal: None },
+                    result_received: false,
+                    process_exit_received: true,
                 },
             ],
             event_delay: Duration::from_millis(10),
@@ -151,7 +155,9 @@ impl FakeExecutionScript {
                 AgentEvent::SessionEnded {
                     session_id,
                     synthetic: true,
-                    abnormal: false,
+                    termination_reason: TerminationReason::Completed,
+                    result_received: true,
+                    process_exit_received: true,
                 },
             ],
             event_delay: Duration::from_millis(10),
@@ -186,7 +192,9 @@ impl FakeExecutionScript {
                 AgentEvent::SessionEnded {
                     session_id,
                     synthetic: true,
-                    abnormal: false,
+                    termination_reason: TerminationReason::Completed,
+                    result_received: true,
+                    process_exit_received: true,
                 },
             ],
             event_delay: Duration::from_millis(10),

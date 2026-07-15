@@ -8,7 +8,7 @@ use std::time::Duration;
 use harness_adapters::fake::script::FakeExecutionScript;
 use harness_adapters::fake::FakeAgentAdapter;
 use harness_core::contracts::agent_adapter::{AgentAdapter, AgentEventSink, SessionOptions};
-use harness_core::contracts::agent_event::AgentEvent;
+use harness_core::contracts::agent_event::{AgentEvent, TerminationReason};
 use harness_core::contracts::agent_event::EnrichedAgentEvent;
 use harness_core::contracts::runtime_profile::{
     AuthCheckStatus, AuthMode, AuthStatus, CapabilitySet, CoreStatus, ExecutionStatus,
@@ -40,7 +40,7 @@ impl AgentEventSink for TokioSink {
     fn send(
         &mut self,
         event: AgentEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<(), harness_core::CoreError>> + Send + '_>> {
         let exec_id = self.execution_id.clone();
         Box::pin(async move {
             // In production, harness-runtime would manage the sequence counter.
@@ -63,7 +63,7 @@ impl SyncSink {
 }
 
 impl AgentEventSink for SyncSink {
-    fn send(&mut self, event: AgentEvent) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+    fn send(&mut self, event: AgentEvent) -> Pin<Box<dyn Future<Output = Result<(), harness_core::CoreError>> + Send + '_>> {
         self.events.lock().unwrap().push(event);
         Box::pin(std::future::ready(Ok(())))
     }
@@ -156,7 +156,7 @@ async fn golden_path_task_success() {
     assert!(events.iter().any(|e| matches!(e, AgentEvent::SessionStarted { .. })));
     assert!(events.iter().any(|e| matches!(e, AgentEvent::Result { is_error: false, .. })));
     assert!(events.iter().any(|e| matches!(e, AgentEvent::ProcessExited { exit_code: 0, .. })));
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::SessionEnded { abnormal: false, .. })));
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::SessionEnded { termination_reason: TerminationReason::Completed, .. })));
 
     exec = ExecutionLifecycle::Completed;
     assert!(exec.is_terminal());
@@ -187,17 +187,23 @@ async fn golden_path_task_failure_with_retry_inner() {
     let events = sink.into_inner();
 
     assert!(events.iter().any(|e| matches!(e, AgentEvent::Error { .. })), "Should have Error event");
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::SessionEnded { abnormal: true, .. })), "Should have abnormal SessionEnded");
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::SessionEnded { termination_reason: TerminationReason::ProcessExited { .. }, .. })), "Should have abnormal SessionEnded");
 
-    // Execution → Failed → allows retry → new Execution
-    let mut exec = ExecutionLifecycle::Running;
+    // Execution Running → Failed (terminal, immutable)
+    let exec = ExecutionLifecycle::Running;
     assert!(ExecutionFsm::can_transition(&exec, &ExecutionLifecycle::Failed));
-    exec = ExecutionLifecycle::Failed;
-    assert!(exec.allows_retry());
-    // Create new Execution (retry), not overwriting history
-    assert!(ExecutionFsm::can_transition(&exec, &ExecutionLifecycle::Created));
+    let old_exec = ExecutionLifecycle::Failed;
+    assert!(old_exec.is_terminal());
+    // Terminal Execution CANNOT transition — retry creates a NEW Execution
+    assert!(!ExecutionFsm::can_transition(&old_exec, &ExecutionLifecycle::Created));
+    // Task → RetryPending (non-terminal) → Dispatched
+    assert!(TaskFsm::can_transition(&TaskLifecycle::Running, &TaskLifecycle::RetryPending));
+    let task_retry = TaskLifecycle::RetryPending;
+    assert!(!task_retry.is_terminal());
+    assert!(TaskFsm::can_transition(&task_retry, &TaskLifecycle::Dispatched));
+    // New Execution created with new ID
     let new_exec = ExecutionLifecycle::Created;
-    assert_ne!(new_exec, exec);
+    assert!(!new_exec.is_terminal());
     // New execution completes successfully
     let adapter2 = FakeAgentAdapter::new();
     adapter2.set_script(FakeExecutionScript::success_with_file("fixed.txt", "fixed"));
