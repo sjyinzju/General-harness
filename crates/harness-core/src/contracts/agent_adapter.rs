@@ -2,7 +2,9 @@
 //! Will be revised after Codex and Claude CLI spikes.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -10,6 +12,16 @@ use async_trait::async_trait;
 use super::agent_event::AgentEvent;
 use super::runtime_profile::RuntimeProfile;
 use super::task_envelope::TaskEnvelope;
+
+/// Async event sink — receives AgentEvents without blocking.
+/// Implementations may use tokio::sync::Mutex or other async primitives.
+/// `harness-core` has zero runtime dependency.
+pub trait AgentEventSink: Send {
+    fn send(
+        &mut self,
+        event: AgentEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+}
 
 #[derive(Debug)]
 pub struct DetectionResult {
@@ -81,10 +93,11 @@ pub trait AgentSession: Send {
     fn is_active(&self) -> bool;
 
     async fn send_task(&mut self, envelope: &TaskEnvelope) -> Result<(), String>;
-    /// Receive events via callback. Returns when session ends.
+    /// Receive events via async sink. Returns when session ends.
+    /// The sink owns backpressure — Adapter awaits each send().
     async fn receive_events(
         &mut self,
-        on_event: &(dyn Fn(AgentEvent) + Send + Sync),
+        sink: &mut dyn AgentEventSink,
     ) -> Result<(), String>;
     async fn interrupt(&self) -> Result<(), String>;
     async fn cancel(&self) -> Result<(), String>;

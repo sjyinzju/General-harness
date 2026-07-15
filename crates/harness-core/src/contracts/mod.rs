@@ -1,4 +1,5 @@
 pub mod agent_adapter;
+pub mod agent_definition;
 pub mod agent_event;
 pub mod agent_identity;
 pub mod goal_contract;
@@ -9,12 +10,17 @@ pub mod task_envelope;
 pub mod task_result;
 pub mod workspace;
 
-pub use agent_adapter::{AgentAdapter, AgentSession, DetectionResult, SessionOptions};
+pub use agent_adapter::{AgentAdapter, AgentEventSink, AgentSession, DetectionResult, SessionOptions};
+pub use agent_definition::{AgentDefinition, DiscoverySource, PassiveDiscoveryStatus};
 pub use agent_event::AgentEvent;
 pub use agent_identity::AgentIdentity;
 pub use goal_contract::{ChangeRequest, GoalContractVersion};
 pub use project::{Project, ProjectLifecycle};
-pub use runtime_profile::{CapabilitySet, ProbeResult, RuntimeProfile, RuntimeProfileStatus};
+pub use runtime_profile::{
+    CapabilitySet, CoreStatus, OptionalCapabilities, RequiredCapabilities,
+    RuntimeProfile, TriState, ActiveValidationResult as ProbeResult,
+    CoreStatus as RuntimeProfileStatus,
+};
 pub use task::{Task, TaskDependency, TaskLifecycle};
 pub use task_envelope::{FileScope, TaskBudget, TaskEnvelope};
 pub use task_result::TaskResult;
