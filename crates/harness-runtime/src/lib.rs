@@ -7,8 +7,10 @@ pub mod operation;
 pub mod process;
 pub mod repo;
 pub mod transition;
+pub mod worktree;
 
 pub use artifact::{ArtifactRoot, RuntimeArtifactDirectory};
 pub use db::Database;
 pub use process::ProcessManager;
 pub use transition::TransitionService;
+pub use worktree::WorktreeManager;

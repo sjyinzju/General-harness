@@ -116,9 +116,10 @@ mod tests {
                 "runtime_profiles",
                 "task_dependencies",
                 "tasks",
-                "workspace_leases"
+                "workspace_leases",
+                "worktrees"
             ],
-            "10 business tables expected"
+            "11 business tables expected (001–004)"
         );
     }
 

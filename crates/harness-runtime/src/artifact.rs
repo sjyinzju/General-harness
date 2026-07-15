@@ -327,7 +327,7 @@ fn validate_component(s: &str) -> Result<(), CoreError> {
 /// `$HOME` does not make `%TEMP%`/`%LOCALAPPDATA%` a "user git worktree" in
 /// any meaningful sense — the guard targets project checkouts. A `.git`
 /// anywhere strictly below home (or on paths outside home) still rejects.
-fn find_git_ancestor(path: &Path) -> Option<PathBuf> {
+pub(crate) fn find_git_ancestor(path: &Path) -> Option<PathBuf> {
     // The path itself may not exist yet; walk the lexical ancestors.
     let absolute = if path.is_absolute() {
         path.to_path_buf()
