@@ -16,12 +16,15 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
-    pub fn new(registry: Arc<ProcessRegistry>) -> Self { Self { registry } }
+    pub fn new(registry: Arc<ProcessRegistry>) -> Self {
+        Self { registry }
+    }
 
     pub async fn spawn(&self, spec: &ProcessSpec) -> Result<ProcessHandle, CoreError> {
         let cancel = tokio_util::sync::CancellationToken::new();
         let mut cmd = tokio::process::Command::new(&spec.executable);
-        cmd.args(&spec.args).current_dir(&spec.working_directory)
+        cmd.args(&spec.args)
+            .current_dir(&spec.working_directory)
             .stdin(match &spec.stdin_mode {
                 StdinMode::Closed => Stdio::null(),
                 StdinMode::Pipe | StdinMode::OneShot(_) => Stdio::piped(),
@@ -39,21 +42,37 @@ impl ProcessManager {
             .filter(|(k, _)| !spec.env_removals.contains(k) && is_safe_env(k))
             .collect();
         cmd.env_clear();
-        for (k, v) in &base_env { cmd.env(k, v); }
-        for (k, v) in &spec.env_overrides { cmd.env(k, v); }
+        for (k, v) in &base_env {
+            cmd.env(k, v);
+        }
+        for (k, v) in &spec.env_overrides {
+            cmd.env(k, v);
+        }
 
-        let mut child = cmd.spawn().map_err(|e| CoreError::new(
-            ErrorCode::ProcessSpawnFailed, format!("spawn {}: {e}", spec.executable.display()), ErrorSource::System
-        ))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            CoreError::new(
+                ErrorCode::ProcessSpawnFailed,
+                format!("spawn {}: {e}", spec.executable.display()),
+                ErrorSource::System,
+            )
+        })?;
         let pid = child.id().expect("process must have PID");
 
         let state = Arc::new(RwLock::new(ProcessState::Running));
         let handle = ProcessHandle {
             execution_id: spec.execution_id.clone(),
-            pid, start_time: chrono::Utc::now(),
+            pid,
+            start_time: chrono::Utc::now(),
             state: state.clone(),
         };
-        self.registry.register_with_state(spec.execution_id.clone(), pid, cancel.clone(), state.clone()).await;
+        self.registry
+            .register_with_state(
+                spec.execution_id.clone(),
+                pid,
+                cancel.clone(),
+                state.clone(),
+            )
+            .await;
 
         let mut stdin = child.stdin.take();
         let cancel2 = cancel.clone();
@@ -117,8 +136,13 @@ impl ProcessManager {
 }
 
 fn is_safe_env(key: &str) -> bool {
-    !matches!(key.to_uppercase().as_str(),
-        "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "DEEPSEEK_API_KEY" |
-        "CODEWORKSPACE_TOKEN" | "GITHUB_TOKEN" | "NPM_TOKEN"
+    !matches!(
+        key.to_uppercase().as_str(),
+        "ANTHROPIC_API_KEY"
+            | "OPENAI_API_KEY"
+            | "DEEPSEEK_API_KEY"
+            | "CODEWORKSPACE_TOKEN"
+            | "GITHUB_TOKEN"
+            | "NPM_TOKEN"
     )
 }

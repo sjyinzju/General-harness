@@ -10,8 +10,7 @@ use harness_runtime::db::Database;
 use harness_runtime::idempotency;
 use harness_runtime::operation::OperationManager;
 use harness_runtime::process::{
-    manager::ProcessManager, reconciler::ProcessReconciler, registry::ProcessRegistry,
-    types::*,
+    manager::ProcessManager, reconciler::ProcessReconciler, registry::ProcessRegistry, types::*,
 };
 use harness_runtime::transition::TransitionService;
 
@@ -22,7 +21,9 @@ fn fixture_path() -> PathBuf {
     // Test binary: target/debug/deps/process_integration-xxx.exe
     // Fixture:     target/debug/process-fixture.exe
     let debug_dir = exe.parent().unwrap().parent().unwrap();
-    debug_dir.join("process-fixture").with_extension(std::env::consts::EXE_EXTENSION)
+    debug_dir
+        .join("process-fixture")
+        .with_extension(std::env::consts::EXE_EXTENSION)
 }
 
 fn basic_spec(execution_id: &str, args: Vec<&str>) -> ProcessSpec {
@@ -64,9 +65,20 @@ async fn setup_db_with_execution() -> (Database, String, String) {
     let tid = format!("t-{}", uuid::Uuid::new_v4());
     let eid = format!("e-{}", uuid::Uuid::new_v4());
     sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES (?,?,?)")
-        .bind(&pid).bind("test").bind("active").execute(&db.pool).await.unwrap();
+        .bind(&pid)
+        .bind("test")
+        .bind("active")
+        .execute(&db.pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?,?,?,?)")
-        .bind(&tid).bind(&pid).bind("test").bind("running").execute(&db.pool).await.unwrap();
+        .bind(&tid)
+        .bind(&pid)
+        .bind("test")
+        .bind("running")
+        .execute(&db.pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES (?,?,1,'running')")
         .bind(&eid).bind(&tid).execute(&db.pool).await.unwrap();
     (db, tid, eid)
@@ -99,7 +111,9 @@ async fn process_non_zero_exit() {
     if let ProcessState::Completed { outcome } = state {
         assert_eq!(outcome.termination, ProcessTermination::NonZeroExit);
         assert_eq!(outcome.exit_code, Some(42));
-    } else { panic!("expected completed"); }
+    } else {
+        panic!("expected completed");
+    }
 }
 
 #[tokio::test]
@@ -128,7 +142,9 @@ async fn process_explicit_timeout() {
     let state = mgr.get_state("e4").await.unwrap();
     if let ProcessState::Completed { outcome } = state {
         assert_eq!(outcome.termination, ProcessTermination::Timeout);
-    } else { panic!("expected completed"); }
+    } else {
+        panic!("expected completed");
+    }
 }
 
 // ── Cancel ────────────────────────────────────────
@@ -145,7 +161,9 @@ async fn process_cancel_running() {
     let state = mgr.get_state("e5").await.unwrap();
     if let ProcessState::Completed { outcome } = state {
         assert_eq!(outcome.termination, ProcessTermination::Cancelled);
-    } else { panic!("expected completed"); }
+    } else {
+        panic!("expected completed");
+    }
 }
 
 #[tokio::test]
@@ -183,7 +201,8 @@ async fn process_env_injection_and_removal() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
     let mut spec = basic_spec("e7", vec!["print_env", "HARNESS_TEST_VAR"]);
-    spec.env_overrides.insert("HARNESS_TEST_VAR".into(), "injected_value".into());
+    spec.env_overrides
+        .insert("HARNESS_TEST_VAR".into(), "injected_value".into());
     mgr.spawn(&spec).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let state = mgr.get_state("e7").await.unwrap();
@@ -201,7 +220,10 @@ async fn reconciler_marks_lost_when_registry_empty() {
     assert!(lost.contains(&eid));
     // Verify DB updated
     let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM execution_attempts WHERE id = ?")
-        .bind(&eid).fetch_one(&db.pool).await.unwrap();
+        .bind(&eid)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
     assert_eq!(lc.0, "lost");
 }
 
@@ -223,11 +245,30 @@ async fn operation_claim_only_one_succeeds() {
     let db = Database::open_in_memory().await.unwrap();
     let pid = format!("p-{}", uuid::Uuid::new_v4());
     let tid = format!("t-{}", uuid::Uuid::new_v4());
-    sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES (?,'test','active')").bind(&pid).execute(&db.pool).await.unwrap();
-    sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?,?,'test','pending')").bind(&tid).bind(&pid).execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES (?,'test','active')")
+        .bind(&pid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?,?,'test','pending')",
+    )
+    .bind(&tid)
+    .bind(&pid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
 
     let mgr = OperationManager::new(db.pool.clone());
-    let op_id = mgr.begin(&tid, "test_op", &serde_json::json!({}), &format!("ik-{}", uuid::Uuid::new_v4())).await.unwrap();
+    let op_id = mgr
+        .begin(
+            &tid,
+            "test_op",
+            &serde_json::json!({}),
+            &format!("ik-{}", uuid::Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
 
     let mgr1 = OperationManager::new(db.pool.clone());
     let mgr2 = OperationManager::new(db.pool.clone());
@@ -246,21 +287,44 @@ async fn operation_claim_old_owner_cannot_complete() {
     let db = Database::open_in_memory().await.unwrap();
     let pid = format!("p-{}", uuid::Uuid::new_v4());
     let tid = format!("t-{}", uuid::Uuid::new_v4());
-    sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES (?,'test','active')").bind(&pid).execute(&db.pool).await.unwrap();
-    sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?,?,'test','pending')").bind(&tid).bind(&pid).execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES (?,'test','active')")
+        .bind(&pid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?,?,'test','pending')",
+    )
+    .bind(&tid)
+    .bind(&pid)
+    .execute(&db.pool)
+    .await
+    .unwrap();
 
     let mgr = OperationManager::new(db.pool.clone());
-    let op_id = mgr.begin(&tid, "test_op", &serde_json::json!({}), &format!("ik-{}", uuid::Uuid::new_v4())).await.unwrap();
+    let op_id = mgr
+        .begin(
+            &tid,
+            "test_op",
+            &serde_json::json!({}),
+            &format!("ik-{}", uuid::Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
     let token1 = mgr.try_claim_operation(&op_id, 1).await.unwrap().unwrap();
     // Let claim expire
     tokio::time::sleep(Duration::from_secs(3)).await;
     let token2 = mgr.try_claim_operation(&op_id, 60).await.unwrap().unwrap();
     assert_ne!(token1, token2);
     // Old owner cannot complete
-    let r = mgr.complete_claimed_operation(&op_id, &token1, &serde_json::json!({"ok":true})).await;
+    let r = mgr
+        .complete_claimed_operation(&op_id, &token1, &serde_json::json!({"ok":true}))
+        .await;
     assert!(r.is_err());
     // New owner can
-    mgr.complete_claimed_operation(&op_id, &token2, &serde_json::json!({"ok":true})).await.unwrap();
+    mgr.complete_claimed_operation(&op_id, &token2, &serde_json::json!({"ok":true}))
+        .await
+        .unwrap();
 }
 
 // ── Idempotency claim ─────────────────────────────

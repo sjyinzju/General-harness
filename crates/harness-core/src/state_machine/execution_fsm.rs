@@ -48,12 +48,21 @@ mod tests {
     #[test]
     fn test_retry_creates_new_execution() {
         // Failed is terminal — cannot transition to Created
-        assert!(!ExecutionFsm::can_transition(&ExecutionLifecycle::Failed, &ExecutionLifecycle::Created));
+        assert!(!ExecutionFsm::can_transition(
+            &ExecutionLifecycle::Failed,
+            &ExecutionLifecycle::Created
+        ));
         // Lost is terminal — cannot transition to Created
-        assert!(!ExecutionFsm::can_transition(&ExecutionLifecycle::Lost, &ExecutionLifecycle::Created));
+        assert!(!ExecutionFsm::can_transition(
+            &ExecutionLifecycle::Lost,
+            &ExecutionLifecycle::Created
+        ));
         // But the Task can create a brand-new Execution:
         let new_exec = ExecutionLifecycle::Created;
         assert!(!new_exec.is_terminal());
-        assert!(ExecutionFsm::can_transition(&new_exec, &ExecutionLifecycle::Running));
+        assert!(ExecutionFsm::can_transition(
+            &new_exec,
+            &ExecutionLifecycle::Running
+        ));
     }
 }

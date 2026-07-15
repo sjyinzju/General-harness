@@ -67,10 +67,11 @@ mod tests {
     async fn test_open_in_memory() {
         let db = Database::open_in_memory().await.unwrap();
         // Verify tables exist
-        let row: (String,) = sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name='projects'")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+        let row: (String,) =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name='projects'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
         assert_eq!(row.0, "projects");
     }
 
@@ -79,10 +80,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = Database::db_path(tmp.path());
         let db = Database::open(&path).await.unwrap();
-        let row: (String,) = sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+        let row: (String,) =
+            sqlx::query_as("SELECT name FROM sqlite_master WHERE type='table' AND name='tasks'")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
         assert_eq!(row.0, "tasks");
     }
 
@@ -102,18 +104,31 @@ mod tests {
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_sqlx_%' ORDER BY name"
         ).fetch_all(&db.pool).await.unwrap();
         let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
-        assert_eq!(names, vec![
-            "event_log","execution_attempts","idempotency_records",
-            "operations","projects","resource_claims","runtime_profiles",
-            "task_dependencies","tasks","workspace_leases"
-        ], "10 business tables expected");
+        assert_eq!(
+            names,
+            vec![
+                "event_log",
+                "execution_attempts",
+                "idempotency_records",
+                "operations",
+                "projects",
+                "resource_claims",
+                "runtime_profiles",
+                "task_dependencies",
+                "tasks",
+                "workspace_leases"
+            ],
+            "10 business tables expected"
+        );
     }
 
     #[tokio::test]
     async fn test_pragma_foreign_keys() {
         let db = Database::open_in_memory().await.unwrap();
         let row: (i64,) = sqlx::query_as("SELECT foreign_keys FROM pragma_foreign_keys")
-            .fetch_one(&db.pool).await.unwrap();
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(row.0, 1);
     }
 
@@ -124,7 +139,9 @@ mod tests {
         let db = Database::open(&path).await.unwrap();
         // WAL is enabled for file-backed DBs (in-memory defaults to "memory")
         let row: (String,) = sqlx::query_as("SELECT * FROM pragma_journal_mode")
-            .fetch_one(&db.pool).await.unwrap();
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(row.0.to_lowercase(), "wal");
     }
 
@@ -132,8 +149,14 @@ mod tests {
     async fn test_pragma_busy_timeout() {
         let db = Database::open_in_memory().await.unwrap();
         let row: (i64,) = sqlx::query_as("SELECT * FROM pragma_busy_timeout")
-            .fetch_one(&db.pool).await.unwrap();
-        assert!(row.0 >= 1000, "busy_timeout should be >= 1000ms, got {}", row.0);
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert!(
+            row.0 >= 1000,
+            "busy_timeout should be >= 1000ms, got {}",
+            row.0
+        );
     }
 
     #[tokio::test]
@@ -143,14 +166,20 @@ mod tests {
         // Create and insert
         {
             let db = Database::open(&path).await.unwrap();
-            sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES ('p1', 'test', 'created')")
-                .execute(&db.pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO projects (id, objective, lifecycle) VALUES ('p1', 'test', 'created')",
+            )
+            .execute(&db.pool)
+            .await
+            .unwrap();
         }
         // Reopen — data persists
         {
             let db = Database::open(&path).await.unwrap();
             let row: (String,) = sqlx::query_as("SELECT objective FROM projects WHERE id = 'p1'")
-                .fetch_one(&db.pool).await.unwrap();
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
             assert_eq!(row.0, "test");
         }
     }
@@ -159,8 +188,11 @@ mod tests {
     async fn test_migration_version() {
         let db = Database::open_in_memory().await.unwrap();
         // _sqlx_migrations exists and has at least v1
-        let row: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version >= 1")
-            .fetch_one(&db.pool).await.unwrap();
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM _sqlx_migrations WHERE version >= 1")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
         assert!(row.0 >= 1);
     }
 

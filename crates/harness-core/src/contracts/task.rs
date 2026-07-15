@@ -39,7 +39,10 @@ pub enum TaskLifecycle {
 impl TaskLifecycle {
     /// Terminal states have NO valid successor transitions.
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Done | Self::Cancelled | Self::Superseded | Self::Failed)
+        matches!(
+            self,
+            Self::Done | Self::Cancelled | Self::Superseded | Self::Failed
+        )
     }
 
     /// Whether the owning Task can schedule a retry.
@@ -51,7 +54,11 @@ impl TaskLifecycle {
         // if the Execution fails unexpectedly
         matches!(
             self,
-            Self::RetryPending | Self::Running | Self::Submitted | Self::AwaitingInput | Self::Verified
+            Self::RetryPending
+                | Self::Running
+                | Self::Submitted
+                | Self::AwaitingInput
+                | Self::Verified
         )
     }
 

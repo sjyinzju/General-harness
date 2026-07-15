@@ -8,10 +8,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::error::CoreError;
 use super::agent_event::AgentEvent;
 use super::runtime_profile::RuntimeProfile;
 use super::task_envelope::TaskEnvelope;
+use crate::error::CoreError;
 
 /// Async event sink — receives AgentEvents with backpressure.
 /// Implementations may use tokio::sync::Mutex or other async primitives.
@@ -66,14 +66,24 @@ pub trait AgentAdapter: Send + Sync {
     fn kind(&self) -> &'static str;
 
     // Discovery
-    async fn detect(&self, binary_path: Option<&std::path::Path>) -> Result<DetectionResult, CoreError>;
+    async fn detect(
+        &self,
+        binary_path: Option<&std::path::Path>,
+    ) -> Result<DetectionResult, CoreError>;
     async fn get_version(&self) -> Result<String, CoreError>;
     async fn inspect_configuration(&self) -> Result<AgentConfigInfo, CoreError>;
     async fn check_authentication(&self) -> Result<AuthCheckResult, CoreError>;
-    async fn probe(&self, temp_dir: &std::path::Path) -> Result<super::runtime_profile::ActiveValidationResult, CoreError>;
+    async fn probe(
+        &self,
+        temp_dir: &std::path::Path,
+    ) -> Result<super::runtime_profile::ActiveValidationResult, CoreError>;
 
     // Execution
-    async fn start_session(&self, profile: &RuntimeProfile, opts: &SessionOptions) -> Result<Box<dyn AgentSession>, CoreError>;
+    async fn start_session(
+        &self,
+        profile: &RuntimeProfile,
+        opts: &SessionOptions,
+    ) -> Result<Box<dyn AgentSession>, CoreError>;
 }
 
 /// Core Agent Session trait — v1 FROZEN.

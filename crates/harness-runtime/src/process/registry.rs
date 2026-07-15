@@ -19,15 +19,36 @@ pub struct ProcessRegistry {
 }
 
 impl ProcessRegistry {
-    pub fn new() -> Self { Self { entries: RwLock::new(HashMap::new()) } }
-
-    pub async fn register(&self, execution_id: String, pid: u32, cancel: tokio_util::sync::CancellationToken) {
-        let state = Arc::new(RwLock::new(ProcessState::Running));
-        self.entries.write().await.insert(execution_id, RegistryEntry { pid, cancel, state });
+    pub fn new() -> Self {
+        Self {
+            entries: RwLock::new(HashMap::new()),
+        }
     }
 
-    pub async fn register_with_state(&self, execution_id: String, pid: u32, cancel: tokio_util::sync::CancellationToken, state: Arc<RwLock<ProcessState>>) {
-        self.entries.write().await.insert(execution_id, RegistryEntry { pid, cancel, state });
+    pub async fn register(
+        &self,
+        execution_id: String,
+        pid: u32,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let state = Arc::new(RwLock::new(ProcessState::Running));
+        self.entries
+            .write()
+            .await
+            .insert(execution_id, RegistryEntry { pid, cancel, state });
+    }
+
+    pub async fn register_with_state(
+        &self,
+        execution_id: String,
+        pid: u32,
+        cancel: tokio_util::sync::CancellationToken,
+        state: Arc<RwLock<ProcessState>>,
+    ) {
+        self.entries
+            .write()
+            .await
+            .insert(execution_id, RegistryEntry { pid, cancel, state });
     }
 
     pub async fn cancel(&self, execution_id: &str) -> Result<(), CoreError> {
@@ -36,7 +57,11 @@ impl ProcessRegistry {
             entry.cancel.cancel();
             Ok(())
         } else {
-            Err(CoreError::new(ErrorCode::ProcessCancelled, "execution not found in registry", ErrorSource::System))
+            Err(CoreError::new(
+                ErrorCode::ProcessCancelled,
+                "execution not found in registry",
+                ErrorSource::System,
+            ))
         }
     }
 

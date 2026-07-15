@@ -97,7 +97,10 @@ impl FakeExecutionScript {
                 AgentEvent::SessionEnded {
                     session_id,
                     synthetic: true,
-                    termination_reason: TerminationReason::ProcessExited { exit_code: 1, signal: None },
+                    termination_reason: TerminationReason::ProcessExited {
+                        exit_code: 1,
+                        signal: None,
+                    },
                     result_received: false,
                     process_exit_received: true,
                 },

@@ -16,7 +16,9 @@ pub fn kill_process_tree(pid: u32) -> io::Result<()> {
 
 #[cfg(not(windows))]
 pub fn kill_process_tree(pid: u32) -> io::Result<()> {
-    unsafe { libc::kill(-(pid as i32), libc::SIGKILL); }
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
     Ok(())
 }
 

@@ -46,22 +46,36 @@ impl TransitionService {
             ));
         }
 
-        let from_str = serde_json::to_string(from).unwrap().trim_matches('"').to_string();
-        let to_str = serde_json::to_string(to).unwrap().trim_matches('"').to_string();
+        let from_str = serde_json::to_string(from)
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        let to_str = serde_json::to_string(to)
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
 
         // Read current version
-        let (current_lifecycle, version): (String, i64) = sqlx::query_as(
-            "SELECT lifecycle, version FROM projects WHERE id = ?",
-        )
-        .bind(project_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?
-        .ok_or_else(|| CoreError::new(ErrorCode::PersistenceError, "project not found", ErrorSource::System))?;
+        let (current_lifecycle, version): (String, i64) =
+            sqlx::query_as("SELECT lifecycle, version FROM projects WHERE id = ?")
+                .bind(project_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        "project not found",
+                        ErrorSource::System,
+                    )
+                })?;
 
         if current_lifecycle != from_str {
             return Err(CoreError::new(
-                ErrorCode::InvalidStateTransition { from: current_lifecycle, to: to_str },
+                ErrorCode::InvalidStateTransition {
+                    from: current_lifecycle,
+                    to: to_str,
+                },
                 "expected different current lifecycle",
                 ErrorSource::System,
             ));
@@ -87,14 +101,20 @@ impl TransitionService {
 
         if affected.rows_affected() == 0 {
             // Distinguish: lifecycle changed vs version conflict
-            let (actual_lc, actual_ver): (String, i64) = sqlx::query_as(
-                "SELECT lifecycle, version FROM projects WHERE id = ?"
-            ).bind(project_id).fetch_optional(&mut *tx).await.map_err(db_err)?
-            .map(|r: (String, i64)| r)
-            .unwrap_or_else(|| (String::new(), 0));
+            let (actual_lc, actual_ver): (String, i64) =
+                sqlx::query_as("SELECT lifecycle, version FROM projects WHERE id = ?")
+                    .bind(project_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?
+                    .map(|r: (String, i64)| r)
+                    .unwrap_or_else(|| (String::new(), 0));
             if actual_lc != from_str {
                 return Err(CoreError::new(
-                    ErrorCode::InvalidStateTransition { from: from_str, to: to_str },
+                    ErrorCode::InvalidStateTransition {
+                        from: from_str,
+                        to: to_str,
+                    },
                     format!("lifecycle already changed to {actual_lc} by another transaction"),
                     ErrorSource::System,
                 ));
@@ -104,7 +124,8 @@ impl TransitionService {
                 ErrorCode::PersistenceError,
                 format!("optimistic_version_conflict: expected={version}, actual={actual_ver}"),
                 ErrorSource::System,
-            ).with_diagnostic(format!("project:{project_id}:version_mismatch")));
+            )
+            .with_diagnostic(format!("project:{project_id}:version_mismatch")));
         }
 
         sqlx::query(
@@ -143,20 +164,47 @@ impl TransitionService {
 
         if !TaskFsm::can_transition(from, to) {
             return Err(CoreError::new(
-                ErrorCode::InvalidStateTransition { from: format!("{from:?}"), to: format!("{to:?}") },
-                "illegal task transition", ErrorSource::System,
+                ErrorCode::InvalidStateTransition {
+                    from: format!("{from:?}"),
+                    to: format!("{to:?}"),
+                },
+                "illegal task transition",
+                ErrorSource::System,
             ));
         }
 
-        let from_s = serde_json::to_string(from).unwrap().trim_matches('"').to_string();
-        let to_s = serde_json::to_string(to).unwrap().trim_matches('"').to_string();
+        let from_s = serde_json::to_string(from)
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
+        let to_s = serde_json::to_string(to)
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
 
-        let (current_lc, version): (String, i64) = sqlx::query_as("SELECT lifecycle, version FROM tasks WHERE id = ?")
-            .bind(task_id).fetch_optional(&self.pool).await.map_err(db_err)?
-            .ok_or_else(|| CoreError::new(ErrorCode::PersistenceError, "task not found", ErrorSource::System))?;
+        let (current_lc, version): (String, i64) =
+            sqlx::query_as("SELECT lifecycle, version FROM tasks WHERE id = ?")
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        "task not found",
+                        ErrorSource::System,
+                    )
+                })?;
 
         if current_lc != from_s {
-            return Err(CoreError::new(ErrorCode::InvalidStateTransition { from: current_lc, to: to_s }, "expected different lifecycle", ErrorSource::System));
+            return Err(CoreError::new(
+                ErrorCode::InvalidStateTransition {
+                    from: current_lc,
+                    to: to_s,
+                },
+                "expected different lifecycle",
+                ErrorSource::System,
+            ));
         }
 
         let event_id = Uuid::new_v4().to_string();
@@ -169,13 +217,30 @@ impl TransitionService {
             .bind(&to_s).bind(task_id).bind(&from_s).bind(version).execute(&mut *tx).await.map_err(db_err)?;
 
         if aff.rows_affected() == 0 {
-            let (actual_lc, actual_ver): (String, i64) = sqlx::query_as("SELECT lifecycle, version FROM tasks WHERE id = ?")
-                .bind(task_id).fetch_optional(&mut *tx).await.map_err(db_err)?
-                .map(|r: (String, i64)| r).unwrap_or_else(|| (String::new(), 0));
+            let (actual_lc, actual_ver): (String, i64) =
+                sqlx::query_as("SELECT lifecycle, version FROM tasks WHERE id = ?")
+                    .bind(task_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?
+                    .map(|r: (String, i64)| r)
+                    .unwrap_or_else(|| (String::new(), 0));
             if actual_lc != from_s {
-                return Err(CoreError::new(ErrorCode::InvalidStateTransition { from: from_s, to: to_s }, format!("lifecycle already changed to {actual_lc} by another transaction"), ErrorSource::System));
+                return Err(CoreError::new(
+                    ErrorCode::InvalidStateTransition {
+                        from: from_s,
+                        to: to_s,
+                    },
+                    format!("lifecycle already changed to {actual_lc} by another transaction"),
+                    ErrorSource::System,
+                ));
             }
-            return Err(CoreError::new(ErrorCode::PersistenceError, format!("optimistic_version_conflict: expected={version}, actual={actual_ver}"), ErrorSource::System).with_diagnostic(format!("task:{task_id}:version_mismatch")));
+            return Err(CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("optimistic_version_conflict: expected={version}, actual={actual_ver}"),
+                ErrorSource::System,
+            )
+            .with_diagnostic(format!("task:{task_id}:version_mismatch")));
         }
 
         sqlx::query("INSERT INTO event_log (id, stream_id, stream_version, event_type, payload_json, schema_version, correlation_id, idempotency_key, source) VALUES (?,?,?,?,?,?,?,?,?)")
@@ -200,21 +265,47 @@ impl TransitionService {
             return Ok(());
         }
 
-        let (current_lc, version): (String, i64) = sqlx::query_as("SELECT lifecycle, version FROM execution_attempts WHERE id = ?")
-            .bind(execution_id).fetch_optional(&self.pool).await.map_err(db_err)?
-            .ok_or_else(|| CoreError::new(ErrorCode::PersistenceError, "execution not found", ErrorSource::System))?;
+        let (current_lc, version): (String, i64) =
+            sqlx::query_as("SELECT lifecycle, version FROM execution_attempts WHERE id = ?")
+                .bind(execution_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?
+                .ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        "execution not found",
+                        ErrorSource::System,
+                    )
+                })?;
 
         let from = parse_exec_lc(&current_lc);
 
         if from.is_terminal() {
-            return Err(CoreError::new(ErrorCode::EntityTerminal { entity_id: execution_id.into() }, "terminal execution cannot be modified", ErrorSource::System));
+            return Err(CoreError::new(
+                ErrorCode::EntityTerminal {
+                    entity_id: execution_id.into(),
+                },
+                "terminal execution cannot be modified",
+                ErrorSource::System,
+            ));
         }
 
         if !ExecutionFsm::can_transition(&from, to) {
-            return Err(CoreError::new(ErrorCode::InvalidStateTransition { from: format!("{from:?}"), to: format!("{to:?}") }, "illegal execution transition", ErrorSource::System));
+            return Err(CoreError::new(
+                ErrorCode::InvalidStateTransition {
+                    from: format!("{from:?}"),
+                    to: format!("{to:?}"),
+                },
+                "illegal execution transition",
+                ErrorSource::System,
+            ));
         }
 
-        let to_s = serde_json::to_string(to).unwrap().trim_matches('"').to_string();
+        let to_s = serde_json::to_string(to)
+            .unwrap()
+            .trim_matches('"')
+            .to_string();
         let event_id = Uuid::new_v4().to_string();
         let cid = Uuid::new_v4().to_string();
         let sv = version + 1;
@@ -225,13 +316,30 @@ impl TransitionService {
             .bind(&to_s).bind(execution_id).bind(version).execute(&mut *tx).await.map_err(db_err)?;
 
         if aff.rows_affected() == 0 {
-            let (actual_lc, actual_ver): (String, i64) = sqlx::query_as("SELECT lifecycle, version FROM execution_attempts WHERE id = ?")
-                .bind(execution_id).fetch_optional(&mut *tx).await.map_err(db_err)?
-                .map(|r: (String, i64)| r).unwrap_or_else(|| (String::new(), 0));
+            let (actual_lc, actual_ver): (String, i64) =
+                sqlx::query_as("SELECT lifecycle, version FROM execution_attempts WHERE id = ?")
+                    .bind(execution_id)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(db_err)?
+                    .map(|r: (String, i64)| r)
+                    .unwrap_or_else(|| (String::new(), 0));
             if actual_lc != current_lc {
-                return Err(CoreError::new(ErrorCode::InvalidStateTransition { from: current_lc, to: to_s }, format!("lifecycle already changed to {actual_lc}"), ErrorSource::System));
+                return Err(CoreError::new(
+                    ErrorCode::InvalidStateTransition {
+                        from: current_lc,
+                        to: to_s,
+                    },
+                    format!("lifecycle already changed to {actual_lc}"),
+                    ErrorSource::System,
+                ));
             }
-            return Err(CoreError::new(ErrorCode::PersistenceError, format!("optimistic_version_conflict: expected={version}, actual={actual_ver}"), ErrorSource::System).with_diagnostic(format!("execution:{execution_id}:version_mismatch")));
+            return Err(CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("optimistic_version_conflict: expected={version}, actual={actual_ver}"),
+                ErrorSource::System,
+            )
+            .with_diagnostic(format!("execution:{execution_id}:version_mismatch")));
         }
 
         sqlx::query("INSERT INTO event_log (id, stream_id, stream_version, event_type, payload_json, schema_version, correlation_id, idempotency_key, source) VALUES (?,?,?,?,?,?,?,?,?)")
@@ -246,7 +354,11 @@ impl TransitionService {
 }
 
 fn db_err(e: sqlx::Error) -> CoreError {
-    CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System)
+    CoreError::new(
+        ErrorCode::PersistenceError,
+        e.to_string(),
+        ErrorSource::System,
+    )
 }
 
 fn parse_exec_lc(s: &str) -> ExecutionLifecycle {

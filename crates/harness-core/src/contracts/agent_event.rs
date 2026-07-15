@@ -21,13 +21,9 @@ pub enum AgentEvent {
         vendor_event_id: Option<String>,
     },
     #[serde(rename = "progress")]
-    Progress {
-        summary: String,
-    },
+    Progress { summary: String },
     #[serde(rename = "reasoning_summary")]
-    ReasoningSummary {
-        summary: String,
-    },
+    ReasoningSummary { summary: String },
     #[serde(rename = "tool_call_started")]
     ToolCallStarted {
         tool_name: String,
@@ -43,10 +39,7 @@ pub enum AgentEvent {
     },
     /// Agent logical result — may arrive before or after ProcessExited.
     #[serde(rename = "result")]
-    Result {
-        content: String,
-        is_error: bool,
-    },
+    Result { content: String, is_error: bool },
     #[serde(rename = "error")]
     Error {
         message: String,
@@ -54,10 +47,7 @@ pub enum AgentEvent {
     },
     /// OS process exit — distinct from Agent logical Result.
     #[serde(rename = "process_exited")]
-    ProcessExited {
-        exit_code: i32,
-        signal: Option<i32>,
-    },
+    ProcessExited { exit_code: i32, signal: Option<i32> },
     /// Passthrough — unknown events are NOT silently dropped.
     #[serde(rename = "raw_vendor_event")]
     RawVendorEvent {

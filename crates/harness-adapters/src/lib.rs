@@ -1,7 +1,7 @@
 //! harness-adapters: AgentAdapter implementations + Contract Test Suite.
 
-pub mod fake;
 pub mod contract_test;
+pub mod fake;
 
-pub use fake::FakeAgentAdapter;
 pub use contract_test::AdapterContractTest;
+pub use fake::FakeAgentAdapter;

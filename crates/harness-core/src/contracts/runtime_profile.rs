@@ -94,7 +94,7 @@ pub enum AuthStatus {
 /// Credential reference — never contains the actual key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CredentialReference {
-    pub source_type: String, // "env_var" | "keychain" | "login_session"
+    pub source_type: String,  // "env_var" | "keychain" | "login_session"
     pub source_label: String, // "ANTHROPIC_API_KEY" | "com.anthropic.claude-keychain"
 }
 

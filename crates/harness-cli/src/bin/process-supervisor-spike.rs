@@ -59,7 +59,11 @@ async fn test_spawn_capture() {
 async fn test_stdin_write() {
     // PowerShell: read line from stdin, echo it back
     let mut child = Command::new("powershell")
-        .args(["-NoProfile", "-Command", "$line = Read-Host; Write-Output \"ECHO: $line\""])
+        .args([
+            "-NoProfile",
+            "-Command",
+            "$line = Read-Host; Write-Output \"ECHO: $line\"",
+        ])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -71,7 +75,10 @@ async fn test_stdin_write() {
 
     // Write to stdin
     if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(b"test-input-from-harness\n").await.expect("stdin write failed");
+        stdin
+            .write_all(b"test-input-from-harness\n")
+            .await
+            .expect("stdin write failed");
         // stdin is dropped here, which closes the pipe
     }
 
@@ -99,7 +106,11 @@ async fn test_stderr_capture() {
 
 async fn test_timeout() {
     let mut child = Command::new("powershell")
-        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30; Write-Output 'done'"])
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Start-Sleep -Seconds 30; Write-Output 'done'",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -127,7 +138,11 @@ async fn test_timeout() {
 
 async fn test_cancellation() {
     let mut child = Command::new("powershell")
-        .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 60; Write-Output 'done'"])
+        .args([
+            "-NoProfile",
+            "-Command",
+            "Start-Sleep -Seconds 60; Write-Output 'done'",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

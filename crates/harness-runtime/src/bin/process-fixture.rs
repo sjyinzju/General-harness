@@ -15,7 +15,10 @@ fn main() {
     match mode {
         "print_stdout" => println!("stdout: hello"),
         "print_stderr" => eprintln!("stderr: hello"),
-        "print_both" => { println!("stdout"); eprintln!("stderr"); }
+        "print_both" => {
+            println!("stdout");
+            eprintln!("stderr");
+        }
         "exit_with_code" => {
             let code: i32 = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
             process::exit(code);
@@ -38,16 +41,24 @@ fn main() {
         "print_cwd" => println!("{}", env::current_dir().unwrap().display()),
         "print_env" => {
             if let Some(key) = args.get(1) {
-                println!("{}={}", key, env::var(key).unwrap_or_else(|_| "<unset>".into()));
+                println!(
+                    "{}={}",
+                    key,
+                    env::var(key).unwrap_or_else(|_| "<unset>".into())
+                );
             }
         }
         "flood_stdout" => {
             let count: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1000);
-            for i in 0..count { println!("stdout line {i}"); }
+            for i in 0..count {
+                println!("stdout line {i}");
+            }
         }
         "flood_stderr" => {
             let count: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1000);
-            for i in 0..count { eprintln!("stderr line {i}"); }
+            for i in 0..count {
+                eprintln!("stderr line {i}");
+            }
         }
         "flood_both" => {
             let count: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(1000);
@@ -66,12 +77,17 @@ fn main() {
         }
         "spawn_grandchild" => {
             let exe = env::current_exe().unwrap();
-            let child = process::Command::new(&exe).arg("spawn_child").spawn().unwrap();
+            let child = process::Command::new(&exe)
+                .arg("spawn_child")
+                .spawn()
+                .unwrap();
             let _ = child.wait_with_output();
         }
         "ignore_graceful_shutdown" => {
             // Never exits on SIGTERM
-            loop { thread::sleep(Duration::from_secs(60)); }
+            loop {
+                thread::sleep(Duration::from_secs(60));
+            }
         }
         "ready_signal" => {
             // Print ready marker, then wait for stdin before proceeding
