@@ -25,7 +25,7 @@ impl OperationManager {
         let op_id = format!("op-{id}");
         let now = now_sql();
         sqlx::query("INSERT INTO operations (id, operation_id, operation_type, task_id, status, payload_json, idempotency_key, started_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?)")
-            .bind(&id).bind(&op_id).bind(op_type).bind(task_id).bind("pending").bind(&payload.to_string()).bind(idempotency_key).bind(&now).bind(&now)
+            .bind(&id).bind(&op_id).bind(op_type).bind(task_id).bind("pending").bind(payload.to_string()).bind(idempotency_key).bind(&now).bind(&now)
             .execute(&self.pool).await.map_err(db_err)?;
         Ok(op_id)
     }
@@ -61,7 +61,7 @@ impl OperationManager {
     ) -> Result<(), CoreError> {
         let expires = expires_sql(lease_secs);
         let r = sqlx::query("UPDATE operations SET claim_expires_at=?, updated_at=? WHERE operation_id=? AND claim_token=? AND status IN ('pending','running','reconciliation_required')")
-            .bind(&expires).bind(&now_sql()).bind(operation_id).bind(token).execute(&self.pool).await.map_err(db_err)?;
+            .bind(&expires).bind(now_sql()).bind(operation_id).bind(token).execute(&self.pool).await.map_err(db_err)?;
         if r.rows_affected() == 0 {
             return Err(CoreError::new(
                 ErrorCode::PersistenceError,
@@ -78,7 +78,7 @@ impl OperationManager {
         token: &str,
     ) -> Result<(), CoreError> {
         sqlx::query("UPDATE operations SET claim_token=NULL, claim_expires_at=NULL, updated_at=? WHERE operation_id=? AND claim_token=?")
-            .bind(&now_sql()).bind(operation_id).bind(token).execute(&self.pool).await.map_err(db_err)?;
+            .bind(now_sql()).bind(operation_id).bind(token).execute(&self.pool).await.map_err(db_err)?;
         Ok(())
     }
 
@@ -89,7 +89,7 @@ impl OperationManager {
         result: &serde_json::Value,
     ) -> Result<(), CoreError> {
         let r = sqlx::query("UPDATE operations SET status='completed', result_json=?, claim_token=NULL, claim_expires_at=NULL, completed_at=?, updated_at=? WHERE operation_id=? AND claim_token=? AND status IN ('pending','running','reconciliation_required')")
-            .bind(&result.to_string()).bind(&now_sql()).bind(&now_sql()).bind(operation_id).bind(token).execute(&self.pool).await.map_err(db_err)?;
+            .bind(result.to_string()).bind(now_sql()).bind(now_sql()).bind(operation_id).bind(token).execute(&self.pool).await.map_err(db_err)?;
         if r.rows_affected() == 0 {
             return Err(CoreError::new(
                 ErrorCode::PersistenceError,
@@ -107,7 +107,7 @@ impl OperationManager {
         reason: &str,
     ) -> Result<(), CoreError> {
         let r = sqlx::query("UPDATE operations SET status='failed', result_json=?, claim_token=NULL, claim_expires_at=NULL, last_error=?, completed_at=?, updated_at=? WHERE operation_id=? AND claim_token=? AND status IN ('pending','running','reconciliation_required')")
-            .bind(reason).bind(reason).bind(&now_sql()).bind(&now_sql()).bind(operation_id).bind(token).execute(&self.pool).await.map_err(db_err)?;
+            .bind(reason).bind(reason).bind(now_sql()).bind(now_sql()).bind(operation_id).bind(token).execute(&self.pool).await.map_err(db_err)?;
         if r.rows_affected() == 0 {
             return Err(CoreError::new(
                 ErrorCode::PersistenceError,
@@ -120,7 +120,7 @@ impl OperationManager {
 
     pub async fn mark_reconciliation_required(&self, operation_id: &str) -> Result<(), CoreError> {
         sqlx::query("UPDATE operations SET status='reconciliation_required', updated_at=? WHERE operation_id=? AND status IN ('pending','running')")
-            .bind(&now_sql()).bind(operation_id).execute(&self.pool).await.map_err(db_err)?;
+            .bind(now_sql()).bind(operation_id).execute(&self.pool).await.map_err(db_err)?;
         Ok(())
     }
 
@@ -132,7 +132,7 @@ impl OperationManager {
         result: &serde_json::Value,
     ) -> Result<(), CoreError> {
         let r = sqlx::query("UPDATE operations SET status='completed', result_json=?, completed_at=?, updated_at=? WHERE operation_id=? AND status IN ('pending','running')")
-            .bind(&result.to_string()).bind(&now_sql()).bind(&now_sql()).bind(operation_id).execute(&self.pool).await.map_err(db_err)?;
+            .bind(result.to_string()).bind(now_sql()).bind(now_sql()).bind(operation_id).execute(&self.pool).await.map_err(db_err)?;
         if r.rows_affected() == 0 {
             return Err(CoreError::new(
                 ErrorCode::PersistenceError,
@@ -145,7 +145,7 @@ impl OperationManager {
 
     pub async fn fail(&self, operation_id: &str, reason: &str) -> Result<(), CoreError> {
         sqlx::query("UPDATE operations SET status='failed', result_json=?, last_error=?, completed_at=?, updated_at=? WHERE operation_id=? AND status IN ('pending','running')")
-            .bind(reason).bind(reason).bind(&now_sql()).bind(&now_sql()).bind(operation_id).execute(&self.pool).await.map_err(db_err)?;
+            .bind(reason).bind(reason).bind(now_sql()).bind(now_sql()).bind(operation_id).execute(&self.pool).await.map_err(db_err)?;
         Ok(())
     }
 

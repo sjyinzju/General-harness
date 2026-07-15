@@ -2,13 +2,11 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 use harness_adapters::fake::script::FakeExecutionScript;
 use harness_adapters::fake::FakeAgentAdapter;
 use harness_core::contracts::agent_adapter::{AgentAdapter, AgentEventSink, SessionOptions};
-use harness_core::contracts::agent_event::EnrichedAgentEvent;
 use harness_core::contracts::agent_event::{AgentEvent, TerminationReason};
 use harness_core::contracts::runtime_profile::{
     AuthCheckStatus, AuthMode, AuthStatus, CapabilitySet, CoreStatus, ExecutionStatus,
@@ -19,41 +17,6 @@ use harness_core::contracts::task_envelope::{FileScope, TaskBudget, TaskEnvelope
 use harness_core::state_machine::execution_fsm::ExecutionFsm;
 use harness_core::state_machine::task_fsm::TaskFsm;
 use harness_core::state_machine::ExecutionLifecycle;
-
-// ── Async test sink using tokio::sync::Mutex ──────
-
-struct TokioSink {
-    execution_id: String,
-    events: tokio::sync::Mutex<Vec<EnrichedAgentEvent>>,
-}
-
-impl TokioSink {
-    fn new(execution_id: String) -> Self {
-        Self {
-            execution_id,
-            events: tokio::sync::Mutex::new(Vec::new()),
-        }
-    }
-    async fn into_inner(self) -> Vec<EnrichedAgentEvent> {
-        self.events.into_inner()
-    }
-}
-
-impl AgentEventSink for TokioSink {
-    fn send(
-        &mut self,
-        event: AgentEvent,
-    ) -> Pin<Box<dyn Future<Output = Result<(), harness_core::CoreError>> + Send + '_>> {
-        let exec_id = self.execution_id.clone();
-        Box::pin(async move {
-            // In production, harness-runtime would manage the sequence counter.
-            // For tests, we use a simple timestamp-based sequence.
-            let enriched = EnrichedAgentEvent::new(exec_id, 0, event);
-            // Note: in real impl, sequence is managed by runtime, not sink
-            Ok(())
-        })
-    }
-}
 
 // Simple sync sink for basic tests
 struct SyncSink {
@@ -191,12 +154,23 @@ async fn golden_path_task_success() {
         .unwrap();
     assert!(session.is_active());
 
-    let mut task = TaskLifecycle::Pending;
-    task = TaskLifecycle::Ready;
-    task = TaskLifecycle::Dispatched;
-    task = TaskLifecycle::Running;
-    let mut exec = ExecutionLifecycle::Created;
-    exec = ExecutionLifecycle::Running;
+    // Lifecycle walk validated against the FSMs.
+    assert!(TaskFsm::can_transition(
+        &TaskLifecycle::Pending,
+        &TaskLifecycle::Ready
+    ));
+    assert!(TaskFsm::can_transition(
+        &TaskLifecycle::Ready,
+        &TaskLifecycle::Dispatched
+    ));
+    assert!(TaskFsm::can_transition(
+        &TaskLifecycle::Dispatched,
+        &TaskLifecycle::Running
+    ));
+    assert!(ExecutionFsm::can_transition(
+        &ExecutionLifecycle::Created,
+        &ExecutionLifecycle::Running
+    ));
 
     session.send_task(&test_envelope()).await.unwrap();
     let mut sink = SyncSink::new();
@@ -224,11 +198,25 @@ async fn golden_path_task_success() {
         }
     )));
 
-    exec = ExecutionLifecycle::Completed;
+    assert!(ExecutionFsm::can_transition(
+        &ExecutionLifecycle::Running,
+        &ExecutionLifecycle::Completed
+    ));
+    let exec = ExecutionLifecycle::Completed;
     assert!(exec.is_terminal());
-    task = TaskLifecycle::Submitted;
-    task = TaskLifecycle::Verified;
-    task = TaskLifecycle::Done;
+    assert!(TaskFsm::can_transition(
+        &TaskLifecycle::Running,
+        &TaskLifecycle::Submitted
+    ));
+    assert!(TaskFsm::can_transition(
+        &TaskLifecycle::Submitted,
+        &TaskLifecycle::Verified
+    ));
+    assert!(TaskFsm::can_transition(
+        &TaskLifecycle::Verified,
+        &TaskLifecycle::Done
+    ));
+    let task = TaskLifecycle::Done;
     assert!(task.is_terminal());
 }
 
@@ -343,7 +331,7 @@ async fn cancel_does_not_affect_other_executions() {
     let adapter2 = FakeAgentAdapter::new();
     adapter2.set_script(FakeExecutionScript::success_with_file("b.txt", "B"));
 
-    let mut session1 = adapter1
+    let session1 = adapter1
         .start_session(&test_profile(), &session_opts())
         .await
         .unwrap();
@@ -359,5 +347,5 @@ async fn cancel_does_not_affect_other_executions() {
     let mut sink = SyncSink::new();
     session2.send_task(&test_envelope()).await.unwrap();
     session2.receive_events(&mut sink).await.unwrap();
-    assert!(sink.into_inner().len() > 0);
+    assert!(!sink.into_inner().is_empty());
 }

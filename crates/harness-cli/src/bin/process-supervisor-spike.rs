@@ -3,7 +3,7 @@
 
 use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
@@ -39,7 +39,7 @@ async fn main() {
 }
 
 async fn test_spawn_capture() {
-    let mut child = Command::new("cmd")
+    let child = Command::new("cmd")
         .args(["/c", "echo hello-from-subprocess"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -89,7 +89,7 @@ async fn test_stdin_write() {
 }
 
 async fn test_stderr_capture() {
-    let mut child = Command::new("cmd")
+    let child = Command::new("cmd")
         .args(["/c", "echo to-stdout & echo to-stderr >&2"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

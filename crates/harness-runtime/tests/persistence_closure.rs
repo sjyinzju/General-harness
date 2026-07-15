@@ -4,7 +4,6 @@
 
 use harness_core::contracts::project::ProjectLifecycle;
 // TaskLifecycle and ExecutionLifecycle used implicitly via TransitionService
-use harness_core::{CoreError, ErrorCode};
 use harness_runtime::db::Database;
 use harness_runtime::idempotency;
 use harness_runtime::operation::OperationManager;
@@ -393,12 +392,12 @@ async fn event_log_stream_version_unique() {
 
     // Insert stream version 1
     sqlx::query("INSERT INTO event_log (id, stream_id, stream_version, event_type, payload_json, schema_version, correlation_id, idempotency_key, source) VALUES (?,?,1,'test','{}',1,?,?,?)")
-        .bind(&Uuid::new_v4().to_string()).bind(stream_id).bind(&Uuid::new_v4().to_string()).bind(&key1).bind("harness")
+        .bind(Uuid::new_v4().to_string()).bind(stream_id).bind(Uuid::new_v4().to_string()).bind(&key1).bind("harness")
         .execute(&db.pool).await.unwrap();
 
     // Insert same stream version again — must fail
     let result = sqlx::query("INSERT INTO event_log (id, stream_id, stream_version, event_type, payload_json, schema_version, correlation_id, idempotency_key, source) VALUES (?,?,1,'test','{}',1,?,?,?)")
-        .bind(&Uuid::new_v4().to_string()).bind(stream_id).bind(&Uuid::new_v4().to_string()).bind(&key2).bind("harness")
+        .bind(Uuid::new_v4().to_string()).bind(stream_id).bind(Uuid::new_v4().to_string()).bind(&key2).bind("harness")
         .execute(&db.pool).await;
     assert!(result.is_err(), "Duplicate stream_version must be rejected");
 }
@@ -408,10 +407,10 @@ async fn event_log_idempotency_key_unique() {
     let db = setup().await;
     let key = ikey();
     sqlx::query("INSERT INTO event_log (id, stream_id, stream_version, event_type, payload_json, schema_version, correlation_id, idempotency_key, source) VALUES (?,?,1,'test','{}',1,?,?,?)")
-        .bind(&Uuid::new_v4().to_string()).bind("s1").bind(&Uuid::new_v4().to_string()).bind(&key).bind("harness")
+        .bind(Uuid::new_v4().to_string()).bind("s1").bind(Uuid::new_v4().to_string()).bind(&key).bind("harness")
         .execute(&db.pool).await.unwrap();
     let result = sqlx::query("INSERT INTO event_log (id, stream_id, stream_version, event_type, payload_json, schema_version, correlation_id, idempotency_key, source) VALUES (?,?,2,'test','{}',1,?,?,?)")
-        .bind(&Uuid::new_v4().to_string()).bind("s2").bind(&Uuid::new_v4().to_string()).bind(&key).bind("harness")
+        .bind(Uuid::new_v4().to_string()).bind("s2").bind(Uuid::new_v4().to_string()).bind(&key).bind("harness")
         .execute(&db.pool).await;
     assert!(
         result.is_err(),
@@ -464,7 +463,7 @@ async fn store_resource_claim_persist() {
     let pid = setup_with_project(&db).await;
     let tid = setup_with_task(&db, &pid).await;
     sqlx::query("INSERT INTO resource_claims (id, project_id, task_id, resource_kind, normalized_resource, access_mode, status) VALUES (?,?,?,'file','src/auth.rs','write','active')")
-        .bind(&Uuid::new_v4().to_string()).bind(&pid).bind(&tid).execute(&db.pool).await.unwrap();
+        .bind(Uuid::new_v4().to_string()).bind(&pid).bind(&tid).execute(&db.pool).await.unwrap();
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM resource_claims WHERE task_id=?")
         .bind(&tid)
         .fetch_one(&db.pool)

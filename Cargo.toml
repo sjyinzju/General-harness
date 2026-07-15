@@ -16,10 +16,13 @@ rust-version = "1.80"
 [workspace.lints.rust]
 unsafe_code = "deny"
 
+# NOTE: clippy::all is the enforced baseline (gate: `cargo clippy --workspace
+# --all-targets -- -D warnings`). pedantic/unwrap_used were previously listed
+# here but never inherited by any crate (dead config); enabling them now would
+# require blanket allows across the codebase — deferred as an explicit
+# decision rather than silently re-added.
 [workspace.lints.clippy]
 all = "warn"
-pedantic = "warn"
-unwrap_used = "warn"
 
 [profile.release]
 opt-level = 3

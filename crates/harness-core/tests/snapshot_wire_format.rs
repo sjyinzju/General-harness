@@ -4,7 +4,6 @@
 use harness_core::contracts::agent_event::{AgentEvent, TerminationReason};
 use harness_core::contracts::project::ProjectLifecycle;
 use harness_core::contracts::task::TaskLifecycle;
-use harness_core::contracts::workspace::LeaseLifecycle;
 use harness_core::state_machine::ExecutionLifecycle;
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 

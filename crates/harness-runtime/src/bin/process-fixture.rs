@@ -83,6 +83,18 @@ fn main() {
                 .unwrap();
             let _ = child.wait_with_output();
         }
+        "spawn_tree_and_sleep" => {
+            // Spawn an intermediate that creates an orphaned grandchild
+            // (sleep 10) and exits, then stay alive. Used to verify that
+            // killing the root also kills the orphaned grandchild.
+            let exe = env::current_exe().unwrap();
+            let child = process::Command::new(&exe)
+                .arg("spawn_child")
+                .spawn()
+                .unwrap();
+            let _ = child.wait_with_output();
+            thread::sleep(Duration::from_secs(60));
+        }
         "ignore_graceful_shutdown" => {
             // Never exits on SIGTERM
             loop {

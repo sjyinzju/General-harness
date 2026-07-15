@@ -18,6 +18,12 @@ pub struct ProcessRegistry {
     entries: RwLock<HashMap<String, RegistryEntry>>,
 }
 
+impl Default for ProcessRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ProcessRegistry {
     pub fn new() -> Self {
         Self {

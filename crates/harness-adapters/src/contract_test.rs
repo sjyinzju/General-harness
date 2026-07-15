@@ -108,6 +108,12 @@ fn session_opts() -> SessionOptions {
 pub struct TestSink {
     events: Mutex<Vec<AgentEvent>>,
 }
+impl Default for TestSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestSink {
     pub fn new() -> Self {
         Self {

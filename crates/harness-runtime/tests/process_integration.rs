@@ -12,7 +12,6 @@ use harness_runtime::operation::OperationManager;
 use harness_runtime::process::{
     manager::ProcessManager, reconciler::ProcessReconciler, registry::ProcessRegistry, types::*,
 };
-use harness_runtime::transition::TransitionService;
 
 fn fixture_path() -> PathBuf {
     // Cargo builds binaries to target/debug/ or target/release/
@@ -39,6 +38,8 @@ fn basic_spec(execution_id: &str, args: Vec<&str>) -> ProcessSpec {
         stdout_capture: CapturePolicy::Pipe,
         stderr_capture: CapturePolicy::Pipe,
         output_byte_limit: 10 * 1024 * 1024,
+        spool_dir: None,
+        known_secrets: vec![],
         execution_id: execution_id.to_string(),
         runtime_profile_id: "test-profile".into(),
     }
@@ -57,6 +58,16 @@ async fn wait_for_completion(mgr: &ProcessManager, eid: &str, timeout: Duration)
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+#[tokio::test]
+async fn process_wait_helper_reaches_completion() {
+    let reg = Arc::new(ProcessRegistry::new());
+    let mgr = ProcessManager::new(reg.clone());
+    let spec = basic_spec("e0-wait", vec!["print_stdout"]);
+    mgr.spawn(&spec).await.unwrap();
+    let state = wait_for_completion(&mgr, "e0-wait", Duration::from_secs(10)).await;
+    assert!(matches!(state, ProcessState::Completed { .. }));
 }
 
 async fn setup_db_with_execution() -> (Database, String, String) {
@@ -91,7 +102,7 @@ async fn process_success_exit_capture_stdout() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
     let spec = basic_spec("e1", vec!["print_stdout"]);
-    let handle = mgr.spawn(&spec).await.unwrap();
+    mgr.spawn(&spec).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let state = mgr.get_state("e1").await.unwrap();
     assert!(matches!(state, ProcessState::Completed { .. }));
@@ -105,7 +116,7 @@ async fn process_non_zero_exit() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
     let spec = basic_spec("e2", vec!["exit_with_code", "42"]);
-    let handle = mgr.spawn(&spec).await.unwrap();
+    mgr.spawn(&spec).await.unwrap();
     tokio::time::sleep(Duration::from_millis(500)).await;
     let state = mgr.get_state("e2").await.unwrap();
     if let ProcessState::Completed { outcome } = state {
@@ -229,7 +240,7 @@ async fn reconciler_marks_lost_when_registry_empty() {
 
 #[tokio::test]
 async fn reconciler_idempotent() {
-    let (db, _tid, eid) = setup_db_with_execution().await;
+    let (db, _tid, _eid) = setup_db_with_execution().await;
     let reg = Arc::new(ProcessRegistry::new());
     let reconciler = ProcessReconciler::new(db.pool.clone(), reg, "test-supervisor".into());
     reconciler.reconcile().await.unwrap();

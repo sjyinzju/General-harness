@@ -38,16 +38,14 @@ pub async fn try_claim(
     if let Some((status, existing_hash, _owner)) = existing {
         match status.as_str() {
             "completed" | "failed_final" => return Ok(None), // Already terminal
-            "failed_retryable" => {
-                if existing_hash != request_hash {
-                    return Err(CoreError::new(
-                        ErrorCode::PersistenceError,
-                        format!("idempotency_request_mismatch: existing_hash={existing_hash}"),
-                        ErrorSource::System,
-                    ));
-                }
-                // Allow retry with same hash
+            "failed_retryable" if existing_hash != request_hash => {
+                return Err(CoreError::new(
+                    ErrorCode::PersistenceError,
+                    format!("idempotency_request_mismatch: existing_hash={existing_hash}"),
+                    ErrorSource::System,
+                ));
             }
+            // failed_retryable with same hash: retry allowed (falls through)
             "pending" => {
                 if existing_hash != request_hash {
                     return Err(CoreError::new(

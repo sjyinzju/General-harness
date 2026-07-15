@@ -3,6 +3,9 @@ name = "harness-runtime"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { path = "../harness-core" }
 tokio = { version = "1", features = ["full"] }
@@ -16,6 +19,15 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
+
+[target.'cfg(windows)'.dependencies]
+# Already in the dependency tree transitively (tokio/sqlx); direct use for the
+# isolated Job Object FFI module only. No new crates enter the lock file.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+] }
 
 [dev-dependencies]
 tempfile = "3"

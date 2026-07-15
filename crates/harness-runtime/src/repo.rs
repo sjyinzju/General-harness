@@ -50,7 +50,7 @@ impl ProjectRepository for SqlProjectRepo {
         from: &ProjectLifecycle,
         to: &ProjectLifecycle,
         version: u32,
-        ikey: &str,
+        _ikey: &str,
     ) -> Result<(), CoreError> {
         let from_str = serde_json::to_string(from)
             .unwrap()
@@ -168,7 +168,7 @@ impl TaskRepository for SqlTaskRepo {
         from: &TaskLifecycle,
         to: &TaskLifecycle,
         version: u32,
-        ikey: &str,
+        _ikey: &str,
     ) -> Result<(), CoreError> {
         let from_s = serde_json::to_string(from)
             .unwrap()
@@ -343,9 +343,9 @@ impl ExecutionRepository for SqlExecutionRepo {
         &self,
         id: &str,
         to: &str,
-        reason: Option<&str>,
+        _reason: Option<&str>,
         version: u32,
-        ikey: &str,
+        _ikey: &str,
     ) -> Result<(), CoreError> {
         let r = sqlx::query("UPDATE execution_attempts SET lifecycle = ?, version = version + 1, updated_at = datetime('now') WHERE id = ? AND version = ?")
             .bind(to).bind(id).bind(version).execute(&self.pool).await.map_err(map_err)?;
@@ -723,22 +723,6 @@ pub mod op_row {
         pub idempotency_key: String,
         pub started_at: String,
         pub completed_at: Option<String>,
-    }
-}
-
-fn row_to_entry(r: event_row::EventRow) -> harness_core::contracts::repository::EventLogEntry {
-    harness_core::contracts::repository::EventLogEntry {
-        id: r.id,
-        stream_id: r.stream_id,
-        stream_version: r.stream_version as u32,
-        event_type: r.event_type,
-        payload_json: r.payload_json,
-        schema_version: r.schema_version as u32,
-        correlation_id: r.correlation_id,
-        causation_id: r.causation_id,
-        idempotency_key: r.idempotency_key,
-        source: r.source,
-        timestamp: r.created_at,
     }
 }
 

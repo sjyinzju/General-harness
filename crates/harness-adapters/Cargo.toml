@@ -3,6 +3,9 @@ name = "harness-adapters"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { path = "../harness-core" }
 tokio = { version = "1", features = ["full"] }

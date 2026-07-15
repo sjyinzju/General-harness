@@ -3,6 +3,9 @@ name = "harness-cli"
 version.workspace = true
 edition.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 harness-core = { path = "../harness-core" }
 harness-runtime = { path = "../harness-runtime" }

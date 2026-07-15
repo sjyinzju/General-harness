@@ -135,7 +135,7 @@ impl TransitionService {
         .bind(project_id)
         .bind(stream_version)
         .bind("project_lifecycle_changed")
-        .bind(&serde_json::json!({"from": from_str, "to": to_str}).to_string())
+        .bind(serde_json::json!({"from": from_str, "to": to_str}).to_string())
         .bind(1i64) // schema_version
         .bind(&correlation_id)
         .bind(idempotency_key)
@@ -245,7 +245,7 @@ impl TransitionService {
 
         sqlx::query("INSERT INTO event_log (id, stream_id, stream_version, event_type, payload_json, schema_version, correlation_id, idempotency_key, source) VALUES (?,?,?,?,?,?,?,?,?)")
             .bind(&event_id).bind(task_id).bind(sv).bind("task_lifecycle_changed")
-            .bind(&serde_json::json!({"from": from_s, "to": to_s}).to_string()).bind(1i64).bind(&cid).bind(idempotency_key).bind("harness")
+            .bind(serde_json::json!({"from": from_s, "to": to_s}).to_string()).bind(1i64).bind(&cid).bind(idempotency_key).bind("harness")
             .execute(&mut *tx).await.map_err(db_err)?;
 
         idempotency::record_in_tx(&mut tx, idempotency_key, "ok").await?;
@@ -344,7 +344,7 @@ impl TransitionService {
 
         sqlx::query("INSERT INTO event_log (id, stream_id, stream_version, event_type, payload_json, schema_version, correlation_id, idempotency_key, source) VALUES (?,?,?,?,?,?,?,?,?)")
             .bind(&event_id).bind(execution_id).bind(sv).bind("execution_lifecycle_changed")
-            .bind(&serde_json::json!({"from": current_lc, "to": to_s, "reason": reason}).to_string()).bind(1i64).bind(&cid).bind(idempotency_key).bind("harness")
+            .bind(serde_json::json!({"from": current_lc, "to": to_s, "reason": reason}).to_string()).bind(1i64).bind(&cid).bind(idempotency_key).bind("harness")
             .execute(&mut *tx).await.map_err(db_err)?;
 
         idempotency::record_in_tx(&mut tx, idempotency_key, "ok").await?;

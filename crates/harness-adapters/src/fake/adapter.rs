@@ -7,9 +7,8 @@ use async_trait::async_trait;
 use harness_core::contracts::agent_adapter::{
     AgentAdapter, AgentConfigInfo, AgentSession, AuthCheckResult, DetectionResult, SessionOptions,
 };
-use harness_core::contracts::agent_event::AgentEvent;
 use harness_core::contracts::runtime_profile::{
-    ActiveProbeChecks, ActiveValidationResult, RuntimeProfile, TriState,
+    ActiveProbeChecks, ActiveValidationResult, RuntimeProfile,
 };
 use harness_core::contracts::task_envelope::TaskEnvelope;
 use harness_core::{CoreError, ErrorCode, ErrorSource};
@@ -200,9 +199,10 @@ impl AgentSession for FakeAgentSession {
 mod tests {
     use super::*;
     use harness_core::contracts::agent_adapter::SessionOptions;
+    use harness_core::contracts::agent_event::AgentEvent;
     use harness_core::contracts::runtime_profile::{
-        AuthMode, AuthStatus, CapabilitySet, CoreStatus, CredentialReference, ExecutionStatus,
-        OptionalCapabilities, ProviderSource, RequiredCapabilities,
+        AuthMode, AuthStatus, CapabilitySet, CoreStatus, ExecutionStatus, OptionalCapabilities,
+        ProviderSource, RequiredCapabilities, TriState,
     };
     use std::time::Duration;
 

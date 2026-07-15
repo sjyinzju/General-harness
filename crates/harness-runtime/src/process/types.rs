@@ -16,6 +16,13 @@ pub struct ProcessSpec {
     pub stdout_capture: CapturePolicy,
     pub stderr_capture: CapturePolicy,
     pub output_byte_limit: usize,
+    /// Harness-owned artifact directory for spool files. Required when either
+    /// capture policy is `Spool`. Must NEVER point into a user git worktree
+    /// (create it via `crate::artifact::ArtifactRoot`).
+    pub spool_dir: Option<PathBuf>,
+    /// Known secret values of this execution (e.g. injected credential env
+    /// values). Redacted from previews, errors, and tracing fields.
+    pub known_secrets: Vec<String>,
     pub execution_id: String,
     pub runtime_profile_id: String,
 }
@@ -56,8 +63,39 @@ pub struct ProcessOutcome {
     pub stdout_bytes: u64,
     pub stderr_bytes: u64,
     pub duration_ms: u64,
+    /// Spool file reference (path) when the stream spilled to disk.
     pub stdout_ref: Option<String>,
     pub stderr_ref: Option<String>,
+    /// True when the stream exceeded `output_byte_limit` (excess was drained
+    /// but not stored).
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    /// Redacted, lossy-decoded head of the stream (bounded).
+    pub stdout_preview: Option<String>,
+    pub stderr_preview: Option<String>,
+}
+
+impl ProcessOutcome {
+    /// Outcome skeleton before capture results are folded in.
+    pub(crate) fn skeleton(
+        termination: ProcessTermination,
+        exit_code: Option<i32>,
+        duration_ms: u64,
+    ) -> Self {
+        Self {
+            termination,
+            exit_code,
+            stdout_bytes: 0,
+            stderr_bytes: 0,
+            duration_ms,
+            stdout_ref: None,
+            stderr_ref: None,
+            stdout_truncated: false,
+            stderr_truncated: false,
+            stdout_preview: None,
+            stderr_preview: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
