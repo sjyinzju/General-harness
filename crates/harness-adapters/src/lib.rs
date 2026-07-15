@@ -1,16 +1,7 @@
-//! harness-adapters: FakeAgentAdapter, ClaudeCliAdapter, CodexCliAdapter, AgentDiscovery.
-//! Depends on harness-core, tokio.
+//! harness-adapters: AgentAdapter implementations + Contract Test Suite.
 
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+pub mod fake;
+pub mod contract_test;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        assert_eq!(add(2, 2), 4);
-    }
-}
+pub use fake::FakeAgentAdapter;
+pub use contract_test::AdapterContractTest;

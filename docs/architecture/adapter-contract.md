@@ -144,3 +144,26 @@ Gate C (Contract Freeze v1):
   - AgentEvent v1 冻结
   - 之后通过 migration 演进
 ```
+
+---
+
+## 5. Agent Environment Protection Rules
+
+Harness MUST NOT:
+
+1. Auto-upgrade Codex, Claude, or any Agent CLI (npm, winget, brew, pip, etc.)
+2. Modify user PATH
+3. Modify, delete, overwrite, or reformat user's `config.toml` or any Agent config file
+4. Read `auth.json`, API keys, access tokens, or system credentials
+5. Auto-switch login accounts
+6. Auto-change the default model
+7. Auto-change service tier
+8. Auto-enable, disable, or modify MCP servers
+9. Use hardcoded `-m <model>`, `-c service_tier=`, or fixed `CODEX_HOME` overrides
+10. Use App-bundled CLI paths instead of PATH-discovered executables
+
+Default invocation form: `<discovered-executable> exec --json ...` (no fixed overrides)
+
+Model/service-tier override ONLY when: user explicitly selects, RuntimeProfile has explicit config, or Task requires capability. Override value MUST be shown to user before invocation.
+
+Configuration priority: `task override > user RuntimeProfile override > inherited Agent CLI config`
