@@ -6,6 +6,7 @@
 pub mod contracts;
 pub mod error;
 pub mod policies;
+pub mod resource_claim;
 pub mod state_machine;
 
 pub use error::{CoreError, ErrorCode, ErrorSource};
