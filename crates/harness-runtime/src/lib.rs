@@ -5,6 +5,7 @@ pub mod event_log;
 pub mod idempotency;
 pub mod lease;
 pub mod operation;
+pub mod policy;
 pub mod process;
 pub mod repo;
 pub mod transition;

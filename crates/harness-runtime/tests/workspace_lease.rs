@@ -1,4 +1,4 @@
-﻿//! I2B-2 WorkspaceLeaseService integration tests.
+//! I2B-2 WorkspaceLeaseService integration tests.
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -75,13 +75,17 @@ fn spec() -> LeaseSpec {
 }
 
 fn svc(pool: &SqlitePool) -> WorkspaceLeaseService {
-    WorkspaceLeaseService::new(pool.clone(), Arc::new(SystemClock), LeaseConfig::default())
+    WorkspaceLeaseService::new_unverified_for_tests(
+        pool.clone(),
+        Arc::new(SystemClock),
+        LeaseConfig::default(),
+    )
 }
 fn svcc(pool: &SqlitePool, clock: Arc<TestClock>) -> WorkspaceLeaseService {
-    WorkspaceLeaseService::new(pool.clone(), clock, LeaseConfig::default())
+    WorkspaceLeaseService::new_unverified_for_tests(pool.clone(), clock, LeaseConfig::default())
 }
 fn svc_with_fast_hb(pool: &SqlitePool) -> WorkspaceLeaseService {
-    WorkspaceLeaseService::new(
+    WorkspaceLeaseService::new_unverified_for_tests(
         pool.clone(),
         Arc::new(SystemClock),
         LeaseConfig {

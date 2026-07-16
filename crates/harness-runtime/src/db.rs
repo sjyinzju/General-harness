@@ -111,6 +111,8 @@ mod tests {
                 "execution_attempts",
                 "idempotency_records",
                 "operations",
+                "policy_evaluations",
+                "policy_findings",
                 "projects",
                 "resource_claims",
                 "runtime_profiles",
@@ -119,7 +121,7 @@ mod tests {
                 "workspace_leases",
                 "worktrees"
             ],
-            "11 business tables expected (001–004)"
+            "13 business tables expected (001–006)"
         );
     }
 

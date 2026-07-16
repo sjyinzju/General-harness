@@ -28,7 +28,31 @@ pub struct WorkspaceLeaseService {
 }
 
 impl WorkspaceLeaseService {
-    pub fn new(pool: SqlitePool, clock: Arc<dyn Clock + Send + Sync>, config: LeaseConfig) -> Self {
+    /// Production constructor: git verifier is MANDATORY. Without it
+    /// the service cannot verify that a worktree is still registered
+    /// in git's worktree list during acquire.
+    pub fn new(
+        pool: SqlitePool,
+        clock: Arc<dyn Clock + Send + Sync>,
+        config: LeaseConfig,
+        git_verifier: Box<dyn crate::worktree::WorktreeGitVerifier>,
+    ) -> Self {
+        Self {
+            transitions: LeaseTransitionService::new(pool.clone()),
+            pool,
+            clock,
+            config,
+            git_verifier: Some(git_verifier),
+        }
+    }
+
+    /// Test-only constructor: skips git-level worktree verification.
+    /// Explicitly named to prevent accidental production use.
+    pub fn new_unverified_for_tests(
+        pool: SqlitePool,
+        clock: Arc<dyn Clock + Send + Sync>,
+        config: LeaseConfig,
+    ) -> Self {
         Self {
             transitions: LeaseTransitionService::new(pool.clone()),
             pool,
@@ -36,15 +60,6 @@ impl WorkspaceLeaseService {
             config,
             git_verifier: None,
         }
-    }
-
-    /// Inject a git-level worktree verifier (production path).
-    pub fn with_git_verifier(
-        mut self,
-        verifier: Box<dyn crate::worktree::WorktreeGitVerifier>,
-    ) -> Self {
-        self.git_verifier = Some(verifier);
-        self
     }
 
     // ── Acquire ──────────────────────────────────────────────────
