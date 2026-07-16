@@ -8,6 +8,7 @@ pub mod operation;
 pub mod policy;
 pub mod process;
 pub mod repo;
+pub mod resource_claim;
 pub mod transition;
 pub mod worktree;
 

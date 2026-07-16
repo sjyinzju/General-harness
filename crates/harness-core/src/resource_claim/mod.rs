@@ -29,7 +29,7 @@ mod normalize;
 mod spec;
 mod types;
 
-pub use engine::ResourceOverlapEngine;
+pub use engine::{ExistingClaim, ResourceOverlapEngine};
 pub use normalize::NormalizedResourcePath;
 pub use spec::{
     ClaimGroupIdentity, ClaimGroupSpec, ResourceClaimRecord, ResourceClaimSpec,
