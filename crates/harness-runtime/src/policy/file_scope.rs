@@ -1,8 +1,22 @@
-//! FileScopeValidator.
+//! FileScopeValidator — workspace path safety and write-scope enforcement.
+//!
+//! Security model (I2B-3 closure):
+//! - Absolute / drive / UNC / root-relative paths are rejected.
+//! - Any `..` path component is rejected (component-based, not substring).
+//! - Windows reserved device names are rejected (case-insensitive, trailing
+//!   spaces/dots stripped, ADS `:` stripped before the stem check).
+//! - Windows alternate data streams (`:` in a component) are rejected.
+//! - Symlink / junction escape is detected by partial canonicalization of
+//!   the nearest existing ancestor and explicitly denied.
+//! - `.git` and harness metadata are protected case-insensitively.
+//! - Path/scope matching is case-insensitive on Windows and Unicode-NFC
+//!   normalized, so `.GIT`, `Secret/`, or NFD-encoded names cannot bypass a
+//!   forbidden/allowed rule.
 use std::path::{Component, Path, PathBuf};
 
 use harness_core::contracts::task_envelope::FileScope;
 use harness_core::{CoreError, ErrorCode, ErrorSource};
+use unicode_normalization::UnicodeNormalization;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedWorkspacePath(String);
@@ -37,7 +51,7 @@ pub enum ScopeViolation {
     ReservedDeviceName,
     TraversalRejected,
     AbsolutePathRejected,
-    PrefixConfusion(String),
+    AlternateDataStream,
 }
 
 pub struct FileScopeValidator {
@@ -60,32 +74,52 @@ impl FileScopeValidator {
     }
 
     pub fn validate(&self, path: &str) -> Result<(ScopeDecision, PathBuf), CoreError> {
+        // Normalize separators and strip trailing slashes.
         let n = path.replace('\\', "/").trim_end_matches('/').to_string();
-        if path.starts_with('/')
-            || (cfg!(windows) && path.len() >= 2 && &path[1..2] == ":")
-            || path.starts_with("\\\\")
-        {
+
+        // Absolute / drive / UNC / root-relative rejection. Uses the
+        // separator-normalized form so single-backslash (`\foo`) and UNC
+        // (`\\srv\share`) paths are caught alongside `/etc` and `C:/`.
+        let is_drive = cfg!(windows)
+            && n.len() >= 2
+            && n.as_bytes()[0].is_ascii_alphabetic()
+            && n.as_bytes()[1] == b':'
+            && (n.len() == 2 || n.as_bytes()[2] == b'/');
+        if n.starts_with('/') || is_drive {
             return Ok((
                 ScopeDecision::Denied(ScopeViolation::AbsolutePathRejected),
                 PathBuf::new(),
             ));
         }
-        if n.contains("/..") || n == ".." || n.starts_with("../") {
-            return Ok((
-                ScopeDecision::Denied(ScopeViolation::TraversalRejected),
-                PathBuf::new(),
-            ));
-        }
+
+        // Per-component checks: traversal, ADS, reserved device names.
         for c in Path::new(&n).components() {
-            if let Component::Normal(p) = c {
-                if is_reserved(&p.to_string_lossy()) {
+            match c {
+                Component::ParentDir => {
                     return Ok((
-                        ScopeDecision::Denied(ScopeViolation::ReservedDeviceName),
+                        ScopeDecision::Denied(ScopeViolation::TraversalRejected),
                         PathBuf::new(),
                     ));
                 }
+                Component::Normal(p) => {
+                    let s = p.to_string_lossy();
+                    if cfg!(windows) && s.contains(':') {
+                        return Ok((
+                            ScopeDecision::Denied(ScopeViolation::AlternateDataStream),
+                            PathBuf::new(),
+                        ));
+                    }
+                    if is_reserved(&s) {
+                        return Ok((
+                            ScopeDecision::Denied(ScopeViolation::ReservedDeviceName),
+                            PathBuf::new(),
+                        ));
+                    }
+                }
+                _ => {}
             }
         }
+
         let cand = self.worktree_root.join(&n);
         let (can, ur) = partial_canon(&cand)?;
         if !can.starts_with(&self.worktree_root) {
@@ -101,20 +135,22 @@ impl FileScopeValidator {
             .unwrap_or_default()
             .trim_start_matches('/')
             .to_string();
-        if is_git(&rel) {
+        let rel_n = normalize(&rel);
+
+        if is_git(&rel_n) {
             return Ok((
                 ScopeDecision::Denied(ScopeViolation::GitMetadataProtected),
                 full,
             ));
         }
-        if is_harness(&rel) {
+        if is_harness(&rel_n) {
             return Ok((
                 ScopeDecision::Denied(ScopeViolation::HarnessMetadataProtected),
                 full,
             ));
         }
         for d in &self.scope.forbidden_paths {
-            if gm(&rel, d) {
+            if gm(&rel_n, &normalize(d)) {
                 return Ok((ScopeDecision::Denied(ScopeViolation::DeniedPath), full));
             }
         }
@@ -122,13 +158,7 @@ impl FileScopeValidator {
             return Ok((ScopeDecision::Allowed, full));
         }
         for a in &self.scope.allowed_paths {
-            if gm(&rel, a) {
-                if !a.contains('*') && rel.len() < a.len() && a.starts_with(&rel) {
-                    return Ok((
-                        ScopeDecision::Denied(ScopeViolation::PrefixConfusion(a.clone())),
-                        full,
-                    ));
-                }
+            if gm(&rel_n, &normalize(a)) {
                 return Ok((ScopeDecision::Allowed, full));
             }
         }
@@ -136,6 +166,17 @@ impl FileScopeValidator {
             ScopeDecision::Denied(ScopeViolation::OutsideWriteScope),
             full,
         ))
+    }
+}
+
+/// NFC-normalize, and on Windows also lowercase, so that case and Unicode
+/// form cannot be used to dodge a rule.
+fn normalize(s: &str) -> String {
+    let nfc: String = s.nfc().collect();
+    if cfg!(windows) {
+        nfc.to_lowercase()
+    } else {
+        nfc
     }
 }
 
@@ -161,12 +202,20 @@ fn is_harness(p: &str) -> bool {
     p.contains(".harness")
 }
 fn is_reserved(n: &str) -> bool {
-    let b = n.split('.').next().unwrap_or(n).to_ascii_uppercase();
+    // Windows ignores trailing spaces and dots in file names; strip them so
+    // `CON ` / `CON.` are caught. Split on `.` and `:` to get the stem so
+    // `CON.txt` and `CON:ads` are caught.
+    let core = n.trim_end_matches([' ', '.']);
+    let stem = core
+        .split(['.', ':'])
+        .next()
+        .unwrap_or(core)
+        .to_ascii_uppercase();
     [
         "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
         "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     ]
-    .contains(&b.as_str())
+    .contains(&stem.as_str())
 }
 fn partial_canon(path: &Path) -> Result<(PathBuf, String), CoreError> {
     let mut e = path.to_path_buf();
@@ -209,6 +258,7 @@ mod tests {
         };
         (t, FileScopeValidator::new(&r, s).unwrap())
     }
+
     #[test]
     fn exact_file() {
         let (_t, v) = v(&["README.md"]);
@@ -256,16 +306,16 @@ mod tests {
         ));
     }
     #[test]
-    fn prefix() {
+    fn prefix_confusion_is_outside_scope() {
+        // "src/a" must NOT match the exact glob "src/ab". The only correct,
+        // stable denial reason is OutsideWriteScope (no PrefixConfusion
+        // variant exists — that dead branch was removed).
         let (_t, v) = v(&["src/ab"]);
         std::fs::write(v.worktree_root().join("src").join("a"), "").unwrap();
         let r = v.validate("src/a").unwrap().0;
         assert!(
-            matches!(
-                r,
-                ScopeDecision::Denied(ScopeViolation::PrefixConfusion { .. })
-            ) || matches!(r, ScopeDecision::Denied(ScopeViolation::OutsideWriteScope)),
-            "{r:?}"
+            matches!(r, ScopeDecision::Denied(ScopeViolation::OutsideWriteScope)),
+            "expected OutsideWriteScope, got {r:?}"
         );
     }
     #[test]
@@ -293,6 +343,14 @@ mod tests {
         ));
     }
     #[test]
+    fn gitmeta_case_insensitive() {
+        let (_t, v) = v(&["**"]);
+        assert!(matches!(
+            v.validate(".GIT/config").unwrap().0,
+            ScopeDecision::Denied(ScopeViolation::GitMetadataProtected)
+        ));
+    }
+    #[test]
     fn harnessmeta() {
         let (_t, v) = v(&["**"]);
         assert!(matches!(
@@ -307,5 +365,134 @@ mod tests {
             v.validate("con.txt").unwrap().0,
             ScopeDecision::Denied(ScopeViolation::ReservedDeviceName)
         ));
+    }
+    #[test]
+    fn reserved_trailing_space() {
+        let (_t, v) = v(&["**"]);
+        assert!(matches!(
+            v.validate("CON ").unwrap().0,
+            ScopeDecision::Denied(ScopeViolation::ReservedDeviceName)
+        ));
+    }
+    #[cfg(windows)]
+    #[test]
+    fn ads_rejected() {
+        let (_t, v) = v(&["**"]);
+        assert!(matches!(
+            v.validate("README.md:hidden").unwrap().0,
+            ScopeDecision::Denied(ScopeViolation::AlternateDataStream)
+        ));
+    }
+    #[test]
+    fn forbidden_case_insensitive() {
+        // On Windows `Secret/` must be denied when `secret/**` is forbidden.
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().join("w");
+        std::fs::create_dir_all(&r).unwrap();
+        let v2 = FileScopeValidator::new(
+            &r,
+            FileScope {
+                allowed_paths: vec!["**".into()],
+                forbidden_paths: vec!["secret/**".into()],
+                readable_paths: vec![],
+                scope_expansion_allowed: false,
+            },
+        )
+        .unwrap();
+        let d = v2.validate("Secret/key.txt").unwrap().0;
+        if cfg!(windows) {
+            assert!(
+                matches!(d, ScopeDecision::Denied(ScopeViolation::DeniedPath)),
+                "expected DeniedPath on Windows, got {d:?}"
+            );
+        } else {
+            assert!(matches!(d, ScopeDecision::Allowed), "{d:?}");
+        }
+    }
+    #[test]
+    fn unicode_normalization() {
+        // NFD-encoded `é` (U+0065 U+0301) must match an NFC `é` (U+00E9)
+        // forbidden rule.
+        let nfc_e = "\u{00e9}"; // é
+        let nfd_e = "e\u{0301}"; // e + combining acute
+        let t = tempfile::tempdir().unwrap();
+        let r = t.path().join("w");
+        std::fs::create_dir_all(&r).unwrap();
+        let forbidden = format!("caf{nfc_e}/**");
+        let v2 = FileScopeValidator::new(
+            &r,
+            FileScope {
+                allowed_paths: vec!["**".into()],
+                forbidden_paths: vec![forbidden],
+                readable_paths: vec![],
+                scope_expansion_allowed: false,
+            },
+        )
+        .unwrap();
+        let path = format!("caf{nfd_e}/secret.txt");
+        let d = v2.validate(&path).unwrap().0;
+        assert!(
+            matches!(d, ScopeDecision::Denied(ScopeViolation::DeniedPath)),
+            "NFD path must match NFC forbidden rule: {d:?}"
+        );
+    }
+    #[test]
+    fn symlink_escape_denied() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("w");
+        std::fs::create_dir_all(&root).unwrap();
+        let outside = t.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let link = root.join("link");
+        if make_symlink(&outside, &link).is_err() {
+            eprintln!("symlink creation unsupported on this platform/session — skipping");
+            return;
+        }
+        let v2 = FileScopeValidator::new(
+            &root,
+            FileScope {
+                allowed_paths: vec!["**".into()],
+                forbidden_paths: vec![],
+                readable_paths: vec![],
+                scope_expansion_allowed: false,
+            },
+        )
+        .unwrap();
+        let d = v2.validate("link/file").unwrap().0;
+        assert!(
+            matches!(d, ScopeDecision::Denied(ScopeViolation::SymlinkEscape)),
+            "expected SymlinkEscape, got {d:?}"
+        );
+    }
+    #[test]
+    fn nonexistent_under_allowed_scope_allowed() {
+        // A nonexistent path whose nearest existing ancestor is the
+        // worktree root must still be evaluated against scope rules — and
+        // allowed when under a `**` allow rule.
+        let (_t, v) = v(&["**"]);
+        let d = v.validate("nonexistent/dir/file.txt").unwrap().0;
+        assert!(
+            matches!(d, ScopeDecision::Allowed),
+            "nonexistent path under ** must be allowed, got {d:?}"
+        );
+    }
+
+    fn make_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_dir(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (target, link);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no symlinks",
+            ))
+        }
     }
 }

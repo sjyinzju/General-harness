@@ -133,15 +133,13 @@ fn denied_scope_priority() {
 #[test]
 fn prefix_confusion_detected() {
     let (_tmp, v) = file_scope_validator(&["src/ab"]);
-    // "src/a" must NOT match "src/ab" — outside scope (correct denial).
+    // "src/a" must NOT match the exact glob "src/ab". The only correct,
+    // stable denial reason is OutsideWriteScope.
     std::fs::write(v.worktree_root().join("src").join("a"), "").unwrap();
     let r = v.validate("src/a").unwrap().0;
     assert!(
-        matches!(
-            r,
-            ScopeDecision::Denied(ScopeViolation::PrefixConfusion { .. })
-        ) || matches!(r, ScopeDecision::Denied(ScopeViolation::OutsideWriteScope)),
-        "expected denial for 'src/a' under glob 'src/ab': {r:?}"
+        matches!(r, ScopeDecision::Denied(ScopeViolation::OutsideWriteScope)),
+        "expected OutsideWriteScope for 'src/a' under glob 'src/ab': {r:?}"
     );
 }
 
@@ -202,12 +200,10 @@ fn nonexistent_under_symlink_ancestor_caught() {
         scope_expansion_allowed: false,
     };
     let v = FileScopeValidator::new(&root, s).unwrap();
-    // Path doesn't exist, but component validation still applies.
+    // Path doesn't exist, but component validation still applies; under a
+    // `**` allow rule it must be Allowed (nearest-ancestor canonicalization).
     let result = v.validate("nonexistent/dir/file.txt");
-    assert!(!matches!(
-        result.unwrap().0,
-        ScopeDecision::Denied(ScopeViolation::OutsideWriteScope)
-    ));
+    assert!(matches!(result.unwrap().0, ScopeDecision::Allowed));
 }
 
 // ── 15-23: CommandPolicy ────────────────────────────────────────────
@@ -811,4 +807,47 @@ fn git_clean_fdx_detected() {
         ),
         "{d:?}"
     );
+}
+
+// ── Batch B: secret-preview redaction across all kinds ─────────────
+
+#[test]
+fn no_raw_secret_in_any_finding_kind() {
+    let known = "sk-super-secret-123";
+    let scanner = SecretScanner::new(vec![known.into()]);
+    let content = format!(
+        "token={known}\n\
+         -----BEGIN RSA PRIVATE KEY-----\nMIIEpAAABBBCCCsecretbody\n\
+         GITHUB_TOKEN=ghp_abcdef123456\n\
+         PASSWORD=hunter2\n"
+    );
+    let findings = scanner.scan_diff_file(".env", content.as_bytes());
+    assert!(!findings.is_empty());
+    for f in &findings {
+        assert!(!f.redacted_preview.contains(known), "{:?}", f.kind);
+        assert!(
+            !f.redacted_preview.contains("MIIEpAAABBBCCCsecretbody"),
+            "{:?}",
+            f.kind
+        );
+        assert!(
+            !f.redacted_preview.contains("ghp_abcdef123456"),
+            "{:?}",
+            f.kind
+        );
+        assert!(!f.redacted_preview.contains("hunter2"), "{:?}", f.kind);
+        assert!(!f.redacted_preview.contains("ghp_"), "{:?}", f.kind);
+    }
+}
+
+#[test]
+fn utf8_cjk_secret_scanned() {
+    let scanner = SecretScanner::new(vec!["real-secret".into()]);
+    let findings = scanner.scan_diff_file(".env", "密码=real-secret\n".as_bytes());
+    assert!(findings
+        .iter()
+        .any(|f| matches!(f.kind, SecretKind::KnownSecret { .. })));
+    assert!(findings
+        .iter()
+        .all(|f| !matches!(f.kind, SecretKind::BinarySkipped)));
 }

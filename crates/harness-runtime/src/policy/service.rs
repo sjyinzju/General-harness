@@ -297,7 +297,7 @@ impl WorkspacePolicyService {
                 byte_range_start: f.byte_range.map(|(s, _)| s as i64),
                 byte_range_end: f.byte_range.map(|(_, e)| e as i64),
                 redacted_preview: f.redacted_preview.clone(),
-                fingerprint: None,
+                fingerprint: f.fingerprint.clone(),
             };
             self.evidence_store.insert_finding(&pf).await?;
             findings.push(pf);
