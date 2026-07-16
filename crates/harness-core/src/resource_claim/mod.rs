@@ -31,10 +31,8 @@ mod types;
 
 pub use engine::{ExistingClaim, ResourceOverlapEngine};
 pub use normalize::NormalizedResourcePath;
-pub use spec::{
-    ClaimGroupIdentity, ClaimGroupSpec, ResourceClaimRecord, ResourceClaimSpec,
-};
+pub use spec::{ClaimGroupIdentity, ClaimGroupSpec, ResourceClaimRecord, ResourceClaimSpec};
 pub use types::{
-    AccessMode, ClaimConflict, ClaimDecision, ClaimLifecycle, ConflictReason,
-    LogicalResourceKey, ResourceIdentity, ResourceKind,
+    AccessMode, ClaimConflict, ClaimDecision, ClaimLifecycle, ConflictReason, LogicalResourceKey,
+    ResourceIdentity, ResourceKind,
 };

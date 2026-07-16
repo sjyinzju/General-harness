@@ -4,11 +4,11 @@
 //! conflicts with a set of existing active claims. It uses component-path
 //! semantics so `src/a/` does NOT match `src/ab/`.
 
+use super::normalize::NormalizedResourcePath;
 use super::spec::ClaimGroupSpec;
 use super::types::{
     AccessMode, ClaimConflict, ClaimDecision, ConflictReason, ResourceIdentity, ResourceKind,
 };
-use super::normalize::NormalizedResourcePath;
 
 /// A lightweight view of an existing active claim for conflict checking.
 #[derive(Debug, Clone)]
@@ -97,18 +97,12 @@ impl ResourceOverlapEngine {
             for j in (i + 1)..claims.len() {
                 let a = &claims[i];
                 let b = &claims[j];
-                if identity_overlaps(&a.identity, &b.identity)
-                    && !a.mode.is_compatible_with(b.mode)
+                if identity_overlaps(&a.identity, &b.identity) && !a.mode.is_compatible_with(b.mode)
                 {
                     conflicts.push((
                         a.clone(),
                         b.clone(),
-                        Self::classify_conflict_reason(
-                            &a.identity,
-                            a.mode,
-                            &b.identity,
-                            b.mode,
-                        ),
+                        Self::classify_conflict_reason(&a.identity, a.mode, &b.identity, b.mode),
                     ));
                 }
             }
@@ -125,12 +119,11 @@ impl ResourceOverlapEngine {
         if req_mode != ex_mode || !req_mode.is_compatible_with(ex_mode) {
             // Incompatible modes — figure out the structural reason.
             match (requested, existing) {
-                (
-                    ResourceIdentity::Logical { key: a },
-                    ResourceIdentity::Logical { key: b },
-                ) if a == b => ConflictReason::LogicalKeyCollision {
-                    key: a.to_string(),
-                },
+                (ResourceIdentity::Logical { key: a }, ResourceIdentity::Logical { key: b })
+                    if a == b =>
+                {
+                    ConflictReason::LogicalKeyCollision { key: a.to_string() }
+                }
                 (
                     ResourceIdentity::Path {
                         repository_identity: _repo_a,
@@ -230,10 +223,9 @@ fn identity_overlaps(a: &ResourceIdentity, b: &ResourceIdentity) -> bool {
                 _ => false, // shouldn't happen for validated paths
             }
         }
-        (
-            ResourceIdentity::Logical { key: key_a },
-            ResourceIdentity::Logical { key: key_b },
-        ) => key_a == key_b,
+        (ResourceIdentity::Logical { key: key_a }, ResourceIdentity::Logical { key: key_b }) => {
+            key_a == key_b
+        }
         // Path vs Logical → never overlap (different domains).
         _ => false,
     }
@@ -242,8 +234,8 @@ fn identity_overlaps(a: &ResourceIdentity, b: &ResourceIdentity) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource_claim::{LogicalResourceKey, ResourceClaimSpec};
     use crate::resource_claim::NormalizedResourcePath;
+    use crate::resource_claim::{LogicalResourceKey, ResourceClaimSpec};
 
     // ── Helpers ────────────────────────────────────────────────────────
 
@@ -398,7 +390,10 @@ mod tests {
     fn test_logical_same_key_conflict() {
         let existing = vec![ex_logical("database-schema", AccessMode::Write)];
         let spec = ClaimGroupSpec {
-            claims: vec![ResourceClaimSpec::logical("database-schema", AccessMode::Read)],
+            claims: vec![ResourceClaimSpec::logical(
+                "database-schema",
+                AccessMode::Read,
+            )],
             project_id: "p1".into(),
             task_id: "t-new".into(),
             execution_id: "e-new".into(),
@@ -454,7 +449,10 @@ mod tests {
     fn test_logical_vs_path_no_conflict() {
         let existing = vec![ex_file("src/a.rs", AccessMode::Write)];
         let spec = ClaimGroupSpec {
-            claims: vec![ResourceClaimSpec::logical("database-schema", AccessMode::Write)],
+            claims: vec![ResourceClaimSpec::logical(
+                "database-schema",
+                AccessMode::Write,
+            )],
             project_id: "p1".into(),
             task_id: "t-new".into(),
             execution_id: "e-new".into(),

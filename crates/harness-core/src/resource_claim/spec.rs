@@ -91,11 +91,12 @@ impl ResourceClaimSpec {
                     .ok_or("path claim missing repository_identity")?;
                 // RepositoryWide has no specific path — empty string is valid.
                 let raw_path = self.resource_path.as_deref().unwrap_or("");
-                let normalized = if matches!(self.kind, ResourceKind::RepositoryWide) && raw_path.is_empty() {
-                    String::new()
-                } else {
-                    NormalizedResourcePath::new(raw_path)?.to_string()
-                };
+                let normalized =
+                    if matches!(self.kind, ResourceKind::RepositoryWide) && raw_path.is_empty() {
+                        String::new()
+                    } else {
+                        NormalizedResourcePath::new(raw_path)?.to_string()
+                    };
                 Ok(ResourceIdentity::Path {
                     repository_identity: repo.to_string(),
                     kind: self.kind.clone(),
@@ -242,10 +243,7 @@ enum OverlapResult {
 ///
 /// Returns `None` when the identities are in different scopes (different repos,
 /// or one path and one logical).
-fn identity_overlap(
-    a: Option<&ResourceIdentity>,
-    b: Option<&ResourceIdentity>,
-) -> OverlapResult {
+fn identity_overlap(a: Option<&ResourceIdentity>, b: Option<&ResourceIdentity>) -> OverlapResult {
     let a = match a {
         Some(id) => id,
         None => return OverlapResult::Disjoint,
@@ -305,14 +303,10 @@ fn identity_overlap(
             }
 
             // Component-prefix check: does directory A contain file/dir B?
-            let path_a_norm =
-                NormalizedResourcePath::new(path_a).unwrap_or_else(|_| {
-                    NormalizedResourcePath::new("__invalid__").unwrap()
-                });
-            let path_b_norm =
-                NormalizedResourcePath::new(path_b).unwrap_or_else(|_| {
-                    NormalizedResourcePath::new("__invalid__").unwrap()
-                });
+            let path_a_norm = NormalizedResourcePath::new(path_a)
+                .unwrap_or_else(|_| NormalizedResourcePath::new("__invalid__").unwrap());
+            let path_b_norm = NormalizedResourcePath::new(path_b)
+                .unwrap_or_else(|_| NormalizedResourcePath::new("__invalid__").unwrap());
 
             let a_is_dir = matches!(kind_a, ResourceKind::DirectoryPrefix);
             let b_is_dir = matches!(kind_b, ResourceKind::DirectoryPrefix);
@@ -326,10 +320,7 @@ fn identity_overlap(
 
             OverlapResult::Disjoint
         }
-        (
-            ResourceIdentity::Logical { key: key_a },
-            ResourceIdentity::Logical { key: key_b },
-        ) => {
+        (ResourceIdentity::Logical { key: key_a }, ResourceIdentity::Logical { key: key_b }) => {
             if key_a == key_b {
                 OverlapResult::Same
             } else {
@@ -577,9 +568,11 @@ mod tests {
     #[test]
     fn test_claim_group_record_roundtrip() {
         let spec = ClaimGroupSpec {
-            claims: vec![
-                ResourceClaimSpec::exact_file("repo", "src/a.rs", AccessMode::Write),
-            ],
+            claims: vec![ResourceClaimSpec::exact_file(
+                "repo",
+                "src/a.rs",
+                AccessMode::Write,
+            )],
             project_id: "p1".into(),
             task_id: "t1".into(),
             execution_id: "e1".into(),

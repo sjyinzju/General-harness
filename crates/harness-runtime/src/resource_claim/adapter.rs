@@ -24,9 +24,7 @@ pub enum DeriveClaimsOutcome {
     Claims(ClaimGroupSpec),
     /// The scope is too broad to safely derive claims; explicit
     /// [`ResourceClaimSpec`] is required.
-    RequiresExplicitClaim {
-        reason: String,
-    },
+    RequiresExplicitClaim { reason: String },
 }
 
 /// Derive conservative [`ClaimGroupSpec`] from a [`TaskEnvelope`].
@@ -224,9 +222,10 @@ fn convert_explicit_claim(
                 mode,
             ))
         }
-        "repo" | "repository_wide" => {
-            Some(ResourceClaimSpec::repository_wide(repository_identity, mode))
-        }
+        "repo" | "repository_wide" => Some(ResourceClaimSpec::repository_wide(
+            repository_identity,
+            mode,
+        )),
         "logical" => {
             let key = rc.resource_name.as_deref()?;
             Some(ResourceClaimSpec::logical(key, mode))
@@ -323,10 +322,7 @@ mod tests {
         let result = derive_claims_from_envelope(&env, "repo");
         match result {
             DeriveClaimsOutcome::Claims(spec) => {
-                let read_claim = spec
-                    .claims
-                    .iter()
-                    .find(|c| c.mode == AccessMode::Read);
+                let read_claim = spec.claims.iter().find(|c| c.mode == AccessMode::Read);
                 assert!(read_claim.is_some());
             }
             _ => panic!("expected Claims"),
@@ -336,14 +332,13 @@ mod tests {
     #[test]
     fn test_explicit_logical_claim_converted() {
         let mut env = envelope(&["src/a.rs"], &[]);
-        env.resource_claims.push(
-            harness_core::contracts::task_envelope::ResourceClaim {
+        env.resource_claims
+            .push(harness_core::contracts::task_envelope::ResourceClaim {
                 resource_type: "logical".into(),
                 resource_path: None,
                 resource_name: Some("database-schema".into()),
                 access_mode: "write".into(),
-            },
-        );
+            });
         let result = derive_claims_from_envelope(&env, "repo");
         match result {
             DeriveClaimsOutcome::Claims(spec) => {

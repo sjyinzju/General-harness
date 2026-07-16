@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use harness_core::resource_claim::{ClaimGroupSpec, ClaimDecision};
+use harness_core::resource_claim::{ClaimDecision, ClaimGroupSpec};
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 
 use super::repo::{AcquireOutcome, ClaimGroupRecord, ClaimGuard, ResourceClaimRepo};
@@ -27,10 +27,7 @@ pub trait ResourceClaimLeaseValidator: Send + Sync {
     ) -> Result<(), CoreError>;
 
     /// Get the lease's current expiry, or None if not found.
-    async fn get_lease_expires_at(
-        &self,
-        lease_id: &str,
-    ) -> Result<Option<String>, CoreError>;
+    async fn get_lease_expires_at(&self, lease_id: &str) -> Result<Option<String>, CoreError>;
 }
 
 pub struct ResourceClaimService {
@@ -56,10 +53,7 @@ impl ResourceClaimService {
     }
 
     /// Check conflicts (read-only, no validation needed).
-    pub async fn check_conflicts(
-        &self,
-        spec: &ClaimGroupSpec,
-    ) -> Result<ClaimDecision, CoreError> {
+    pub async fn check_conflicts(&self, spec: &ClaimGroupSpec) -> Result<ClaimDecision, CoreError> {
         self.repo.check_conflicts(spec).await
     }
 
@@ -211,10 +205,7 @@ impl ResourceClaimService {
         })?;
 
         let now = self.clock.now();
-        let remaining = lease_dt
-            .signed_duration_since(now)
-            .num_seconds()
-            .max(0) as u32;
+        let remaining = lease_dt.signed_duration_since(now).num_seconds().max(0) as u32;
 
         if remaining == 0 {
             return Err(CoreError::new(

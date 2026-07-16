@@ -54,18 +54,12 @@ pub enum ResourceIdentity {
         normalized_path: String,
     },
     /// A logical resource key — conflicts only with the exact same key.
-    Logical {
-        key: LogicalResourceKey,
-    },
+    Logical { key: LogicalResourceKey },
 }
 
 impl ResourceIdentity {
     /// Build a path-scoped identity.
-    pub fn path(
-        repository_identity: &str,
-        kind: ResourceKind,
-        normalized_path: &str,
-    ) -> Self {
+    pub fn path(repository_identity: &str, kind: ResourceKind, normalized_path: &str) -> Self {
         ResourceIdentity::Path {
             repository_identity: repository_identity.to_string(),
             kind,
@@ -82,7 +76,8 @@ impl ResourceIdentity {
     pub fn repository_identity(&self) -> Option<&str> {
         match self {
             ResourceIdentity::Path {
-                repository_identity, ..
+                repository_identity,
+                ..
             } => Some(repository_identity.as_str()),
             ResourceIdentity::Logical { .. } => None,
         }
@@ -162,9 +157,7 @@ pub enum ConflictReason {
         existing_path: String,
     },
     /// Logical resource keys are identical.
-    LogicalKeyCollision {
-        key: String,
-    },
+    LogicalKeyCollision { key: String },
     /// A RepositoryWide claim covers the requested path resource.
     RepositoryWideCoversPath {
         repository_identity: String,
@@ -200,11 +193,7 @@ pub enum ClaimDecision {
     /// All claims compatible — can acquire.
     Compatible,
     /// One or more claims conflict.
-    Conflict {
-        conflicts: Vec<ClaimConflict>,
-    },
+    Conflict { conflicts: Vec<ClaimConflict> },
     /// The claim group spec contains internal inconsistencies.
-    InvalidSpec {
-        reason: String,
-    },
+    InvalidSpec { reason: String },
 }

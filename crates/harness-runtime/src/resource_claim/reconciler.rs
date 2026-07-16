@@ -19,15 +19,9 @@ pub enum ClaimAnomaly {
         expires_at: String,
     },
     /// Active claim group whose associated lease is Released.
-    ActiveLeaseReleased {
-        group_id: String,
-        lease_id: String,
-    },
+    ActiveLeaseReleased { group_id: String, lease_id: String },
     /// Active claim group whose associated lease is Expired.
-    ActiveLeaseExpired {
-        group_id: String,
-        lease_id: String,
-    },
+    ActiveLeaseExpired { group_id: String, lease_id: String },
     /// Active claim group with a stale fencing token (not equal to current epoch).
     StaleFencingToken {
         group_id: String,
@@ -56,27 +50,21 @@ pub enum ClaimAnomaly {
         worktree_id: String,
     },
     /// Claim group with no child claim rows.
-    ClaimGroupWithoutRows {
-        group_id: String,
-    },
+    ClaimGroupWithoutRows { group_id: String },
     /// Orphan claim rows (NULL group_id or group doesn't exist).
     ClaimRowsWithoutGroup {
         claim_id: String,
         group_id: Option<String>,
     },
     /// Inconsistent claim row count vs expected.
-    IncompleteClaimGroup {
-        group_id: String,
-    },
+    IncompleteClaimGroup { group_id: String },
     /// Multiple active claim groups with conflicting resources.
     MultipleConflictingActiveGroups {
         group_id_a: String,
         group_id_b: String,
     },
     /// Repository identity mismatch between group and worktree.
-    RepositoryIdentityMismatch {
-        group_id: String,
-    },
+    RepositoryIdentityMismatch { group_id: String },
 }
 
 /// Outcome of a reconciliation run.
@@ -202,13 +190,11 @@ impl ResourceClaimReconciler {
         .map_err(db_err)?;
 
         for (group_id, claim_fencing, current_epoch) in &rows {
-            report
-                .anomalies
-                .push(ClaimAnomaly::StaleFencingToken {
-                    group_id: group_id.clone(),
-                    claim_fencing: *claim_fencing,
-                    current_epoch: *current_epoch,
-                });
+            report.anomalies.push(ClaimAnomaly::StaleFencingToken {
+                group_id: group_id.clone(),
+                claim_fencing: *claim_fencing,
+                current_epoch: *current_epoch,
+            });
         }
         Ok(())
     }
@@ -226,13 +212,11 @@ impl ResourceClaimReconciler {
         .map_err(db_err)?;
 
         for (group_id, execution_id, lifecycle) in &exec_rows {
-            report
-                .anomalies
-                .push(ClaimAnomaly::OwnerExecutionTerminal {
-                    group_id: group_id.clone(),
-                    execution_id: execution_id.clone(),
-                    lifecycle: lifecycle.clone(),
-                });
+            report.anomalies.push(ClaimAnomaly::OwnerExecutionTerminal {
+                group_id: group_id.clone(),
+                execution_id: execution_id.clone(),
+                lifecycle: lifecycle.clone(),
+            });
             self.expire_group(group_id).await?;
             report.expired.push(group_id.clone());
         }
@@ -246,12 +230,10 @@ impl ResourceClaimReconciler {
         .map_err(db_err)?;
 
         for (group_id, execution_id) in &lost_rows {
-            report
-                .anomalies
-                .push(ClaimAnomaly::OwnerExecutionLost {
-                    group_id: group_id.clone(),
-                    execution_id: execution_id.clone(),
-                });
+            report.anomalies.push(ClaimAnomaly::OwnerExecutionLost {
+                group_id: group_id.clone(),
+                execution_id: execution_id.clone(),
+            });
             self.expire_group(group_id).await?;
             report.expired.push(group_id.clone());
         }
@@ -272,12 +254,10 @@ impl ResourceClaimReconciler {
         .map_err(db_err)?;
 
         for (group_id, worktree_id) in &missing_rows {
-            report
-                .anomalies
-                .push(ClaimAnomaly::WorktreeMissing {
-                    group_id: group_id.clone(),
-                    worktree_id: worktree_id.clone(),
-                });
+            report.anomalies.push(ClaimAnomaly::WorktreeMissing {
+                group_id: group_id.clone(),
+                worktree_id: worktree_id.clone(),
+            });
         }
 
         // Removed worktrees.
@@ -289,12 +269,10 @@ impl ResourceClaimReconciler {
         .map_err(db_err)?;
 
         for (group_id, worktree_id) in &removed_rows {
-            report
-                .anomalies
-                .push(ClaimAnomaly::WorktreeRemoved {
-                    group_id: group_id.clone(),
-                    worktree_id: worktree_id.clone(),
-                });
+            report.anomalies.push(ClaimAnomaly::WorktreeRemoved {
+                group_id: group_id.clone(),
+                worktree_id: worktree_id.clone(),
+            });
             self.expire_group(group_id).await?;
             report.expired.push(group_id.clone());
         }
@@ -314,11 +292,9 @@ impl ResourceClaimReconciler {
         .map_err(db_err)?;
 
         for (group_id,) in &rows {
-            report
-                .anomalies
-                .push(ClaimAnomaly::ClaimGroupWithoutRows {
-                    group_id: group_id.clone(),
-                });
+            report.anomalies.push(ClaimAnomaly::ClaimGroupWithoutRows {
+                group_id: group_id.clone(),
+            });
             self.expire_group(group_id).await?;
             report.expired.push(group_id.clone());
         }
@@ -337,12 +313,10 @@ impl ResourceClaimReconciler {
         .map_err(db_err)?;
 
         for (claim_id, group_id) in &rows {
-            report
-                .anomalies
-                .push(ClaimAnomaly::ClaimRowsWithoutGroup {
-                    claim_id: claim_id.clone(),
-                    group_id: group_id.clone(),
-                });
+            report.anomalies.push(ClaimAnomaly::ClaimRowsWithoutGroup {
+                claim_id: claim_id.clone(),
+                group_id: group_id.clone(),
+            });
         }
         Ok(())
     }

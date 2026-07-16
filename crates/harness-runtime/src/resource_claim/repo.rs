@@ -6,8 +6,8 @@
 //! single atomic window.
 
 use harness_core::resource_claim::{
-    AccessMode, ClaimConflict, ClaimDecision, ClaimGroupSpec, ClaimLifecycle,
-    ExistingClaim, ResourceIdentity, ResourceKind, ResourceOverlapEngine,
+    AccessMode, ClaimConflict, ClaimDecision, ClaimGroupSpec, ClaimLifecycle, ExistingClaim,
+    ResourceIdentity, ResourceKind, ResourceOverlapEngine,
 };
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
@@ -51,15 +51,11 @@ pub enum AcquireOutcome {
     /// Idempotent replay: same idempotency key returned the existing group.
     AlreadyAcquired(ClaimGroupRecord),
     /// One or more claims conflict with existing active claims.
-    Conflict {
-        conflicts: Vec<ClaimConflict>,
-    },
+    Conflict { conflicts: Vec<ClaimConflict> },
     /// Idempotency key exists but with a different request hash.
     IdempotencyConflict,
     /// The spec was invalid (empty group, bad paths, etc.).
-    InvalidSpec {
-        reason: String,
-    },
+    InvalidSpec { reason: String },
 }
 
 /// A persisted claim group with its child claim rows.
@@ -116,10 +112,7 @@ impl ResourceClaimRepo {
 
     /// Check whether a [`ClaimGroupSpec`] conflicts with any active claims.
     /// This is a read-only operation and does not reserve resources.
-    pub async fn check_conflicts(
-        &self,
-        spec: &ClaimGroupSpec,
-    ) -> Result<ClaimDecision, CoreError> {
+    pub async fn check_conflicts(&self, spec: &ClaimGroupSpec) -> Result<ClaimDecision, CoreError> {
         let active = self.load_active_claims().await?;
         let existing: Vec<ExistingClaim> = active
             .iter()
@@ -715,10 +708,7 @@ impl ResourceClaimRepo {
     }
 
     /// Load all claim rows for a group.
-    async fn load_group_claims(
-        &self,
-        group_id: &str,
-    ) -> Result<Vec<ClaimRowRecord>, CoreError> {
+    async fn load_group_claims(&self, group_id: &str) -> Result<Vec<ClaimRowRecord>, CoreError> {
         let rows: Vec<ClaimRow> = sqlx::query_as(
             "SELECT id, group_id, resource_kind, normalized_resource, access_mode, lifecycle FROM resource_claims WHERE group_id = ?",
         )
@@ -745,13 +735,12 @@ impl ResourceClaimRepo {
         &self,
         ikey: &str,
     ) -> Result<Option<ClaimGroupRecord>, CoreError> {
-        let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT status, result_json FROM idempotency_records WHERE key = ?",
-        )
-        .bind(ikey)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT status, result_json FROM idempotency_records WHERE key = ?")
+                .bind(ikey)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
 
         match row {
             Some((_status, result_json)) if !result_json.is_empty() => {
@@ -766,13 +755,12 @@ impl ResourceClaimRepo {
 
     /// Get the request hash for an existing idempotency key.
     async fn get_ikey_hash(&self, ikey: &str) -> Result<Option<String>, CoreError> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT request_hash FROM idempotency_records WHERE key = ?",
-        )
-        .bind(ikey)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT request_hash FROM idempotency_records WHERE key = ?")
+                .bind(ikey)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
         Ok(row.map(|r| r.0))
     }
 
@@ -788,14 +776,13 @@ impl ResourceClaimRepo {
             return Ok(());
         }
         // Get the next stream_version for this stream.
-        let max_ver: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(stream_version) FROM event_log WHERE stream_id = ?",
-        )
-        .bind(group_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?
-        .flatten();
+        let max_ver: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(stream_version) FROM event_log WHERE stream_id = ?")
+                .bind(group_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?
+                .flatten();
         let next_ver = max_ver.unwrap_or(0) + 1;
 
         let event_id = Uuid::new_v4().to_string();
@@ -875,10 +862,7 @@ fn rows_to_active_views(rows: Vec<ActiveClaimRow>) -> Vec<ActiveClaimView> {
                         &r.normalized_resource,
                     )
                     .unwrap_or_else(|_| {
-                        harness_core::resource_claim::LogicalResourceKey::new(
-                            "invalid",
-                        )
-                        .unwrap()
+                        harness_core::resource_claim::LogicalResourceKey::new("invalid").unwrap()
                     }),
                 },
                 _ => ResourceIdentity::Path {

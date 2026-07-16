@@ -20,12 +20,14 @@ async fn seed_world(pool: &SqlitePool, project_id: &str, task_id: &str, executio
         .execute(pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?, ?, 'test', 'pending')")
-        .bind(task_id)
-        .bind(project_id)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?, ?, 'test', 'pending')",
+    )
+    .bind(task_id)
+    .bind(project_id)
+    .execute(pool)
+    .await
+    .unwrap();
     sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id) VALUES (?, ?, 1, 'created', '')")
         .bind(execution_id)
         .bind(task_id)
@@ -108,14 +110,8 @@ async fn test_acquire_success() {
     let repo = ResourceClaimRepo::new(db.pool.clone());
 
     let spec = spec_exact("src/a.rs", AccessMode::Write);
-    let result = repo
-        .acquire_group(&spec, &guard(), "ikey-1")
-        .await
-        .unwrap();
-    assert!(matches!(
-        result,
-        AcquireOutcome::Acquired(_)
-    ));
+    let result = repo.acquire_group(&spec, &guard(), "ikey-1").await.unwrap();
+    assert!(matches!(result, AcquireOutcome::Acquired(_)));
 
     // Verify stored state.
     let active = repo.list_active_for_task("t1").await.unwrap();
@@ -139,10 +135,7 @@ async fn test_multi_resource_all_succeed() {
         .acquire_group(&spec, &guard(), "ikey-multi")
         .await
         .unwrap();
-    assert!(matches!(
-        result,
-        AcquireOutcome::Acquired(_)
-    ));
+    assert!(matches!(result, AcquireOutcome::Acquired(_)));
 
     let active = repo.list_active_for_task("t1").await.unwrap();
     assert_eq!(active.len(), 1);
@@ -189,13 +182,11 @@ async fn test_one_conflict_means_none_inserted() {
         ("src/a.rs", AccessMode::Read),
         ("src/b.rs", AccessMode::Write),
     ]);
-    let result = repo.acquire_group(&spec2, &g2, "ikey-conflict-2").await.unwrap();
-    assert!(
-        matches!(
-            result,
-            AcquireOutcome::Conflict { .. }
-        )
-    );
+    let result = repo
+        .acquire_group(&spec2, &g2, "ikey-conflict-2")
+        .await
+        .unwrap();
+    assert!(matches!(result, AcquireOutcome::Conflict { .. }));
 
     // Task 2 should have NO active claims (all-or-nothing).
     let active_t2 = repo.list_active_for_task("t2").await.unwrap();
@@ -217,10 +208,7 @@ async fn test_repeated_idempotent_acquire() {
         .acquire_group(&spec, &guard(), "ikey-idem")
         .await
         .unwrap();
-    assert!(matches!(
-        r1,
-        AcquireOutcome::Acquired(_)
-    ));
+    assert!(matches!(r1, AcquireOutcome::Acquired(_)));
 
     // Same key again — should return AlreadyAcquired.
     let r2 = repo
@@ -228,10 +216,7 @@ async fn test_repeated_idempotent_acquire() {
         .await
         .unwrap();
     assert!(
-        matches!(
-            r2,
-            AcquireOutcome::AlreadyAcquired(_)
-        ),
+        matches!(r2, AcquireOutcome::AlreadyAcquired(_)),
         "expected AlreadyAcquired, got {r2:?}"
     );
 
@@ -258,10 +243,7 @@ async fn test_same_key_different_hash_rejected() {
         .await
         .unwrap();
     assert!(
-        matches!(
-            result,
-            AcquireOutcome::IdempotencyConflict
-        ),
+        matches!(result, AcquireOutcome::IdempotencyConflict),
         "expected IdempotencyConflict, got {result:?}"
     );
 }
@@ -326,14 +308,8 @@ async fn test_concurrent_exact_write_one_winner() {
     let ok_count = r1.is_ok() as u8 + r2.is_ok() as u8;
     assert_eq!(ok_count, 2, "both should complete without error");
 
-    let acquired_count = matches!(
-        r1.unwrap(),
-        AcquireOutcome::Acquired(_)
-    ) as u8
-        + matches!(
-            r2.unwrap(),
-            AcquireOutcome::Acquired(_)
-        ) as u8;
+    let acquired_count = matches!(r1.unwrap(), AcquireOutcome::Acquired(_)) as u8
+        + matches!(r2.unwrap(), AcquireOutcome::Acquired(_)) as u8;
     assert_eq!(acquired_count, 1, "exactly one should acquire");
 }
 
@@ -393,15 +369,12 @@ async fn test_concurrent_directory_exact_one_winner() {
         },
     );
 
-    let acquired_count = matches!(
-        r1.as_ref().unwrap(),
-        AcquireOutcome::Acquired(_)
-    ) as u8
-        + matches!(
-            r2.as_ref().unwrap(),
-            AcquireOutcome::Acquired(_)
-        ) as u8;
-    assert_eq!(acquired_count, 1, "directory vs exact: exactly one should win");
+    let acquired_count = matches!(r1.as_ref().unwrap(), AcquireOutcome::Acquired(_)) as u8
+        + matches!(r2.as_ref().unwrap(), AcquireOutcome::Acquired(_)) as u8;
+    assert_eq!(
+        acquired_count, 1,
+        "directory vs exact: exactly one should win"
+    );
 }
 
 #[tokio::test]
@@ -460,14 +433,8 @@ async fn test_concurrent_read_read_both_succeed() {
         },
     );
 
-    let acquired_count = matches!(
-        r1.as_ref().unwrap(),
-        AcquireOutcome::Acquired(_)
-    ) as u8
-        + matches!(
-            r2.as_ref().unwrap(),
-            AcquireOutcome::Acquired(_)
-        ) as u8;
+    let acquired_count = matches!(r1.as_ref().unwrap(), AcquireOutcome::Acquired(_)) as u8
+        + matches!(r2.as_ref().unwrap(), AcquireOutcome::Acquired(_)) as u8;
     assert_eq!(acquired_count, 2, "both readers should succeed");
 }
 
@@ -524,10 +491,7 @@ async fn test_different_repositories_both_succeed() {
         .acquire_group(&spec2, &g2, "ikey-diff-repo-2")
         .await
         .unwrap();
-    assert!(matches!(
-        result,
-        AcquireOutcome::Acquired(_)
-    ));
+    assert!(matches!(result, AcquireOutcome::Acquired(_)));
 }
 
 #[tokio::test]
@@ -546,7 +510,9 @@ async fn test_release_success() {
         _ => panic!("expected Acquired"),
     };
 
-    repo.release_group(&group_id, &guard(), "done").await.unwrap();
+    repo.release_group(&group_id, &guard(), "done")
+        .await
+        .unwrap();
 
     // Group should now be released.
     let record = repo.get_group(&group_id).await.unwrap();
@@ -574,7 +540,9 @@ async fn test_repeated_release_idempotent() {
     };
 
     // First release succeeds.
-    repo.release_group(&group_id, &guard(), "done").await.unwrap();
+    repo.release_group(&group_id, &guard(), "done")
+        .await
+        .unwrap();
 
     // Second release fails (already released, guard check fails on lifecycle).
     let r2 = repo.release_group(&group_id, &guard(), "again").await;
@@ -607,10 +575,7 @@ async fn test_replace_success() {
         .replace_group(&old_group_id, &spec_new, &guard(), "ikey-replace-new")
         .await
         .unwrap();
-    assert!(matches!(
-        replace_result,
-        AcquireOutcome::Acquired(_)
-    ));
+    assert!(matches!(replace_result, AcquireOutcome::Acquired(_)));
 
     // Old group should be released.
     let old_record = repo.get_group(&old_group_id).await.unwrap();
@@ -643,7 +608,10 @@ async fn test_replace_conflict_preserves_old_group() {
         worktree_id: None,
         lease_id: None,
     };
-    let result = repo.acquire_group(&spec1, &g1, "ikey-rep-conf-1").await.unwrap();
+    let result = repo
+        .acquire_group(&spec1, &g1, "ikey-rep-conf-1")
+        .await
+        .unwrap();
     let old_group_id = match result {
         AcquireOutcome::Acquired(ref r) => r.group_id.clone(),
         _ => panic!("expected Acquired"),
@@ -693,10 +661,7 @@ async fn test_replace_conflict_preserves_old_group() {
         .await
         .unwrap();
     assert!(
-        matches!(
-            rep_result,
-            AcquireOutcome::Conflict { .. }
-        ),
+        matches!(rep_result, AcquireOutcome::Conflict { .. }),
         "expected Conflict, got {rep_result:?}"
     );
 
@@ -724,10 +689,7 @@ async fn test_commit_success_response_lost_retry() {
         .acquire_group(&spec, &guard(), "ikey-retry")
         .await
         .unwrap();
-    assert!(matches!(
-        retry,
-        AcquireOutcome::AlreadyAcquired(_)
-    ));
+    assert!(matches!(retry, AcquireOutcome::AlreadyAcquired(_)));
 
     // Only one group should exist.
     let active = repo.list_active_for_task("t1").await.unwrap();
@@ -805,7 +767,9 @@ async fn test_active_indexes_history_behavior() {
     };
 
     // Release it.
-    repo.release_group(&group_id, &guard(), "done").await.unwrap();
+    repo.release_group(&group_id, &guard(), "done")
+        .await
+        .unwrap();
 
     // List active should be empty.
     let active = repo.list_active_for_task("t1").await.unwrap();
@@ -856,12 +820,7 @@ async fn test_no_partial_group_after_injected_failure() {
         .acquire_group(&spec, &guard(), "ikey-partial")
         .await
         .unwrap();
-    assert!(
-        matches!(
-            result,
-            AcquireOutcome::Conflict { .. }
-        )
-    );
+    assert!(matches!(result, AcquireOutcome::Conflict { .. }));
 
     // Verify no partial claims for t1.
     let active = repo.list_active_for_task("t1").await.unwrap();
@@ -892,14 +851,8 @@ async fn test_separate_connections_concurrency() {
         .await
         .unwrap();
 
-    assert!(matches!(
-        r1,
-        AcquireOutcome::Acquired(_)
-    ));
-    assert!(matches!(
-        r2,
-        AcquireOutcome::Acquired(_)
-    ));
+    assert!(matches!(r1, AcquireOutcome::Acquired(_)));
+    assert!(matches!(r2, AcquireOutcome::Acquired(_)));
 }
 
 #[tokio::test]
