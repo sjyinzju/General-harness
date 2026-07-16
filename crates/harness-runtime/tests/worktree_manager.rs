@@ -1,4 +1,4 @@
-//! I2B-1 WorktreeManager integration tests.
+﻿//! I2B-1 WorktreeManager integration tests.
 //!
 //! Every test uses throwaway git repositories under a tempdir and an
 //! isolated git environment (`GIT_CONFIG_NOSYSTEM` + empty
@@ -78,7 +78,7 @@ async fn setup() -> TestEnv {
         .unwrap()
         .with_env(env.clone());
     let worktree_root = tmp.path().join("wt-root");
-    let manager = WorktreeManager::new(
+    let manager = WorktreeManager::new_unleased(
         db.pool.clone(),
         RepositoryInspector::new(inspector_git),
         &worktree_root,

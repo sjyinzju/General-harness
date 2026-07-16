@@ -16,6 +16,9 @@ use super::lock::RepositoryLocks;
 use super::metadata::{self, WorktreeMetadata};
 use super::naming;
 use super::types::*;
+use crate::lease::guard::{
+    LeaseAccessResult, NoOpAccessValidator, WorkspaceLeaseAccessValidator, WorktreeAccessRequest,
+};
 use crate::operation::OperationManager;
 
 pub struct WorktreeManager {
@@ -25,16 +28,22 @@ pub struct WorktreeManager {
     ops: OperationManager,
     worktree_root: PathBuf,
     supervisor_id: String,
+    lease_validator: Box<dyn WorkspaceLeaseAccessValidator>,
 }
 
 impl WorktreeManager {
     /// `worktree_root` is the harness-owned data directory for worktrees.
     /// It must NOT live inside a user git worktree (tracked directory).
+    ///
+    /// `lease_validator` is MANDATORY — inject
+    /// `ServiceLeaseAccessValidator` for production, or
+    /// `NoOpAccessValidator` for tests / unleased mode explicitly.
     pub fn new(
         pool: SqlitePool,
         inspector: RepositoryInspector,
         worktree_root: &Path,
         supervisor_id: String,
+        lease_validator: Box<dyn WorkspaceLeaseAccessValidator>,
     ) -> Result<Self, CoreError> {
         if let Some(ancestor) = crate::artifact::find_git_ancestor(worktree_root) {
             return Err(ws_err(format!(
@@ -54,7 +63,25 @@ impl WorktreeManager {
             locks: Arc::new(RepositoryLocks::new()),
             worktree_root: root,
             supervisor_id,
+            lease_validator,
         })
+    }
+
+    /// Convenience constructor for tests that do not exercise lease
+    /// semantics. Explicitly named to prevent accidental production use.
+    pub fn new_unleased(
+        pool: SqlitePool,
+        inspector: RepositoryInspector,
+        worktree_root: &Path,
+        supervisor_id: String,
+    ) -> Result<Self, CoreError> {
+        Self::new(
+            pool,
+            inspector,
+            worktree_root,
+            supervisor_id,
+            Box::new(NoOpAccessValidator),
+        )
     }
 
     pub fn worktree_root(&self) -> &Path {
@@ -563,6 +590,39 @@ impl WorktreeManager {
             return Ok(WorktreeRemoveOutcome::RefusedOwnershipUnverified {
                 reason: "ownership metadata does not match record".into(),
             });
+        }
+
+        // Lease guard: an active lease (without valid force credential)
+        // blocks removal. The validator handles the DB check internally.
+        {
+            let access_request = WorktreeAccessRequest {
+                worktree_id: record.worktree_id.clone(),
+                worktree_path: record.worktree_path.clone(),
+                task_id: record.task_id.clone(),
+                execution_id: record.execution_id.clone(),
+                owner_supervisor_id: record.owner_supervisor_id.clone(),
+                lease_credential: None, // normal path — no force override
+            };
+            match self
+                .lease_validator
+                .can_remove_worktree(&access_request)
+                .await?
+            {
+                LeaseAccessResult::Allowed => {}
+                LeaseAccessResult::BlockedByActiveLease {
+                    lease_id,
+                    owner_supervisor_id: _,
+                } => {
+                    return Ok(WorktreeRemoveOutcome::RefusedOwnershipUnverified {
+                        reason: format!("active lease {lease_id} blocks worktree removal"),
+                    });
+                }
+                LeaseAccessResult::StaleFencingToken | LeaseAccessResult::Unauthorized => {
+                    return Ok(WorktreeRemoveOutcome::RefusedOwnershipUnverified {
+                        reason: "lease credential is not valid for this worktree".into(),
+                    });
+                }
+            }
         }
 
         // Safety guards: never the repository root, never outside our root.

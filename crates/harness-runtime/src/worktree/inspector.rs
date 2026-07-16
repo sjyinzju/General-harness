@@ -306,6 +306,98 @@ fn canonicalize_str(base: &Path, raw: &str) -> Result<PathBuf, CoreError> {
         .map_err(|e| ws_err(format!("canonicalize {}: {e}", joined.display())))
 }
 
+// ── WorktreeGitVerifier impl ────────────────────────────────────────
+
+#[async_trait::async_trait]
+impl super::git_verifier::WorktreeGitVerifier for RepositoryInspector {
+    async fn verify_worktree_git(
+        &self,
+        worktree_path: &Path,
+        expected_common_dir: &Path,
+        expected_branch: &str,
+    ) -> Result<super::git_verifier::GitVerificationResult, CoreError> {
+        // Must resolve to a directory that exists.
+        if !worktree_path.is_dir() {
+            return Ok(super::git_verifier::GitVerificationResult {
+                listed: false,
+                common_dir_matches: false,
+                branch_matches: false,
+                head_readable: false,
+                admin_intact: false,
+                ambiguous: false,
+            });
+        }
+        // Read common git dir from the worktree.
+        let common_raw = self
+            .git()
+            .run(worktree_path, &["rev-parse", "--git-common-dir"])
+            .await;
+        let common_dir = common_raw.as_ref().ok().filter(|o| o.success()).map(|o| {
+            let p = PathBuf::from(o.stdout.trim());
+            if p.is_absolute() {
+                p
+            } else {
+                worktree_path.join(p)
+            }
+        });
+        let common_dir_matches = common_dir
+            .as_ref()
+            .and_then(|cd| cd.canonicalize().ok())
+            .zip(expected_common_dir.canonicalize().ok())
+            .map(|(a, b)| a == b)
+            .unwrap_or(false);
+
+        // Read HEAD.
+        let head = self.git().run(worktree_path, &["rev-parse", "HEAD"]).await;
+        let head_readable = head.as_ref().map(|o| o.success()).unwrap_or(false);
+
+        // Read actual branch.
+        let branch = self
+            .git()
+            .run(worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await;
+        let actual_branch = branch
+            .as_ref()
+            .ok()
+            .filter(|o| o.success())
+            .map(|o| o.stdout.trim().to_string());
+        let branch_matches = actual_branch.as_deref() == Some(expected_branch);
+
+        // Check if listed in `git worktree list`.
+        let root = expected_common_dir.parent().unwrap_or(expected_common_dir);
+        let repo_root = if root.as_os_str().is_empty() {
+            expected_common_dir
+        } else {
+            root
+        };
+        let listed = if repo_root.exists() {
+            self.list_worktrees(repo_root)
+                .await
+                .map(|entries| {
+                    entries.iter().any(|e| {
+                        e.path.canonicalize().ok().as_deref()
+                            == worktree_path.canonicalize().ok().as_deref()
+                            || e.path == *worktree_path
+                    })
+                })
+                .unwrap_or(false)
+        } else {
+            false
+        };
+
+        let admin_intact = common_dir.is_some() && head_readable && listed;
+
+        Ok(super::git_verifier::GitVerificationResult {
+            listed,
+            common_dir_matches,
+            branch_matches,
+            head_readable,
+            admin_intact,
+            ambiguous: false,
+        })
+    }
+}
+
 fn ws_err(msg: String) -> CoreError {
     CoreError::new(ErrorCode::WorkspaceError, msg, ErrorSource::System)
 }
