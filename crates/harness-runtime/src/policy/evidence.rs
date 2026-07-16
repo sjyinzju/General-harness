@@ -139,6 +139,122 @@ impl PolicyEvidenceStore {
         .map_err(db_err)?;
         Ok(row.map(|r| r.into()))
     }
+
+    /// All evidence rows for a worktree (used by the reconciler).
+    pub async fn find_all_for_worktree(
+        &self,
+        worktree_id: &str,
+    ) -> Result<Vec<PolicyEvaluationRecord>, CoreError> {
+        let rows: Vec<EvalRow> = sqlx::query_as(
+            "SELECT id, evaluation_type, project_id, task_id, execution_id, worktree_id, fencing_token, policy_version, input_fingerprint, decision, reasons_json, changed_path_count, finding_count, artifact_reference, evaluator_identity, created_at FROM policy_evaluations WHERE worktree_id = ? ORDER BY created_at ASC",
+        )
+        .bind(worktree_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    /// Mark an evaluation invalid so it can no longer serve as a basis for
+    /// commit/verification. The decision is set to a sentinel `invalid` and
+    /// the reason is recorded in `reasons_json`.
+    pub async fn mark_invalid(&self, evaluation_id: &str, reason: &str) -> Result<(), CoreError> {
+        sqlx::query(
+            "UPDATE policy_evaluations SET decision = 'invalid', reasons_json = ? WHERE id = ?",
+        )
+        .bind(reason)
+        .bind(evaluation_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    // ── Approval persistence boundary ──────────────────────────────
+
+    pub async fn insert_approval(&self, rec: &ApprovalRecord) -> Result<(), CoreError> {
+        sqlx::query(
+            "INSERT INTO policy_approvals (id, project_id, task_id, execution_id, command_fingerprint, decision, expiry, fencing_token, evaluator_identity, created_at) VALUES (?,?,?,?,?,?,?,?,?,datetime('now'))",
+        )
+        .bind(&rec.id)
+        .bind(&rec.project_id)
+        .bind(&rec.task_id)
+        .bind(&rec.execution_id)
+        .bind(&rec.command_fingerprint)
+        .bind(&rec.decision)
+        .bind(&rec.expiry)
+        .bind(rec.fencing_token)
+        .bind(&rec.evaluator_identity)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Latest approval for a composite fingerprint under a given fencing
+    /// epoch. Approvals recorded under a different (stale) epoch are not
+    /// returned.
+    pub async fn find_approval(
+        &self,
+        command_fingerprint: &str,
+        fencing_token: i64,
+    ) -> Result<Option<ApprovalRecord>, CoreError> {
+        let row: Option<ApprovalRow> = sqlx::query_as(
+            "SELECT id, project_id, task_id, execution_id, command_fingerprint, decision, expiry, fencing_token, evaluator_identity, created_at FROM policy_approvals WHERE command_fingerprint = ? AND fencing_token = ? ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(command_fingerprint)
+        .bind(fencing_token)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| r.into()))
+    }
+}
+
+/// A persisted command approval decision.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApprovalRecord {
+    pub id: String,
+    pub project_id: String,
+    pub task_id: String,
+    pub execution_id: String,
+    pub command_fingerprint: String,
+    pub decision: String,
+    pub expiry: Option<String>,
+    pub fencing_token: Option<i64>,
+    pub evaluator_identity: String,
+    pub created_at: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct ApprovalRow {
+    id: String,
+    project_id: String,
+    task_id: String,
+    execution_id: String,
+    command_fingerprint: String,
+    decision: String,
+    expiry: Option<String>,
+    fencing_token: Option<i64>,
+    evaluator_identity: String,
+    created_at: String,
+}
+
+impl From<ApprovalRow> for ApprovalRecord {
+    fn from(r: ApprovalRow) -> Self {
+        Self {
+            id: r.id,
+            project_id: r.project_id,
+            task_id: r.task_id,
+            execution_id: r.execution_id,
+            command_fingerprint: r.command_fingerprint,
+            decision: r.decision,
+            expiry: r.expiry,
+            fencing_token: r.fencing_token,
+            evaluator_identity: r.evaluator_identity,
+            created_at: r.created_at,
+        }
+    }
 }
 
 #[derive(sqlx::FromRow)]

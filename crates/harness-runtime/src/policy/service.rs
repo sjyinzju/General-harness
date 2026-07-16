@@ -8,13 +8,17 @@
 //! Active and its fencing token equals the current worktree epoch. The
 //! raw lease token is NEVER persisted, logged, or rendered in Debug/Display.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use uuid::Uuid;
 
 use super::command::{ApprovalRequest, CommandFingerprint, CommandPolicyEngine, PolicyDecision};
-use super::evidence::{PolicyEvaluationRecord, PolicyEvidence, PolicyEvidenceStore, PolicyFinding};
+use super::diff::{DiffIncludes, GitDiffScopeValidator, ScopeValidationReport};
+use super::evidence::{
+    ApprovalRecord, PolicyEvaluationRecord, PolicyEvidence, PolicyEvidenceStore, PolicyFinding,
+};
 use super::file_scope::{FileScopeValidator, ScopeDecision, ScopeViolation};
 use super::scanner::{SecretScanReport, SecretScanner};
 
@@ -141,8 +145,11 @@ impl WorkspacePolicyService {
         // Idempotency: same FULL fingerprint (exec+args+cwd+env) → existing
         // result. A different executable/cwd/env with the same args cannot
         // collide because the composite key binds all four dimensions.
+        // Invalidated (reconciled) evidence is never reused.
         if let Some(existing) = self.evidence_store.find_by_fingerprint(&composite).await? {
-            if existing.fencing_token == Some(guard.fencing_token) {
+            if existing.fencing_token == Some(guard.fencing_token)
+                && is_reusable_decision(&existing.decision)
+            {
                 let decision = match existing.decision.as_str() {
                     "allowed" => PolicyDecision::Allow,
                     "denied" => PolicyDecision::Deny {
@@ -161,8 +168,7 @@ impl WorkspacePolicyService {
                     },
                 ));
             }
-            // Stale: another owner now holds the lease.
-            return Err(policy_err("evidence is stale — lease owner changed".into()));
+            // Stale or invalidated — fall through and re-evaluate.
         }
 
         let decision = self.command_engine.evaluate_command(
@@ -342,6 +348,138 @@ impl WorkspacePolicyService {
         }
         Ok(ApprovalOutcome::Approved)
     }
+
+    /// Validate the real changed paths in a worktree diff against file scope,
+    /// producing a ScopeValidationReport and persisting PolicyEvidence.
+    /// Fail-closed: the lease credential is verified first. Large diffs are
+    /// represented by `artifact_reference` (a spool path) — the full diff
+    /// content is never stored in SQLite.
+    pub async fn validate_workspace_diff(
+        &self,
+        guard: &WorkspaceAccessGuard,
+        diff: &GitDiffScopeValidator,
+        worktree: &Path,
+        file_scope: &FileScopeValidator,
+        includes: DiffIncludes,
+        artifact_reference: Option<String>,
+    ) -> Result<(ScopeValidationReport, PolicyEvidence), CoreError> {
+        self.enforce_fencing(guard).await?;
+        let report = diff.validate(worktree, file_scope, includes).await?;
+        let evidence = self
+            .persist_diff_evidence(guard, &report, artifact_reference)
+            .await?;
+        Ok((report, evidence))
+    }
+
+    /// Persist a diff validation report as PolicyEvidence. Public so callers
+    /// that already hold a report (e.g. from an artifact-backed diff) can
+    /// persist it under the current lease.
+    pub async fn persist_diff_evidence(
+        &self,
+        guard: &WorkspaceAccessGuard,
+        report: &ScopeValidationReport,
+        artifact_reference: Option<String>,
+    ) -> Result<PolicyEvidence, CoreError> {
+        self.enforce_fencing(guard).await?;
+        let eval_id = format!("pe-{}", Uuid::new_v4());
+        let record = PolicyEvaluationRecord {
+            id: eval_id.clone(),
+            evaluation_type: "diff".into(),
+            project_id: guard.project_id.clone(),
+            task_id: guard.task_id.clone(),
+            execution_id: guard.execution_id.clone(),
+            worktree_id: Some(guard.worktree_id.clone()),
+            fencing_token: Some(guard.fencing_token),
+            policy_version: 1,
+            input_fingerprint: None,
+            decision: if report.clean {
+                "allowed".into()
+            } else {
+                "denied".into()
+            },
+            reasons_json: serde_json::to_string(
+                &report
+                    .violations
+                    .iter()
+                    .map(|(p, v)| format!("{p}: {v:?}"))
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap_or_default(),
+            changed_path_count: Some(report.changed_paths.len() as i64),
+            finding_count: Some(report.violations.len() as i64),
+            artifact_reference,
+            evaluator_identity: guard.evaluator_identity.clone(),
+            created_at: String::new(),
+        };
+        self.evidence_store.insert_evaluation(&record).await?;
+
+        let mut findings = Vec::new();
+        for (path, viol) in &report.violations {
+            let fid = format!("pf-{}", Uuid::new_v4());
+            let pf = PolicyFinding {
+                id: fid,
+                evaluation_id: eval_id.clone(),
+                finding_type: format!("{viol:?}"),
+                file_path: Some(path.clone()),
+                line_number: None,
+                byte_range_start: None,
+                byte_range_end: None,
+                redacted_preview: format!("[scope violation: {viol:?}]"),
+                fingerprint: None,
+            };
+            self.evidence_store.insert_finding(&pf).await?;
+            findings.push(pf);
+        }
+
+        Ok(PolicyEvidence {
+            evaluation: record,
+            findings,
+        })
+    }
+
+    /// Record an approval decision for a command fingerprint, bound to the
+    /// current lease epoch. Fail-closed: the lease credential is verified.
+    pub async fn record_approval(
+        &self,
+        guard: &WorkspaceAccessGuard,
+        fingerprint: &CommandFingerprint,
+        decision: &str,
+        expiry: Option<String>,
+    ) -> Result<ApprovalRecord, CoreError> {
+        self.enforce_fencing(guard).await?;
+        let rec = ApprovalRecord {
+            id: format!("pa-{}", Uuid::new_v4()),
+            project_id: guard.project_id.clone(),
+            task_id: guard.task_id.clone(),
+            execution_id: guard.execution_id.clone(),
+            command_fingerprint: fingerprint.composite_key(),
+            decision: decision.to_string(),
+            expiry,
+            fencing_token: Some(guard.fencing_token),
+            evaluator_identity: guard.evaluator_identity.clone(),
+            created_at: String::new(),
+        };
+        self.evidence_store.insert_approval(&rec).await?;
+        Ok(rec)
+    }
+
+    /// Look up a recorded approval for a fingerprint under the current lease
+    /// epoch. Approvals recorded under a stale epoch are not returned.
+    pub async fn find_approval(
+        &self,
+        guard: &WorkspaceAccessGuard,
+        fingerprint: &CommandFingerprint,
+    ) -> Result<Option<ApprovalRecord>, CoreError> {
+        self.evidence_store
+            .find_approval(&fingerprint.composite_key(), guard.fencing_token)
+            .await
+    }
+}
+
+/// A decision string that may be reused for idempotency. Reconciled
+/// `invalid` rows are never reused.
+fn is_reusable_decision(decision: &str) -> bool {
+    matches!(decision, "allowed" | "denied" | "require_approval")
 }
 
 /// Outcome of `validate_approval`.
