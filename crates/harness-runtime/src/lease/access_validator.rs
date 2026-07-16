@@ -39,7 +39,7 @@ impl WorkspaceLeaseAccessValidator for ServiceLeaseAccessValidator {
                 && cred.fencing_token == lease.fencing_token
                 && self
                     .service
-                    .validate_lease(&request.worktree_id, &cred.lease_token, cred.fencing_token)
+                    .validate_lease(&cred.lease_id, &cred.lease_token, cred.fencing_token)
                     .await
                     .is_ok()
             {
@@ -59,10 +59,19 @@ impl WorkspaceLeaseAccessValidator for ServiceLeaseAccessValidator {
         worktree_id: &str,
         credential: &LeaseCredential,
     ) -> Result<bool, CoreError> {
+        // Confirm the credential's lease actually governs this worktree
+        // before trusting it. validate_lease checks Active + token + fencing;
+        // we additionally verify the lease belongs to this worktree.
+        let Ok(Some(lease)) = self.service.get_lease(&credential.lease_id).await else {
+            return Ok(false);
+        };
+        if lease.worktree_id.as_deref() != Some(worktree_id) {
+            return Ok(false);
+        }
         Ok(self
             .service
             .validate_lease(
-                worktree_id,
+                &credential.lease_id,
                 &credential.lease_token,
                 credential.fencing_token,
             )

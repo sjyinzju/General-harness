@@ -1206,3 +1206,42 @@ async fn stale_fencing_rejects_admin_remove() {
         LeaseAccessResult::StaleFencingToken
     );
 }
+
+#[tokio::test]
+async fn valid_admin_recovery_credential_accepted() {
+    let (_db, p, _tmp) = init_db().await;
+    let s = Arc::new(svc(&p));
+    let r = match s.acquire_lease(&spec()).await.unwrap() {
+        LeaseAcquireOutcome::Acquired(r) => r,
+        _ => panic!(),
+    };
+    let validator = ServiceLeaseAccessValidator::new(s);
+    let cred = LeaseCredential {
+        lease_id: r.lease_id.clone(),
+        lease_token: r.lease_token.clone(),
+        fencing_token: r.fencing_token,
+    };
+    let req = WorktreeAccessRequest {
+        worktree_id: "wt-1".into(),
+        worktree_path: String::new(),
+        task_id: "t1".into(),
+        execution_id: "e1".into(),
+        owner_supervisor_id: "sup-test".into(),
+        lease_credential: Some(cred.clone()),
+    };
+    // A valid credential matching the active lease's id + token + fencing
+    // must be accepted (administrative force-remove path).
+    assert_eq!(
+        validator.can_remove_worktree(&req).await.unwrap(),
+        LeaseAccessResult::Allowed
+    );
+    // validate_force_credential must agree and reject a mismatched worktree.
+    assert!(validator
+        .validate_force_credential("wt-1", &cred)
+        .await
+        .unwrap());
+    assert!(!validator
+        .validate_force_credential("wt-other", &cred)
+        .await
+        .unwrap());
+}

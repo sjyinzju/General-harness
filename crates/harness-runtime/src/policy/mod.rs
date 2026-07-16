@@ -15,4 +15,7 @@ pub use file_scope::{
     FileScopeValidator, NormalizedWorkspacePath, ScopeDecision, ScopeRule, ScopeViolation,
 };
 pub use scanner::{SecretFinding, SecretKind, SecretScanReport};
-pub use service::WorkspacePolicyService;
+pub use service::{
+    ApprovalOutcome, LeaseFencingValidator, NoOpLeaseFencingValidator, WorkspaceAccessGuard,
+    WorkspacePolicyService,
+};

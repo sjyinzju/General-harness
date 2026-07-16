@@ -1,7 +1,14 @@
 //! WorkspacePolicyService — unified entry point for policy evaluation.
-//! Validates WorkspaceAccessGuard (fencing token), delegates to
-//! FileScopeValidator / CommandPolicyEngine / SecretScanner, and
-//! persists structured PolicyEvidence.
+//! Validates the caller's lease credential (fencing token) in real time,
+//! delegates to FileScopeValidator / CommandPolicyEngine / SecretScanner,
+//! and persists structured PolicyEvidence.
+//!
+//! Fail-closed invariant: no PolicyEvidence is ever produced without a
+//! live `LeaseFencingValidator` confirming that the caller's lease is
+//! Active and its fencing token equals the current worktree epoch. The
+//! raw lease token is NEVER persisted, logged, or rendered in Debug/Display.
+
+use std::sync::Arc;
 
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use uuid::Uuid;
@@ -11,9 +18,12 @@ use super::evidence::{PolicyEvaluationRecord, PolicyEvidence, PolicyEvidenceStor
 use super::file_scope::{FileScopeValidator, ScopeDecision, ScopeViolation};
 use super::scanner::{SecretScanReport, SecretScanner};
 
-/// Minimum access guard required to generate policy evidence.
+/// Live lease credential carried by a guard. The `lease_token` is a secret:
+/// it must never be persisted, logged, or rendered. `fencing_token` is the
+/// public monotonic epoch and is safe to store in evidence.
 pub struct WorkspaceAccessGuard {
     pub lease_id: String,
+    pub lease_token: String,
     pub fencing_token: i64,
     pub worktree_id: String,
     pub project_id: String,
@@ -22,17 +32,93 @@ pub struct WorkspaceAccessGuard {
     pub evaluator_identity: String,
 }
 
+// Custom Debug: the lease token is redacted and must never leak.
+impl std::fmt::Debug for WorkspaceAccessGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkspaceAccessGuard")
+            .field("lease_id", &self.lease_id)
+            .field("lease_token", &"[REDACTED]")
+            .field("fencing_token", &self.fencing_token)
+            .field("worktree_id", &self.worktree_id)
+            .field("project_id", &self.project_id)
+            .field("task_id", &self.task_id)
+            .field("execution_id", &self.execution_id)
+            .field("evaluator_identity", &self.evaluator_identity)
+            .finish()
+    }
+}
+
+/// Trait injected into WorkspacePolicyService so it can verify that the
+/// caller still holds an Active lease whose fencing token equals the
+/// current worktree epoch. Implemented by `WorkspaceLeaseService` in
+/// production; tests supply a mock.
+#[async_trait::async_trait]
+pub trait LeaseFencingValidator: Send + Sync {
+    /// Return Ok(()) only when `lease_id` is Active and `lease_token` +
+    /// `fencing_token` match the live lease record (and therefore the
+    /// current worktree epoch).
+    async fn validate_active_fencing(
+        &self,
+        lease_id: &str,
+        lease_token: &str,
+        fencing_token: i64,
+    ) -> Result<(), CoreError>;
+}
+
+/// No-op validator for tests that do not exercise lease fencing. Explicitly
+/// named to prevent accidental production use — production must inject a
+/// real `WorkspaceLeaseService`-backed validator via [`WorkspacePolicyService::new`].
+pub struct NoOpLeaseFencingValidator;
+
+#[async_trait::async_trait]
+impl LeaseFencingValidator for NoOpLeaseFencingValidator {
+    async fn validate_active_fencing(
+        &self,
+        _lease_id: &str,
+        _lease_token: &str,
+        _fencing_token: i64,
+    ) -> Result<(), CoreError> {
+        Ok(())
+    }
+}
+
 pub struct WorkspacePolicyService {
     evidence_store: PolicyEvidenceStore,
     command_engine: CommandPolicyEngine,
+    lease_validator: Arc<dyn LeaseFencingValidator>,
 }
 
 impl WorkspacePolicyService {
-    pub fn new(evidence_store: PolicyEvidenceStore) -> Self {
+    /// Production constructor: a `LeaseFencingValidator` is MANDATORY.
+    pub fn new(
+        evidence_store: PolicyEvidenceStore,
+        lease_validator: Arc<dyn LeaseFencingValidator>,
+    ) -> Self {
         Self {
             evidence_store,
             command_engine: CommandPolicyEngine::new(),
+            lease_validator,
         }
+    }
+
+    /// Test-only constructor that skips live lease fencing verification.
+    /// Explicitly named to prevent accidental production use.
+    pub fn new_unverified_for_tests(evidence_store: PolicyEvidenceStore) -> Self {
+        Self::new(evidence_store, Arc::new(NoOpLeaseFencingValidator))
+    }
+
+    /// Verify the caller's lease credential is live and matches the current
+    /// fencing epoch. Called at every evidence-producing entry point.
+    async fn enforce_fencing(&self, guard: &WorkspaceAccessGuard) -> Result<(), CoreError> {
+        self.lease_validator
+            .validate_active_fencing(&guard.lease_id, &guard.lease_token, guard.fencing_token)
+            .await
+            .map_err(|_| {
+                policy_err(format!(
+                    "lease fencing verification failed for {} (fencing={})",
+                    guard.lease_id, guard.fencing_token
+                ))
+            })
     }
 
     /// Evaluate a command against policy, producing evidence.
@@ -44,16 +130,18 @@ impl WorkspacePolicyService {
         cwd: &str,
         env_names: &[String],
     ) -> Result<(PolicyDecision, PolicyEvidence), CoreError> {
+        // Fail-closed: no evidence without a live lease.
+        self.enforce_fencing(guard).await?;
+
         let fp =
             self.command_engine
                 .fingerprint(executable, args, std::path::Path::new(cwd), env_names);
+        let composite = fp.composite_key();
 
-        // Idempotency: same fingerprint → existing result.
-        if let Some(existing) = self
-            .evidence_store
-            .find_by_fingerprint(&fp.args_hash)
-            .await?
-        {
+        // Idempotency: same FULL fingerprint (exec+args+cwd+env) → existing
+        // result. A different executable/cwd/env with the same args cannot
+        // collide because the composite key binds all four dimensions.
+        if let Some(existing) = self.evidence_store.find_by_fingerprint(&composite).await? {
             if existing.fencing_token == Some(guard.fencing_token) {
                 let decision = match existing.decision.as_str() {
                     "allowed" => PolicyDecision::Allow,
@@ -73,7 +161,7 @@ impl WorkspacePolicyService {
                     },
                 ));
             }
-            // Stale: different owner now holds the lease.
+            // Stale: another owner now holds the lease.
             return Err(policy_err("evidence is stale — lease owner changed".into()));
         }
 
@@ -93,6 +181,9 @@ impl WorkspacePolicyService {
             }
         };
 
+        // Store the COMPOSITE fingerprint so future lookups bind all four
+        // dimensions. Only the public fencing_token (epoch) is persisted —
+        // never the lease token.
         let record = PolicyEvaluationRecord {
             id: eval_id.clone(),
             evaluation_type: "command".into(),
@@ -102,7 +193,7 @@ impl WorkspacePolicyService {
             worktree_id: Some(guard.worktree_id.clone()),
             fencing_token: Some(guard.fencing_token),
             policy_version: 1,
-            input_fingerprint: Some(fp.args_hash.clone()),
+            input_fingerprint: Some(composite),
             decision: dec_str.into(),
             reasons_json: serde_json::to_string(&reasons).unwrap_or_default(),
             changed_path_count: None,
@@ -159,6 +250,9 @@ impl WorkspacePolicyService {
         guard: &WorkspaceAccessGuard,
         report: &SecretScanReport,
     ) -> Result<PolicyEvidence, CoreError> {
+        // Fail-closed: no evidence without a live lease.
+        self.enforce_fencing(guard).await?;
+
         let eval_id = format!("pe-{}", Uuid::new_v4());
         let record = PolicyEvaluationRecord {
             id: eval_id.clone(),
@@ -236,18 +330,26 @@ impl WorkspacePolicyService {
         &self,
         request: &ApprovalRequest,
         fingerprint: &CommandFingerprint,
-    ) -> Result<bool, CoreError> {
+    ) -> Result<ApprovalOutcome, CoreError> {
         if request.command_fingerprint != *fingerprint {
-            return Ok(false);
+            return Ok(ApprovalOutcome::FingerprintMismatch);
         }
         if let Some(ref expiry) = request.expiry {
             let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
             if expiry < &now {
-                return Ok(false);
+                return Ok(ApprovalOutcome::Expired);
             }
         }
-        Ok(true)
+        Ok(ApprovalOutcome::Approved)
     }
+}
+
+/// Outcome of `validate_approval`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Approved,
+    Expired,
+    FingerprintMismatch,
 }
 
 fn policy_err(msg: String) -> CoreError {

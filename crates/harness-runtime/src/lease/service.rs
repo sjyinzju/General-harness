@@ -597,6 +597,24 @@ impl WorkspaceLeaseService {
     }
 }
 
+/// Production `LeaseFencingValidator` implementation: delegates to
+/// `validate_lease`, which confirms the lease is Active and that both the
+/// lease token and fencing token match the live record. Because an Active
+/// lease's fencing token always equals the current `worktrees.lease_epoch`,
+/// a matching Active lease is proof that the fencing token is current.
+#[async_trait::async_trait]
+impl crate::policy::service::LeaseFencingValidator for WorkspaceLeaseService {
+    async fn validate_active_fencing(
+        &self,
+        lease_id: &str,
+        lease_token: &str,
+        fencing_token: i64,
+    ) -> Result<(), CoreError> {
+        self.validate_lease(lease_id, lease_token, fencing_token)
+            .await
+    }
+}
+
 // ── DB helpers ───────────────────────────────────────────────────
 
 async fn get_worktree_row(pool: &SqlitePool, worktree_id: &str) -> Result<WorktreeRow, CoreError> {

@@ -13,11 +13,14 @@ use harness_runtime::policy::command::{CommandPolicyEngine, PolicyDecision};
 use harness_runtime::policy::evidence::{PolicyEvaluationRecord, PolicyEvidenceStore};
 use harness_runtime::policy::file_scope::{FileScopeValidator, ScopeDecision, ScopeViolation};
 use harness_runtime::policy::scanner::{SecretKind, SecretScanner};
-use harness_runtime::policy::service::{WorkspaceAccessGuard, WorkspacePolicyService};
+use harness_runtime::policy::service::{
+    LeaseFencingValidator, WorkspaceAccessGuard, WorkspacePolicyService,
+};
 
 fn guard() -> WorkspaceAccessGuard {
     WorkspaceAccessGuard {
         lease_id: "lease-test".into(),
+        lease_token: "tok-test".into(),
         fencing_token: 1,
         worktree_id: "wt-1".into(),
         project_id: "p1".into(),
@@ -25,6 +28,32 @@ fn guard() -> WorkspaceAccessGuard {
         execution_id: "e1".into(),
         evaluator_identity: "harness-test".into(),
     }
+}
+
+/// Mock fencing validator that always rejects — models a stale/invalid
+/// lease credential so we can prove the service fails closed.
+struct RejectFencingValidator;
+#[async_trait::async_trait]
+impl LeaseFencingValidator for RejectFencingValidator {
+    async fn validate_active_fencing(
+        &self,
+        _lease_id: &str,
+        _lease_token: &str,
+        _fencing_token: i64,
+    ) -> Result<(), harness_core::CoreError> {
+        Err(harness_core::CoreError::new(
+            harness_core::ErrorCode::WorkspaceError,
+            "mock: stale fencing".to_string(),
+            harness_core::ErrorSource::System,
+        ))
+    }
+}
+
+async fn eval_count(db: &harness_runtime::Database) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM policy_evaluations")
+        .fetch_one(&db.pool)
+        .await
+        .unwrap()
 }
 
 fn file_scope_validator(allowed: &[&str]) -> (tempfile::TempDir, FileScopeValidator) {
@@ -381,7 +410,7 @@ async fn valid_fencing_guard_accepted_by_service() {
     let g = guard();
     let db = Database::open_in_memory().await.unwrap();
     let store = PolicyEvidenceStore::new(db.pool.clone());
-    let svc = WorkspacePolicyService::new(store);
+    let svc = WorkspacePolicyService::new_unverified_for_tests(store);
     // Evaluation with a valid guard succeeds.
     let result = svc
         .evaluate_command(&g, "cargo", &["build".into()], "/w", &[])
@@ -413,7 +442,7 @@ async fn stale_fencing_evidence_invalidated() {
         created_at: String::new(),
     };
     store.insert_evaluation(&rec).await.unwrap();
-    let svc = WorkspacePolicyService::new(store);
+    let svc = WorkspacePolicyService::new_unverified_for_tests(store);
     let stale = svc.invalidate_stale_evidence("wt-1", 5).await.unwrap();
     assert_eq!(stale.len(), 1);
     assert_eq!(stale[0].id, "pe-stale");
@@ -423,7 +452,7 @@ async fn stale_fencing_evidence_invalidated() {
 async fn evidence_idempotency_by_fingerprint() {
     let db = Database::open_in_memory().await.unwrap();
     let store = PolicyEvidenceStore::new(db.pool.clone());
-    let svc = WorkspacePolicyService::new(store);
+    let svc = WorkspacePolicyService::new_unverified_for_tests(store);
     let g = guard();
     let (_, ev1) = svc
         .evaluate_command(&g, "cargo", &["build".into()], "/w", &[])
@@ -440,7 +469,7 @@ async fn evidence_idempotency_by_fingerprint() {
 async fn all_outputs_contain_no_lease_token() {
     let db = Database::open_in_memory().await.unwrap();
     let store = PolicyEvidenceStore::new(db.pool.clone());
-    let svc = WorkspacePolicyService::new(store);
+    let svc = WorkspacePolicyService::new_unverified_for_tests(store);
     let g = guard();
     let (_, evidence) = svc
         .evaluate_command(&g, "cargo", &["build".into()], "/w", &[])
@@ -450,6 +479,10 @@ async fn all_outputs_contain_no_lease_token() {
     assert!(
         !eval_str.contains(&g.lease_id),
         "lease_id must not appear in evidence Debug"
+    );
+    assert!(
+        !eval_str.contains(&g.lease_token),
+        "lease_token must not appear in evidence Debug"
     );
     // Raw secret tokens must never appear.
     let scanner = SecretScanner::new(vec!["my-secret-key".into()]);
@@ -463,7 +496,7 @@ async fn all_outputs_contain_no_lease_token() {
 async fn scan_evidence_persisted() {
     let db = Database::open_in_memory().await.unwrap();
     let store = PolicyEvidenceStore::new(db.pool.clone());
-    let svc = WorkspacePolicyService::new(store);
+    let svc = WorkspacePolicyService::new_unverified_for_tests(store);
     let g = guard();
     let scanner = SecretScanner::new(vec![]);
     let report = scanner.scan_diff(&[("clean.rs".into(), b"fn main() {}".to_vec())]);
@@ -508,7 +541,7 @@ async fn policy_service_refuses_command_eval_without_store() {
     // Without it, evaluations would have no audit trail.
     let db = Database::open_in_memory().await.unwrap();
     let store = PolicyEvidenceStore::new(db.pool.clone());
-    let svc = WorkspacePolicyService::new(store);
+    let svc = WorkspacePolicyService::new_unverified_for_tests(store);
     let g = guard();
     let result = svc
         .evaluate_command(&g, "echo", &["hello".into()], "/w", &[])
@@ -520,7 +553,7 @@ async fn policy_service_refuses_command_eval_without_store() {
 async fn scope_decision_not_stored_with_raw_token() {
     let db = Database::open_in_memory().await.unwrap();
     let store = PolicyEvidenceStore::new(db.pool.clone());
-    let svc = WorkspacePolicyService::new(store);
+    let svc = WorkspacePolicyService::new_unverified_for_tests(store);
     let g = guard();
     let (_decision, evidence) = svc
         .evaluate_command(&g, "cargo", &["build".into()], "/w", &[])
@@ -563,5 +596,219 @@ fn approval_fingerprint_mismatch_rejected_by_validator() {
     assert_ne!(
         fp_good, fp_bad,
         "different commands must produce different fingerprints"
+    );
+}
+
+// ── Batch A: fingerprint idempotency collisions ────────────────────
+
+#[tokio::test]
+async fn same_args_different_executable_no_cache_collision() {
+    let db = Database::open_in_memory().await.unwrap();
+    let store = PolicyEvidenceStore::new(db.pool.clone());
+    let svc = WorkspacePolicyService::new_unverified_for_tests(store);
+    let g = guard();
+    // `git status` is Allow (read-only git). `rm status` shares the same
+    // args but must NOT reuse the cached Allow — it must be RequireApproval.
+    let (d1, ev1) = svc
+        .evaluate_command(&g, "git", &["status".into()], "/w", &[])
+        .await
+        .unwrap();
+    assert_eq!(d1, PolicyDecision::Allow);
+    let (d2, ev2) = svc
+        .evaluate_command(&g, "rm", &["status".into()], "/w", &[])
+        .await
+        .unwrap();
+    assert!(
+        matches!(d2, PolicyDecision::RequireApproval { .. }),
+        "rm status must not inherit git status's Allow: {d2:?}"
+    );
+    assert_ne!(ev1.evaluation.id, ev2.evaluation.id);
+}
+
+#[tokio::test]
+async fn same_args_different_cwd_no_cache_collision() {
+    let db = Database::open_in_memory().await.unwrap();
+    let store = PolicyEvidenceStore::new(db.pool.clone());
+    let svc = WorkspacePolicyService::new_unverified_for_tests(store);
+    let g = guard();
+    let (d1, ev1) = svc
+        .evaluate_command(&g, "cargo", &["build".into()], "/w", &[])
+        .await
+        .unwrap();
+    let (d2, ev2) = svc
+        .evaluate_command(&g, "cargo", &["build".into()], "/other", &[])
+        .await
+        .unwrap();
+    assert_eq!(d1, PolicyDecision::Allow);
+    assert_eq!(d2, PolicyDecision::Allow);
+    assert_ne!(
+        ev1.evaluation.id, ev2.evaluation.id,
+        "different cwd must produce distinct evidence"
+    );
+}
+
+// ── Batch A: fencing fail-closed ───────────────────────────────────
+
+#[tokio::test]
+async fn stale_fencing_cannot_create_command_evidence() {
+    let db = Database::open_in_memory().await.unwrap();
+    let store = PolicyEvidenceStore::new(db.pool.clone());
+    let svc = WorkspacePolicyService::new(store, std::sync::Arc::new(RejectFencingValidator));
+    let g = guard();
+    let res = svc
+        .evaluate_command(&g, "cargo", &["build".into()], "/w", &[])
+        .await;
+    assert!(res.is_err(), "stale fencing must block command evidence");
+    assert_eq!(eval_count(&db).await, 0, "no evidence must be persisted");
+}
+
+#[tokio::test]
+async fn stale_fencing_cannot_create_scan_evidence() {
+    let db = Database::open_in_memory().await.unwrap();
+    let store = PolicyEvidenceStore::new(db.pool.clone());
+    let svc = WorkspacePolicyService::new(store, std::sync::Arc::new(RejectFencingValidator));
+    let g = guard();
+    let scanner = SecretScanner::new(vec![]);
+    let report = scanner.scan_diff(&[("clean.rs".into(), b"fn main() {}".to_vec())]);
+    let res = svc.persist_scan_evidence(&g, &report).await;
+    assert!(res.is_err(), "stale fencing must block scan evidence");
+    assert_eq!(eval_count(&db).await, 0, "no evidence must be persisted");
+}
+
+// ── Batch A: tightened git / code-exec policy ──────────────────────
+
+#[test]
+fn git_config_global_denied() {
+    let engine = CommandPolicyEngine::new();
+    let d = engine
+        .evaluate_command(
+            "git",
+            &[
+                "config".into(),
+                "--global".into(),
+                "user.name".into(),
+                "x".into(),
+            ],
+            &PathBuf::from("/w"),
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(d, PolicyDecision::Deny { .. }), "{d:?}");
+}
+
+#[test]
+fn git_branch_delete_requires_approval_or_denied() {
+    let engine = CommandPolicyEngine::new();
+    let d = engine
+        .evaluate_command(
+            "git",
+            &["branch".into(), "-D".into(), "main".into()],
+            &PathBuf::from("/w"),
+            &[],
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            d,
+            PolicyDecision::RequireApproval { .. } | PolicyDecision::Deny { .. }
+        ),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn git_worktree_add_not_read_only() {
+    let engine = CommandPolicyEngine::new();
+    let d = engine
+        .evaluate_command(
+            "git",
+            &["worktree".into(), "add".into(), "/p".into()],
+            &PathBuf::from("/w"),
+            &[],
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            d,
+            PolicyDecision::RequireApproval { .. } | PolicyDecision::Deny { .. }
+        ),
+        "git worktree add must not be auto-allowed: {d:?}"
+    );
+}
+
+#[test]
+fn python_c_requires_approval() {
+    let engine = CommandPolicyEngine::new();
+    let d = engine
+        .evaluate_command(
+            "python",
+            &["-c".into(), "print(1)".into()],
+            &PathBuf::from("/w"),
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(d, PolicyDecision::RequireApproval { .. }), "{d:?}");
+}
+
+#[test]
+fn node_e_requires_approval() {
+    let engine = CommandPolicyEngine::new();
+    let d = engine
+        .evaluate_command(
+            "node",
+            &["-e".into(), "x".into()],
+            &PathBuf::from("/w"),
+            &[],
+        )
+        .unwrap();
+    assert!(matches!(d, PolicyDecision::RequireApproval { .. }), "{d:?}");
+}
+
+#[test]
+fn npx_requires_approval() {
+    let engine = CommandPolicyEngine::new();
+    let d = engine
+        .evaluate_command("npx", &["some-pkg".into()], &PathBuf::from("/w"), &[])
+        .unwrap();
+    assert!(matches!(d, PolicyDecision::RequireApproval { .. }), "{d:?}");
+}
+
+#[test]
+fn git_reset_hard_detected() {
+    let engine = CommandPolicyEngine::new();
+    let d = engine
+        .evaluate_command(
+            "git",
+            &["reset".into(), "--hard".into()],
+            &PathBuf::from("/w"),
+            &[],
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            d,
+            PolicyDecision::RequireApproval { .. } | PolicyDecision::Deny { .. }
+        ),
+        "{d:?}"
+    );
+}
+
+#[test]
+fn git_clean_fdx_detected() {
+    let engine = CommandPolicyEngine::new();
+    let d = engine
+        .evaluate_command(
+            "git",
+            &["clean".into(), "-fdx".into()],
+            &PathBuf::from("/w"),
+            &[],
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            d,
+            PolicyDecision::RequireApproval { .. } | PolicyDecision::Deny { .. }
+        ),
+        "{d:?}"
     );
 }
