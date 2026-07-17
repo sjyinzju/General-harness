@@ -71,12 +71,15 @@ async fn table_count_10_business_tables() {
     let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(
         names.len(),
-        15,
-        "Expected 15 business tables (001–008), got: {names:?}"
+        18,
+        "Expected 18 business tables (001–009), got: {names:?}"
     );
     assert_eq!(
         names,
         vec![
+            "agent_definitions",
+            "agent_provider_hints",
+            "discovery_evidence",
             "event_log",
             "execution_attempts",
             "idempotency_records",

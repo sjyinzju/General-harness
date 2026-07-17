@@ -2,6 +2,7 @@ pub mod agent_adapter;
 pub mod agent_definition;
 pub mod agent_event;
 pub mod agent_identity;
+pub mod discovery;
 pub mod goal_contract;
 pub mod project;
 pub mod repository;
@@ -17,6 +18,12 @@ pub use agent_adapter::{
 pub use agent_definition::{AgentDefinition, DiscoverySource, PassiveDiscoveryStatus};
 pub use agent_event::AgentEvent;
 pub use agent_identity::AgentIdentity;
+pub use discovery::{
+    ActiveValidationRequest, AdapterCompatibility, AuthModeHint, AuthStateValue,
+    AuthenticationState, CapabilityNegotiation, CapabilitySupport, CompatibilityDiagnostic,
+    DiagnosticLevel, DiscoveredAgent, DiscoveryConfidence, DiscoveryEvidence, EvidenceKind,
+    ExecutableIdentity, ProviderHint, ProviderHintSource, ValidationResult, ValidationStatus,
+};
 pub use goal_contract::{ChangeRequest, GoalContractVersion};
 pub use project::{Project, ProjectLifecycle};
 pub use runtime_profile::{

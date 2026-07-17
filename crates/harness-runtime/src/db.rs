@@ -107,6 +107,9 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "agent_definitions",
+                "agent_provider_hints",
+                "discovery_evidence",
                 "event_log",
                 "execution_attempts",
                 "idempotency_records",
@@ -123,7 +126,7 @@ mod tests {
                 "workspace_leases",
                 "worktrees"
             ],
-            "15 business tables expected (001–008)"
+            "18 business tables expected (001–009)"
         );
     }
 
