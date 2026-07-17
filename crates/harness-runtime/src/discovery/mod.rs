@@ -228,10 +228,7 @@ impl AgentDiscoveryService {
         let version = version_result.ok().map(|o| o.trim().to_string());
 
         // Probe: --help
-        if let Ok(ref output) = self
-            .probe_command(exe_path, &[&pattern.help_flag])
-            .await
-        {
+        if let Ok(ref output) = self.probe_command(exe_path, &[&pattern.help_flag]).await {
             evidence.push(DiscoveryEvidence {
                 evidence_kind: EvidenceKind::HelpOutput,
                 observation: format!("Help output: {} bytes", output.len()),
@@ -303,6 +300,7 @@ impl AgentDiscoveryService {
             },
             output_byte_limit: PROBE_OUTPUT_LIMIT,
             spool_dir: None, // no spool needed for short probes
+            allowed_env_var_names: vec![],
             known_secrets: vec![],
             execution_id: exec_id.clone(),
             runtime_profile_id: String::new(),
@@ -454,9 +452,8 @@ impl AgentDiscoveryService {
                     // it's a custom endpoint hint. Only record the presence.
                     evidence.push(DiscoveryEvidence {
                         evidence_kind: EvidenceKind::EnvironmentPresence,
-                        observation:
-                            "ANTHROPIC_BASE_URL is set — custom endpoint (value not read)"
-                                .to_string(),
+                        observation: "ANTHROPIC_BASE_URL is set — custom endpoint (value not read)"
+                            .to_string(),
                         confidence: DiscoveryConfidence::Low,
                         collected_at: now,
                     });

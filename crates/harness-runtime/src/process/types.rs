@@ -23,6 +23,11 @@ pub struct ProcessSpec {
     /// Known secret values of this execution (e.g. injected credential env
     /// values). Redacted from previews, errors, and tracing fields.
     pub known_secrets: Vec<String>,
+    /// Environment variable NAMES that this profile is explicitly allowed to
+    /// pass to the child process. Any override whose name is NOT in this set
+    /// AND matches a sensitive pattern is rejected at spawn time.
+    /// An empty list means "no overrides allowed" (defense-in-depth default).
+    pub allowed_env_var_names: Vec<String>,
     pub execution_id: String,
     pub runtime_profile_id: String,
 }

@@ -39,6 +39,7 @@ fn basic_spec(execution_id: &str, args: Vec<&str>) -> ProcessSpec {
         stderr_capture: CapturePolicy::Pipe,
         output_byte_limit: 10 * 1024 * 1024,
         spool_dir: None,
+        allowed_env_var_names: vec![],
         known_secrets: vec![],
         execution_id: execution_id.to_string(),
         runtime_profile_id: "test-profile".into(),

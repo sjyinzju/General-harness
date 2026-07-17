@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +25,6 @@ use harness_core::contracts::task_envelope::TaskEnvelope;
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use harness_runtime::process::manager::ProcessManager;
 use harness_runtime::process::types::{CapturePolicy, ProcessSpec, ProcessState, StdinMode};
-use tokio::sync::Mutex;
 use tracing;
 
 /// Max stdout bytes for stream parsing (1 MiB).
@@ -119,7 +119,7 @@ impl ClaudeCliAdapter {
     }
 
     /// Parse a single JSONL line from Claude stdout → Option<AgentEvent>.
-    fn parse_line(line: &str, session_id: &str, profile_id: &str) -> Option<AgentEvent> {
+    pub fn parse_line(line: &str, session_id: &str, profile_id: &str) -> Option<AgentEvent> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return None;
@@ -327,6 +327,7 @@ impl AgentAdapter for ClaudeCliAdapter {
             stderr_capture: CapturePolicy::Discard,
             output_byte_limit: 4096,
             spool_dir: None,
+            allowed_env_var_names: vec![],
             known_secrets: vec![],
             execution_id: exec_id.clone(),
             runtime_profile_id: String::new(),
@@ -412,11 +413,12 @@ impl AgentAdapter for ClaudeCliAdapter {
     }
 
     async fn check_authentication(&self) -> Result<AuthCheckResult, CoreError> {
-        // Check env var presence only (names, not values)
+        // Env var presence is NOT proof of valid authentication.
+        // We do NOT read auth.json or run login status commands.
+        // Only a real, no-cost login status command can confirm auth.
         let has_api_key = std::env::var("ANTHROPIC_API_KEY").is_ok();
-        // We do NOT read auth.json or run login status commands
         Ok(AuthCheckResult {
-            authenticated: has_api_key, // best-effort: key presence ≠ valid auth
+            authenticated: false, // Env var presence ≠ authenticated
             method: Some(
                 if has_api_key {
                     "api_key_env"
@@ -426,7 +428,12 @@ impl AgentAdapter for ClaudeCliAdapter {
                 .to_string(),
             ),
             provider: Some("anthropic".to_string()),
-            error: None,
+            error: Some(if has_api_key {
+                "ANTHROPIC_API_KEY is set but has not been verified — run active validation to confirm"
+                    .to_string()
+            } else {
+                "No authentication method detected — ANTHROPIC_API_KEY not set".to_string()
+            }),
         })
     }
 
@@ -487,7 +494,7 @@ pub struct ClaudeCliSession {
     env: HashMap<String, String>,
     timeout: Duration,
     process_manager: Arc<ProcessManager>,
-    active: Arc<Mutex<bool>>,
+    active: Arc<AtomicBool>,
     execution_id: Option<String>,
 }
 
@@ -512,7 +519,7 @@ impl ClaudeCliSession {
             env,
             timeout,
             process_manager,
-            active: Arc::new(Mutex::new(true)),
+            active: Arc::new(AtomicBool::new(true)),
             execution_id: None,
         }
     }
@@ -525,7 +532,7 @@ impl AgentSession for ClaudeCliSession {
     }
 
     fn is_active(&self) -> bool {
-        *self.active.blocking_lock()
+        self.active.load(Ordering::SeqCst)
     }
 
     async fn send_task(&mut self, envelope: &TaskEnvelope) -> Result<(), CoreError> {
@@ -560,11 +567,17 @@ impl AgentSession for ClaudeCliSession {
                 max_memory_bytes: 64 * 1024,
             },
             output_byte_limit: MAX_OUTPUT_BYTES,
-            spool_dir: None,
+            spool_dir: Some(std::env::temp_dir().join(format!("claude-spool-{}", exec_id))),
+            allowed_env_var_names: self.env.keys().cloned().collect(),
             known_secrets: vec![], // Caller can inject via env
             execution_id: exec_id.clone(),
             runtime_profile_id: self.profile_id.clone(),
         };
+
+        // Ensure spool directory exists
+        if let Some(ref spool) = spec.spool_dir {
+            let _ = std::fs::create_dir_all(spool);
+        }
 
         let _handle = self.process_manager.spawn(&spec).await.map_err(|e| {
             CoreError::new(
@@ -583,6 +596,7 @@ impl AgentSession for ClaudeCliSession {
         Ok(())
     }
 
+    #[allow(unused_assignments)]
     async fn receive_events(&mut self, sink: &mut dyn AgentEventSink) -> Result<(), CoreError> {
         let exec_id = self.execution_id.clone().ok_or_else(|| {
             CoreError::new(
@@ -595,10 +609,12 @@ impl AgentSession for ClaudeCliSession {
         let mut _seq: u64 = 0;
         let mut result_received = false;
         let mut process_exit_received = false;
+        let mut terminal_emitted = false;
+        let mut sink_closed = false;
 
         // Poll ProcessManager state
         loop {
-            if !self.is_active() {
+            if !self.is_active() && !terminal_emitted {
                 break;
             }
 
@@ -607,19 +623,18 @@ impl AgentSession for ClaudeCliSession {
                 Some(ProcessState::Completed { outcome }) => {
                     // Process completed — parse captured output
                     if let Some(ref stdout_ref) = outcome.stdout_ref {
-                        // Read spool file and parse events
                         if let Ok(content) = tokio::fs::read_to_string(stdout_ref).await {
                             for line in content.lines() {
+                                if sink_closed {
+                                    break;
+                                }
                                 if let Some(event) = ClaudeCliAdapter::parse_line(
                                     line,
                                     &self.session_id,
                                     &self.profile_id,
                                 ) {
-                                    // Track terminal events
                                     match &event {
-                                        AgentEvent::Result { .. } => {
-                                            result_received = true;
-                                        }
+                                        AgentEvent::Result { .. } => result_received = true,
                                         AgentEvent::ProcessExited { .. } => {
                                             process_exit_received = true;
                                         }
@@ -631,16 +646,20 @@ impl AgentSession for ClaudeCliSession {
                                         tracing::warn!(
                                             session_id = %self.session_id,
                                             error = %e,
-                                            "Event sink error"
+                                            "Claude event sink closed — cancelling process"
                                         );
+                                        sink_closed = true;
+                                        let _ = self.process_manager.cancel(&exec_id).await;
                                         break;
                                     }
                                 }
                             }
                         }
                     } else if let Some(ref preview) = outcome.stdout_preview {
-                        // Parse in-memory preview
                         for line in preview.lines() {
+                            if sink_closed {
+                                break;
+                            }
                             if let Some(event) = ClaudeCliAdapter::parse_line(
                                 line,
                                 &self.session_id,
@@ -658,52 +677,57 @@ impl AgentSession for ClaudeCliSession {
                                     tracing::warn!(
                                         session_id = %self.session_id,
                                         error = %e,
-                                        "Event sink error"
+                                        "Claude event sink closed — cancelling process"
                                     );
+                                    sink_closed = true;
+                                    let _ = self.process_manager.cancel(&exec_id).await;
                                     break;
                                 }
                             }
                         }
                     }
 
-                    // Emit ProcessExited if not already in stream
-                    if !process_exit_received {
-                        let exit_code = outcome.exit_code.unwrap_or(-1);
-                        _seq += 1;
-                        let _ = sink
-                            .send(AgentEvent::ProcessExited {
-                                exit_code,
-                                signal: None,
-                            })
-                            .await;
-                    }
-
-                    // Synthesize SessionEnded (exactly one terminal outcome)
-                    {
-                        let termination_reason = match outcome.termination {
-                            harness_runtime::process::types::ProcessTermination::Completed => {
-                                TerminationReason::Completed
-                            }
-                            harness_runtime::process::types::ProcessTermination::NonZeroExit => {
-                                TerminationReason::ProcessExited {
-                                    exit_code: outcome.exit_code.unwrap_or(1),
-                                    signal: None,
+                    // Emit exactly one terminal outcome
+                    if !terminal_emitted {
+                        let termination_reason = if sink_closed {
+                            TerminationReason::Cancelled
+                        } else {
+                            match outcome.termination {
+                                harness_runtime::process::types::ProcessTermination::Completed => {
+                                    TerminationReason::Completed
                                 }
+                                harness_runtime::process::types::ProcessTermination::NonZeroExit => {
+                                    TerminationReason::ProcessExited {
+                                        exit_code: outcome.exit_code.unwrap_or(1),
+                                        signal: None,
+                                    }
+                                }
+                                harness_runtime::process::types::ProcessTermination::Timeout => {
+                                    TerminationReason::Timeout
+                                }
+                                harness_runtime::process::types::ProcessTermination::Cancelled => {
+                                    TerminationReason::Cancelled
+                                }
+                                harness_runtime::process::types::ProcessTermination::Killed => {
+                                    TerminationReason::Cancelled
+                                }
+                                harness_runtime::process::types::ProcessTermination::Lost => {
+                                    TerminationReason::Lost
+                                }
+                                _ => TerminationReason::Unknown,
                             }
-                            harness_runtime::process::types::ProcessTermination::Timeout => {
-                                TerminationReason::Timeout
-                            }
-                            harness_runtime::process::types::ProcessTermination::Cancelled => {
-                                TerminationReason::Cancelled
-                            }
-                            harness_runtime::process::types::ProcessTermination::Killed => {
-                                TerminationReason::Cancelled
-                            }
-                            harness_runtime::process::types::ProcessTermination::Lost => {
-                                TerminationReason::Lost
-                            }
-                            _ => TerminationReason::Unknown,
                         };
+
+                        if !process_exit_received {
+                            let exit_code = outcome.exit_code.unwrap_or(-1);
+                            _seq += 1;
+                            let _ = sink
+                                .send(AgentEvent::ProcessExited {
+                                    exit_code,
+                                    signal: None,
+                                })
+                                .await;
+                        }
 
                         _seq += 1;
                         let _ = sink
@@ -715,22 +739,53 @@ impl AgentSession for ClaudeCliSession {
                                 process_exit_received: true,
                             })
                             .await;
+                        terminal_emitted = true;
                     }
 
                     break;
                 }
                 Some(ProcessState::Running) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if sink_closed {
+                        // Waiting for cancel to take effect — re-check quickly
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
                 None => {
-                    // Process registry entry gone
+                    if !terminal_emitted {
+                        let _ = sink
+                            .send(AgentEvent::SessionEnded {
+                                session_id: self.session_id.clone(),
+                                synthetic: true,
+                                termination_reason: TerminationReason::Lost,
+                                result_received: false,
+                                process_exit_received: false,
+                            })
+                            .await;
+                        terminal_emitted = true;
+                    }
                     break;
                 }
-                _ => break,
+                _ => {
+                    if !terminal_emitted {
+                        let _ = sink
+                            .send(AgentEvent::SessionEnded {
+                                session_id: self.session_id.clone(),
+                                synthetic: true,
+                                termination_reason: TerminationReason::Unknown,
+                                result_received: false,
+                                process_exit_received: false,
+                            })
+                            .await;
+                        terminal_emitted = true;
+                    }
+                    break;
+                }
             }
         }
 
-        *self.active.lock().await = false;
+        self.active.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -744,7 +799,7 @@ impl AgentSession for ClaudeCliSession {
                 )
             })?;
         }
-        *self.active.lock().await = false;
+        self.active.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -756,7 +811,7 @@ impl AgentSession for ClaudeCliSession {
         if let Some(ref exec_id) = self.execution_id {
             let _ = self.process_manager.cancel(exec_id).await;
         }
-        *self.active.lock().await = false;
+        self.active.store(false, Ordering::SeqCst);
         Ok(())
     }
 }

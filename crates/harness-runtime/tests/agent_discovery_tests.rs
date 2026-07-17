@@ -566,13 +566,18 @@ fn test_37_nonzero_exit_not_pretending_success() {
 #[test]
 fn test_38_termination_reason_variants() {
     use harness_core::contracts::agent_event::TerminationReason;
-    let reasons = [TerminationReason::Completed,
-        TerminationReason::ProcessExited { exit_code: 1, signal: None },
+    let reasons = [
+        TerminationReason::Completed,
+        TerminationReason::ProcessExited {
+            exit_code: 1,
+            signal: None,
+        },
         TerminationReason::Interrupted,
         TerminationReason::Cancelled,
         TerminationReason::Timeout,
         TerminationReason::Lost,
-        TerminationReason::Unknown];
+        TerminationReason::Unknown,
+    ];
     assert_eq!(reasons.len(), 7);
 }
 

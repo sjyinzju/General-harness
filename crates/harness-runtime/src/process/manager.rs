@@ -67,6 +67,22 @@ impl ProcessManager {
                 CapturePolicy::Discard => Stdio::null(),
             });
 
+        // Defense-in-depth: validate env_overrides against profile-allowed set.
+        // Any override whose name is sensitive AND not in the allowed set is
+        // rejected with a structured error (fail-closed, never silently drop).
+        for k in spec.env_overrides.keys() {
+            if is_sensitive_env(k) && !spec.allowed_env_var_names.contains(k) {
+                return Err(CoreError::new(
+                    ErrorCode::ConfigInvalid,
+                    format!(
+                        "env override '{}' is not in the profile-allowed set for execution {}",
+                        k, spec.execution_id
+                    ),
+                    ErrorSource::Harness,
+                ));
+            }
+        }
+
         let base_env: HashMap<String, String> = std::env::vars()
             .filter(|(k, _)| !spec.env_removals.contains(k) && is_safe_env(k))
             .collect();
@@ -74,14 +90,18 @@ impl ProcessManager {
         for (k, v) in &base_env {
             cmd.env(k, v);
         }
+        // Defense-in-depth re-check on overrides before injection.
         for (k, v) in &spec.env_overrides {
-            cmd.env(k, v);
+            if !is_sensitive_env(k) || spec.allowed_env_var_names.contains(k) {
+                cmd.env(k, v);
+            }
         }
         // Environment is logged as names + presence only — never values.
         tracing::debug!(
             execution_id = %spec.execution_id,
             env_override_names = ?ProcessEventRedactor::env_presence(&spec.env_overrides),
             env_removals = ?spec.env_removals,
+            allowed_env_names = ?spec.allowed_env_var_names,
             "process_env_prepared"
         );
 
@@ -277,7 +297,13 @@ fn capture_config(
 }
 
 fn is_safe_env(key: &str) -> bool {
-    !matches!(
+    !is_sensitive_env(key)
+}
+
+/// Returns true if the env var name matches a known credential/secret pattern.
+/// Used for defense-in-depth filtering — never inspects values.
+fn is_sensitive_env(key: &str) -> bool {
+    matches!(
         key.to_uppercase().as_str(),
         "ANTHROPIC_API_KEY"
             | "OPENAI_API_KEY"

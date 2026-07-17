@@ -116,6 +116,7 @@ impl GitRunner {
             },
             output_byte_limit: OUTPUT_LIMIT,
             spool_dir: Some(spool_dir.clone()),
+            allowed_env_var_names: vec![],
             known_secrets: vec![],
             execution_id: call_id.clone(),
             runtime_profile_id: "git-runner".into(),

@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,7 +28,6 @@ use harness_core::contracts::task_envelope::TaskEnvelope;
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use harness_runtime::process::manager::ProcessManager;
 use harness_runtime::process::types::{CapturePolicy, ProcessSpec, ProcessState, StdinMode};
-use tokio::sync::Mutex;
 use tracing;
 
 const MAX_OUTPUT_BYTES: usize = 1_024 * 1024;
@@ -161,6 +161,7 @@ impl CodexCliAdapter {
             stderr_capture: CapturePolicy::Discard,
             output_byte_limit: 4096,
             spool_dir: None,
+            allowed_env_var_names: vec![],
             known_secrets: vec![],
             execution_id: exec_id.clone(),
             runtime_profile_id: String::new(),
@@ -189,7 +190,7 @@ impl CodexCliAdapter {
     }
 
     /// Parse a single JSONL line from Codex stdout → Option<AgentEvent>.
-    fn parse_line(line: &str, session_id: &str, profile_id: &str) -> Option<AgentEvent> {
+    pub fn parse_line(line: &str, session_id: &str, profile_id: &str) -> Option<AgentEvent> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return None;
@@ -387,6 +388,7 @@ impl AgentAdapter for CodexCliAdapter {
             stderr_capture: CapturePolicy::Discard,
             output_byte_limit: 4096,
             spool_dir: None,
+            allowed_env_var_names: vec![],
             known_secrets: vec![],
             execution_id: exec_id.clone(),
             runtime_profile_id: String::new(),
@@ -471,14 +473,15 @@ impl AgentAdapter for CodexCliAdapter {
         let has_api_key = std::env::var("OPENAI_API_KEY").is_ok();
 
         Ok(AuthCheckResult {
-            authenticated: has_api_key, // best-effort: presence ≠ valid
+            authenticated: false, // Env var presence ≠ authenticated
             method: Some(if has_api_key { "api_key_env" } else { "login" }.to_string()),
             provider: Some("openai".to_string()),
-            error: if !has_api_key {
-                Some("OPENAI_API_KEY not set — may be using ChatGPT login".to_string())
+            error: Some(if has_api_key {
+                "OPENAI_API_KEY is set but has not been verified — run active validation to confirm"
+                    .to_string()
             } else {
-                None
-            },
+                "No API key detected — may be using ChatGPT login (unverified)".to_string()
+            }),
         })
     }
 
@@ -535,7 +538,7 @@ pub struct CodexCliSession {
     env: HashMap<String, String>,
     timeout: Duration,
     process_manager: Arc<ProcessManager>,
-    active: Arc<Mutex<bool>>,
+    active: Arc<AtomicBool>,
     execution_id: Option<String>,
 }
 
@@ -560,7 +563,7 @@ impl CodexCliSession {
             env,
             timeout,
             process_manager,
-            active: Arc::new(Mutex::new(true)),
+            active: Arc::new(AtomicBool::new(true)),
             execution_id: None,
         }
     }
@@ -573,7 +576,7 @@ impl AgentSession for CodexCliSession {
     }
 
     fn is_active(&self) -> bool {
-        *self.active.blocking_lock()
+        self.active.load(Ordering::SeqCst)
     }
 
     async fn send_task(&mut self, envelope: &TaskEnvelope) -> Result<(), CoreError> {
@@ -608,11 +611,16 @@ impl AgentSession for CodexCliSession {
                 max_memory_bytes: 64 * 1024,
             },
             output_byte_limit: MAX_OUTPUT_BYTES,
-            spool_dir: None,
+            spool_dir: Some(std::env::temp_dir().join(format!("codex-spool-{}", exec_id))),
+            allowed_env_var_names: self.env.keys().cloned().collect(),
             known_secrets: vec![],
             execution_id: exec_id.clone(),
             runtime_profile_id: self.profile_id.clone(),
         };
+
+        if let Some(ref spool) = spec.spool_dir {
+            let _ = std::fs::create_dir_all(spool);
+        }
 
         let _handle = self.process_manager.spawn(&spec).await.map_err(|e| {
             CoreError::new(
@@ -631,6 +639,7 @@ impl AgentSession for CodexCliSession {
         Ok(())
     }
 
+    #[allow(unused_assignments)]
     async fn receive_events(&mut self, sink: &mut dyn AgentEventSink) -> Result<(), CoreError> {
         let exec_id = self.execution_id.clone().ok_or_else(|| {
             CoreError::new(
@@ -642,9 +651,11 @@ impl AgentSession for CodexCliSession {
 
         let mut result_received = false;
         let mut process_exit_received = false;
+        let mut terminal_emitted = false;
+        let mut sink_closed = false;
 
         loop {
-            if !self.is_active() {
+            if !self.is_active() && !terminal_emitted {
                 break;
             }
 
@@ -654,6 +665,9 @@ impl AgentSession for CodexCliSession {
                     if let Some(ref stdout_ref) = outcome.stdout_ref {
                         if let Ok(content) = tokio::fs::read_to_string(stdout_ref).await {
                             for line in content.lines() {
+                                if sink_closed {
+                                    break;
+                                }
                                 if let Some(event) = CodexCliAdapter::parse_line(
                                     line,
                                     &self.session_id,
@@ -670,8 +684,10 @@ impl AgentSession for CodexCliSession {
                                         tracing::warn!(
                                             session_id = %self.session_id,
                                             error = %e,
-                                            "Codex event sink error"
+                                            "Codex event sink closed — cancelling process"
                                         );
+                                        sink_closed = true;
+                                        let _ = self.process_manager.cancel(&exec_id).await;
                                         break;
                                     }
                                 }
@@ -679,6 +695,9 @@ impl AgentSession for CodexCliSession {
                         }
                     } else if let Some(ref preview) = outcome.stdout_preview {
                         for line in preview.lines() {
+                            if sink_closed {
+                                break;
+                            }
                             if let Some(event) = CodexCliAdapter::parse_line(
                                 line,
                                 &self.session_id,
@@ -695,48 +714,54 @@ impl AgentSession for CodexCliSession {
                                     tracing::warn!(
                                         session_id = %self.session_id,
                                         error = %e,
-                                        "Codex event sink error"
+                                        "Codex event sink closed — cancelling process"
                                     );
+                                    sink_closed = true;
+                                    let _ = self.process_manager.cancel(&exec_id).await;
                                     break;
                                 }
                             }
                         }
                     }
 
-                    if !process_exit_received {
-                        let _ = sink
-                            .send(AgentEvent::ProcessExited {
-                                exit_code: outcome.exit_code.unwrap_or(-1),
-                                signal: None,
-                            })
-                            .await;
-                    }
-
-                    {
-                        let termination_reason = match outcome.termination {
-                            harness_runtime::process::types::ProcessTermination::Completed => {
-                                TerminationReason::Completed
-                            }
-                            harness_runtime::process::types::ProcessTermination::NonZeroExit => {
-                                TerminationReason::ProcessExited {
-                                    exit_code: outcome.exit_code.unwrap_or(1),
-                                    signal: None,
+                    if !terminal_emitted {
+                        let termination_reason = if sink_closed {
+                            TerminationReason::Cancelled
+                        } else {
+                            match outcome.termination {
+                                harness_runtime::process::types::ProcessTermination::Completed => {
+                                    TerminationReason::Completed
                                 }
+                                harness_runtime::process::types::ProcessTermination::NonZeroExit => {
+                                    TerminationReason::ProcessExited {
+                                        exit_code: outcome.exit_code.unwrap_or(1),
+                                        signal: None,
+                                    }
+                                }
+                                harness_runtime::process::types::ProcessTermination::Timeout => {
+                                    TerminationReason::Timeout
+                                }
+                                harness_runtime::process::types::ProcessTermination::Cancelled => {
+                                    TerminationReason::Cancelled
+                                }
+                                harness_runtime::process::types::ProcessTermination::Killed => {
+                                    TerminationReason::Cancelled
+                                }
+                                harness_runtime::process::types::ProcessTermination::Lost => {
+                                    TerminationReason::Lost
+                                }
+                                _ => TerminationReason::Unknown,
                             }
-                            harness_runtime::process::types::ProcessTermination::Timeout => {
-                                TerminationReason::Timeout
-                            }
-                            harness_runtime::process::types::ProcessTermination::Cancelled => {
-                                TerminationReason::Cancelled
-                            }
-                            harness_runtime::process::types::ProcessTermination::Killed => {
-                                TerminationReason::Cancelled
-                            }
-                            harness_runtime::process::types::ProcessTermination::Lost => {
-                                TerminationReason::Lost
-                            }
-                            _ => TerminationReason::Unknown,
                         };
+
+                        if !process_exit_received {
+                            let _ = sink
+                                .send(AgentEvent::ProcessExited {
+                                    exit_code: outcome.exit_code.unwrap_or(-1),
+                                    signal: None,
+                                })
+                                .await;
+                        }
 
                         let _ = sink
                             .send(AgentEvent::SessionEnded {
@@ -747,19 +772,52 @@ impl AgentSession for CodexCliSession {
                                 process_exit_received: true,
                             })
                             .await;
+                        terminal_emitted = true;
                     }
 
                     break;
                 }
                 Some(ProcessState::Running) => {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    if sink_closed {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
                 }
-                None => break,
-                _ => break,
+                None => {
+                    if !terminal_emitted {
+                        let _ = sink
+                            .send(AgentEvent::SessionEnded {
+                                session_id: self.session_id.clone(),
+                                synthetic: true,
+                                termination_reason: TerminationReason::Lost,
+                                result_received: false,
+                                process_exit_received: false,
+                            })
+                            .await;
+                        terminal_emitted = true;
+                    }
+                    break;
+                }
+                _ => {
+                    if !terminal_emitted {
+                        let _ = sink
+                            .send(AgentEvent::SessionEnded {
+                                session_id: self.session_id.clone(),
+                                synthetic: true,
+                                termination_reason: TerminationReason::Unknown,
+                                result_received: false,
+                                process_exit_received: false,
+                            })
+                            .await;
+                        terminal_emitted = true;
+                    }
+                    break;
+                }
             }
         }
 
-        *self.active.lock().await = false;
+        self.active.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -773,7 +831,7 @@ impl AgentSession for CodexCliSession {
                 )
             })?;
         }
-        *self.active.lock().await = false;
+        self.active.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -785,7 +843,7 @@ impl AgentSession for CodexCliSession {
         if let Some(ref exec_id) = self.execution_id {
             let _ = self.process_manager.cancel(exec_id).await;
         }
-        *self.active.lock().await = false;
+        self.active.store(false, Ordering::SeqCst);
         Ok(())
     }
 }
