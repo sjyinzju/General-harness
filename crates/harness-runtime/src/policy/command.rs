@@ -1,6 +1,21 @@
 //! CommandPolicyEngine — executable + args + cwd + environment-aware
 //! command approval. Never shells out; uses structured input only.
 //!
+//! ## Shell Policy (I4-C3 Closure — FROZEN)
+//!
+//! **Shells are AbsoluteDenied.** The following executables are permanently
+//! denied by `DangerousPattern` entries with `deny: true`:
+//!   - `sh` (matches bash, sh, zsh, etc.)
+//!   - `cmd` (matches cmd, cmd.exe)
+//!   - `powershell` (matches powershell, pwsh, PowerShell.exe)
+//!
+//! **Approval cannot override.** Even when a valid single-use approval is
+//! provided, shells remain denied. The `Deny` variant is returned before
+//! any approval check, and the `RequireApproval` path is never reached.
+//!
+//! This is a **frozen policy decision** per the I4-C3 security model.
+//! No "approved shell" execution path exists or is planned.
+//!
 //! Matching semantics (I2B-3 closure):
 //! - A `DangerousPattern` matches only when BOTH `executable_contains` AND
 //!   `arg_contains` are satisfied (AND logic). A `None` constraint is

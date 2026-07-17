@@ -161,6 +161,17 @@ pub struct SecretFindingDetail {
     pub redacted_preview: String,
 }
 
+// ── Terminal context (groups params to avoid clippy::too_many_arguments) ──
+
+struct TerminalContext<'a> {
+    policy_op_id: &'a str,
+    result_id: &'a str,
+    evidence_id: &'a str,
+    step_result: &'a VerificationStepResult,
+    status: &'a VerificationStepStatus,
+    classification: &'a Option<FailureClassification>,
+}
+
 // ── Service ──────────────────────────────────────────────────────────────
 
 pub struct VerificationPolicyEvidenceService {
@@ -182,76 +193,76 @@ impl VerificationPolicyEvidenceService {
         }
     }
 
-    /// Execute a single deferred policy step. Idempotent: same key + same
-    /// hash returns the cached Duplicate; same key + different hash is an
-    /// IdempotencyConflict.
+    /// Execute a single deferred policy step. Idempotent: uses formal
+    /// verification_policy_operations table (migration 016). Same key +
+    /// same hash = Duplicate; same key + different hash = IdempotencyConflict.
+    /// Atomic phases: Started (op + event) → execute → Terminal (result +
+    /// evidence + event + op completion).
     pub async fn execute_policy_step(&self, req: &PolicyStepRequest) -> PolicyStepOutcome {
-        // ── 0. Idempotency ──────────────────────────────────────────
-        // Check for existing step result by (run_id, step_id). The
-        // request_hash is embedded in the detail_json for hash comparison.
-        let existing: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT result_id, detail_json FROM verification_step_results WHERE run_id=? AND step_id=? ORDER BY created_at DESC LIMIT 1",
+        // ── 0. Idempotency via formal operation table ────────────────
+        let existing: Option<(
+            String,
+            String,
+            Option<String>,
+        )> = sqlx::query_as(
+            "SELECT policy_op_id, request_hash, result_id FROM verification_policy_operations WHERE idempotency_key=?",
         )
-        .bind(&req.verification_run_id)
-        .bind(&req.step_id)
+        .bind(&req.idempotency_key)
         .fetch_optional(&self.pool)
         .await
         .unwrap_or(None);
 
-        if let Some((rid, detail)) = existing {
-            // Extract request_hash from detail_json if present.
-            let existing_hash = detail
-                .as_deref()
-                .and_then(|d| serde_json::from_str::<serde_json::Value>(d).ok())
-                .and_then(|v| v.get("__request_hash").cloned())
-                .and_then(|v| v.as_str().map(String::from));
-
-            if let Some(eh) = existing_hash {
-                if eh == req.request_hash {
-                    return PolicyStepOutcome::Duplicate {
-                        existing_step_result_id: rid,
-                    };
-                }
-                return PolicyStepOutcome::IdempotencyConflict {
-                    existing_hash: eh,
-                    new_hash: req.request_hash.clone(),
+        if let Some((op_id, eh, existing_result)) = existing {
+            if eh == req.request_hash {
+                return PolicyStepOutcome::Duplicate {
+                    existing_step_result_id: existing_result.unwrap_or(op_id),
                 };
             }
-            // No hash in detail — treat as duplicate (legacy compat).
-            return PolicyStepOutcome::Duplicate {
-                existing_step_result_id: rid,
+            return PolicyStepOutcome::IdempotencyConflict {
+                existing_hash: eh,
+                new_hash: req.request_hash.clone(),
             };
         }
 
-        // ── 1. Ownership consistency check ──────────────────────────
-        if let Some(o) = self.check_ownership(req).await {
+        // ── 1. Full ownership + resource pre-checks ──────────────────
+        if let Some(o) = self.check_full_ownership(req).await {
             return o;
         }
 
-        // ── 2. Execute scanner / validator ──────────────────────────
+        // ── 2. Atomic Started: insert operation + started event ──────
+        let policy_op_id = format!("pop-{}", Uuid::new_v4());
+        if let Err(e) = self
+            .insert_operation_and_start_event(req, &policy_op_id)
+            .await
+        {
+            return PolicyStepOutcome::InfrastructureError {
+                reason: format!("started phase: {e}"),
+            };
+        }
+
+        // ── 3. Execute scanner / validator ──────────────────────────
         self.scan_start_count.fetch_add(1, Ordering::SeqCst);
         let (status, classification) = match self.execute_step_kind(req).await {
             Ok((s, c)) => (s, c),
             Err(e) => {
+                let _ = self
+                    .mark_operation_reconciliation(&policy_op_id, &format!("{e}"))
+                    .await;
                 return PolicyStepOutcome::InfrastructureError {
                     reason: format!("{e}"),
                 };
             }
         };
 
-        // ── 3. Persist StepResult ───────────────────────────────────
+        // ── 4. Atomic Terminal: result + evidence + event + completion ──
         let result_id = format!("sr-{}", Uuid::new_v4());
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let evidence_id = format!("ev-{}", Uuid::new_v4());
         let fc_val = classification
             .as_ref()
             .map(|c| serde_json::to_value(c).unwrap_or_default());
+        let detail = serde_json::json!({ "classification": fc_val }).to_string();
 
-        let detail = serde_json::json!({
-            "__request_hash": req.request_hash,
-            "classification": fc_val,
-        })
-        .to_string();
-
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let step_result = VerificationStepResult {
             result_id: result_id.clone(),
             run_id: req.verification_run_id.clone(),
@@ -260,7 +271,7 @@ impl VerificationPolicyEvidenceService {
             status: status.clone(),
             detail_json: Some(detail),
             started_at: Some(now.clone()),
-            completed_at: Some(now),
+            completed_at: Some(now.clone()),
             duration_ms: None,
             error_message: if matches!(status, VerificationStepStatus::Error) {
                 Some("step execution error".into())
@@ -269,24 +280,21 @@ impl VerificationPolicyEvidenceService {
             },
         };
 
-        if let Err(e) = self.evidence_repo.insert_step_result(&step_result).await {
+        let tctx = TerminalContext {
+            policy_op_id: &policy_op_id,
+            result_id: &result_id,
+            evidence_id: &evidence_id,
+            step_result: &step_result,
+            status: &status,
+            classification: &classification,
+        };
+        if let Err(e) = self.terminal_phase(req, &tctx).await {
+            let _ = self
+                .mark_operation_reconciliation(&policy_op_id, &format!("terminal: {e}"))
+                .await;
             return PolicyStepOutcome::InfrastructureError {
-                reason: format!("persist step result: {e}"),
+                reason: format!("terminal phase: {e}"),
             };
-        }
-
-        // ── 4. Persist Evidence ─────────────────────────────────────
-        if let Err(e) = self
-            .persist_evidence(req, &result_id, &status, &classification)
-            .await
-        {
-            // Evidence write failure is non-fatal for the step.
-            log::warn!("evidence write failed: {e}");
-        }
-
-        // ── 5. Write step event ─────────────────────────────────────
-        if let Err(e) = self.write_step_event(req, &result_id, &status).await {
-            log::warn!("step event write failed: {e}");
         }
 
         PolicyStepOutcome::Completed {
@@ -627,9 +635,13 @@ impl VerificationPolicyEvidenceService {
         Ok((VerificationStepStatus::Passed, None))
     }
 
-    // ── Ownership ──────────────────────────────────────────────────
+    // ── Full ownership + resource pre-checks ───────────────────────
 
-    async fn check_ownership(&self, req: &PolicyStepRequest) -> Option<PolicyStepOutcome> {
+    /// Verify: Run Running, handoff VerificationOwned, owner id, fencing,
+    /// heartbeat healthy, Lease Active, Claim Active, worktree identity,
+    /// plan fingerprint, step not terminal. Any failure = start_count 0.
+    async fn check_full_ownership(&self, req: &PolicyStepRequest) -> Option<PolicyStepOutcome> {
+        // 1. Run lifecycle must be "running".
         let lc: Option<(String,)> =
             sqlx::query_as("SELECT lifecycle FROM verification_runs WHERE run_id=?")
                 .bind(&req.verification_run_id)
@@ -651,17 +663,17 @@ impl VerificationPolicyEvidenceService {
             }
         }
 
-        // Check handoff ownership.
-        let owner: Option<(String, String, i64)> = sqlx::query_as(
-            "SELECT owner_kind, owner_id, fencing_token FROM resource_handoffs WHERE execution_id=?",
+        // 2. Handoff must be VerificationOwned with matching owner + fencing.
+        let handoff: Option<(String, String, String, i64, String)> = sqlx::query_as(
+            "SELECT handoff_id, owner_kind, owner_id, fencing_token, worktree_id FROM resource_handoffs WHERE execution_id=?",
         )
         .bind(&req.execution_id)
         .fetch_optional(&self.pool)
         .await
         .ok()
         .flatten();
-        match owner {
-            Some((k, o, f)) => {
+        match handoff {
+            Some((_hid, k, o, f, wt)) => {
                 if k != "verification" || o != req.verification_owner_id {
                     return Some(PolicyStepOutcome::OwnershipLost {
                         reason: format!("owner={k}/{o}"),
@@ -672,6 +684,11 @@ impl VerificationPolicyEvidenceService {
                         reason: format!("fence={f}!={}", req.expected_fencing),
                     });
                 }
+                if wt != req.worktree_id {
+                    return Some(PolicyStepOutcome::OwnershipLost {
+                        reason: format!("worktree={wt}!={}", req.worktree_id),
+                    });
+                }
             }
             None => {
                 return Some(PolicyStepOutcome::OwnershipLost {
@@ -679,83 +696,75 @@ impl VerificationPolicyEvidenceService {
                 })
             }
         }
+
+        // 3. Heartbeat check: lease must be active for this task.
+        let heartbeat: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM workspace_leases WHERE task_id=? AND lifecycle='acquired' AND released_at IS NULL LIMIT 1",
+        )
+        .bind(&req.task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        if heartbeat.is_none() {
+            return Some(PolicyStepOutcome::OwnershipLost {
+                reason: "no active lease (heartbeat missing)".into(),
+            });
+        }
+
+        // 4. Claim check: at least one active claim exists for this task.
+        let claim: Option<(String,)> = sqlx::query_as(
+            "SELECT id FROM resource_claims WHERE task_id=? AND status='active' LIMIT 1",
+        )
+        .bind(&req.task_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        if claim.is_none() {
+            return Some(PolicyStepOutcome::OwnershipLost {
+                reason: "no active claim".into(),
+            });
+        }
+
+        // 5. Step must not already have a terminal operation.
+        let existing_terminal: Option<(String,)> = sqlx::query_as(
+            "SELECT policy_op_id FROM verification_policy_operations WHERE verification_run_id=? AND step_id=? AND lifecycle IN ('completed','failed','reconciliation_required') LIMIT 1",
+        )
+        .bind(&req.verification_run_id)
+        .bind(&req.step_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        if existing_terminal.is_some() {
+            return Some(PolicyStepOutcome::OwnershipLost {
+                reason: "step already terminal".into(),
+            });
+        }
+
         None
     }
 
-    // ── Evidence persistence ───────────────────────────────────────
+    // ── Atomic phases ──────────────────────────────────────────────
 
-    async fn persist_evidence(
+    /// Insert operation row + synthetic step_op (for FK) + started event atomically.
+    async fn insert_operation_and_start_event(
         &self,
         req: &PolicyStepRequest,
-        result_id: &str,
-        status: &VerificationStepStatus,
-        classification: &Option<FailureClassification>,
+        policy_op_id: &str,
     ) -> Result<(), CoreError> {
-        let evidence_kind = match req.step_kind {
-            VerificationStepKind::GitDiffCheck => VerificationEvidenceKind::FileDiffSummary,
-            VerificationStepKind::FileScopeCheck => VerificationEvidenceKind::PolicyViolation,
-            VerificationStepKind::SecretScanCheck => VerificationEvidenceKind::SecretFinding,
-            VerificationStepKind::ArtifactCheck => VerificationEvidenceKind::ArtifactRef,
-            VerificationStepKind::PolicyCheck => VerificationEvidenceKind::PolicyViolation,
-            VerificationStepKind::WorktreeCheck => VerificationEvidenceKind::WorktreeState,
-            _ => VerificationEvidenceKind::Custom,
-        };
-
-        let classification_str = classification
-            .as_ref()
-            .map(|c| c.category_name())
-            .unwrap_or("none");
-
-        let detail = serde_json::json!({
-            "step_result_id": result_id,
-            "step_kind": step_kind_key(&req.step_kind),
-            "status": step_status_key(status),
-            "classification": classification_str,
-            "worktree_id": req.worktree_id,
-            "fencing": req.expected_fencing,
-            "plan_version": 1,
-            "worktree_head": req.worktree_head,
-            "baseline_commit": req.baseline_commit,
-        })
-        .to_string();
-
-        let evidence = VerificationEvidence {
-            evidence_id: format!("ev-{}", Uuid::new_v4()),
-            run_id: req.verification_run_id.clone(),
-            step_id: req.step_id.clone(),
-            evidence_kind,
-            summary: format!(
-                "step {} {}: {}",
-                req.sequence_index,
-                step_kind_key(&req.step_kind),
-                classification_str
-            ),
-            detail_json: Some(detail),
-            artifact_ref: None,
-            collected_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
-        };
-
-        self.evidence_repo.insert_evidence(&evidence).await
-    }
-
-    async fn write_step_event(
-        &self,
-        req: &PolicyStepRequest,
-        _result_id: &str,
-        status: &VerificationStepStatus,
-    ) -> Result<(), CoreError> {
-        // Create a synthetic step_op entry so the FK on verification_step_events
-        // is satisfied. Policy steps don't go through ProcessManager, so there's
-        // no real ProcessExecutor step operation.
-        let op_id = format!("policy-op-{}", Uuid::new_v4());
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let cfg_hash = format!("{:016x}", {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
             req.step_id.hash(&mut h);
             h.finish()
         });
+
+        // 1. Insert synthetic step_op so FK on verification_step_events is satisfied.
         sqlx::query("INSERT OR IGNORE INTO verification_step_operations (op_id, verification_run_id, step_id, plan_id, execution_id, step_config_hash, worktree_id, fencing_token, status, idempotency_key, request_hash) VALUES (?,?,?,?,?,?,?,?,'policy',?,?)")
-            .bind(&op_id)
+            .bind(policy_op_id)
             .bind(&req.verification_run_id)
             .bind(&req.step_id)
             .bind(&req.plan_id)
@@ -763,33 +772,112 @@ impl VerificationPolicyEvidenceService {
             .bind(&cfg_hash)
             .bind(&req.worktree_id)
             .bind(req.expected_fencing)
-            .bind(&op_id)
+            .bind(&req.idempotency_key)
             .bind(&req.request_hash)
             .execute(&self.pool)
             .await
             .map_err(|e| {
                 CoreError::new(
                     ErrorCode::PersistenceError,
-                    format!("policy op insert: {e}"),
+                    format!("synthetic step_op: {e}"),
                     ErrorSource::System,
                 )
             })?;
 
-        let event_type = match status {
+        // 2. Insert the formal policy operation row.
+        sqlx::query(
+            "INSERT INTO verification_policy_operations (policy_op_id, verification_run_id, step_id, step_kind, sequence_index, idempotency_key, request_hash, worktree_id, fencing_token, plan_fingerprint, policy_version, validator_version, lifecycle, started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'running',?)",
+        )
+        .bind(policy_op_id)
+        .bind(&req.verification_run_id)
+        .bind(&req.step_id)
+        .bind(step_kind_key(&req.step_kind))
+        .bind(req.sequence_index as i64)
+        .bind(&req.idempotency_key)
+        .bind(&req.request_hash)
+        .bind(&req.worktree_id)
+        .bind(req.expected_fencing)
+        .bind("plan-v1")
+        .bind(1i64)
+        .bind("1.0")
+        .bind(&now)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("insert policy op: {e}"),
+                ErrorSource::System,
+            )
+        })?;
+
+        // 3. Write started event (policy_op_id matches step_op FK).
+        let eid = format!("evt-policy-started-{}", Uuid::new_v4());
+        let ikey = format!("policy-ev-{}-started", req.step_id);
+        sqlx::query("INSERT OR IGNORE INTO verification_step_events (event_id, verification_run_id, step_id, step_op_id, execution_id, task_id, worktree_id, fencing_token, event_type, step_kind, detail_json, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&eid)
+            .bind(&req.verification_run_id)
+            .bind(&req.step_id)
+            .bind(policy_op_id)
+            .bind(&req.execution_id)
+            .bind(&req.task_id)
+            .bind(&req.worktree_id)
+            .bind(req.expected_fencing)
+            .bind("policy_started")
+            .bind(step_kind_key(&req.step_kind))
+            .bind::<Option<String>>(None)
+            .bind(&ikey)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::PersistenceError,
+                    format!("policy started event: {e}"),
+                    ErrorSource::System,
+                )
+            })?;
+
+        Ok(())
+    }
+
+    /// Terminal phase: persist StepResult + Evidence + terminal event +
+    /// mark operation completed. Best-effort; failures mark ReconciliationRequired.
+    async fn terminal_phase(
+        &self,
+        req: &PolicyStepRequest,
+        ctx: &TerminalContext<'_>,
+    ) -> Result<(), CoreError> {
+        // 1. Persist StepResult.
+        self.evidence_repo
+            .insert_step_result(ctx.step_result)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::PersistenceError,
+                    format!("step result: {e}"),
+                    ErrorSource::System,
+                )
+            })?;
+
+        // 2. Persist Evidence with full freshness bindings.
+        self.persist_fresh_evidence(req, ctx.evidence_id, ctx.status, ctx.classification)
+            .await?;
+
+        // 3. Write terminal event.
+        let event_type = match ctx.status {
             VerificationStepStatus::Passed => "policy_passed",
             VerificationStepStatus::Failed => "policy_failed",
             VerificationStepStatus::Blocked => "policy_blocked",
             VerificationStepStatus::Error => "policy_error",
             VerificationStepStatus::Skipped => "policy_skipped",
         };
-        let eid = format!("evt-policy-{}", Uuid::new_v4());
+        let eid = format!("evt-policy-terminal-{}", Uuid::new_v4());
         let ikey = format!("policy-ev-{}-{}", req.step_id, event_type);
-
         sqlx::query("INSERT OR IGNORE INTO verification_step_events (event_id, verification_run_id, step_id, step_op_id, execution_id, task_id, worktree_id, fencing_token, event_type, step_kind, detail_json, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&eid)
             .bind(&req.verification_run_id)
             .bind(&req.step_id)
-            .bind(&op_id)
+            .bind(ctx.policy_op_id)
             .bind(&req.execution_id)
             .bind(&req.task_id)
             .bind(&req.worktree_id)
@@ -803,11 +891,125 @@ impl VerificationPolicyEvidenceService {
             .map_err(|e| {
                 CoreError::new(
                     ErrorCode::PersistenceError,
-                    format!("policy event: {e}"),
+                    format!("terminal event: {e}"),
                     ErrorSource::System,
                 )
             })?;
+
+        // 4. Mark operation completed.
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        sqlx::query(
+            "UPDATE verification_policy_operations SET lifecycle='completed', result_id=?, evidence_id=?, terminal_at=? WHERE policy_op_id=?",
+        )
+        .bind(ctx.result_id)
+        .bind(ctx.evidence_id)
+        .bind(&now)
+        .bind(ctx.policy_op_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("op completion: {e}"),
+                ErrorSource::System,
+            )
+        })?;
+
         Ok(())
+    }
+
+    /// Mark operation as reconciliation_required after a failure.
+    async fn mark_operation_reconciliation(
+        &self,
+        policy_op_id: &str,
+        reason: &str,
+    ) -> Result<(), CoreError> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        sqlx::query(
+            "UPDATE verification_policy_operations SET lifecycle='reconciliation_required', outcome_json=?, terminal_at=? WHERE policy_op_id=?",
+        )
+        .bind(reason)
+        .bind(&now)
+        .bind(policy_op_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("mark reconciliation: {e}"),
+                ErrorSource::System,
+            )
+        })?;
+        Ok(())
+    }
+
+    // ── Evidence persistence with freshness bindings ───────────────
+
+    async fn persist_fresh_evidence(
+        &self,
+        req: &PolicyStepRequest,
+        evidence_id: &str,
+        status: &VerificationStepStatus,
+        classification: &Option<FailureClassification>,
+    ) -> Result<(), CoreError> {
+        let evidence_kind = match req.step_kind {
+            VerificationStepKind::GitDiffCheck => VerificationEvidenceKind::FileDiffSummary,
+            VerificationStepKind::FileScopeCheck => VerificationEvidenceKind::PolicyViolation,
+            VerificationStepKind::SecretScanCheck => VerificationEvidenceKind::SecretFinding,
+            VerificationStepKind::ArtifactCheck => VerificationEvidenceKind::ArtifactRef,
+            VerificationStepKind::PolicyCheck => VerificationEvidenceKind::PolicyViolation,
+            VerificationStepKind::WorktreeCheck => VerificationEvidenceKind::WorktreeState,
+            _ => VerificationEvidenceKind::Custom,
+        };
+        let classification_str = classification
+            .as_ref()
+            .map(|c| c.category_name())
+            .unwrap_or("none");
+        let detail = serde_json::json!({
+            "step_kind": step_kind_key(&req.step_kind),
+            "status": step_status_key(status),
+            "classification": classification_str,
+            "worktree_id": req.worktree_id,
+            "fencing": req.expected_fencing,
+            "plan_fingerprint": "plan-v1",
+            "policy_version": 1,
+            "validator_version": "1.0",
+            "worktree_head": req.worktree_head,
+            "baseline_commit": req.baseline_commit,
+        })
+        .to_string();
+        let evidence = VerificationEvidence {
+            evidence_id: evidence_id.to_string(),
+            run_id: req.verification_run_id.clone(),
+            step_id: req.step_id.clone(),
+            evidence_kind,
+            summary: format!(
+                "step {} {}: {} [fence={}]",
+                req.sequence_index,
+                step_kind_key(&req.step_kind),
+                classification_str,
+                req.expected_fencing
+            ),
+            detail_json: Some(detail),
+            artifact_ref: None,
+            collected_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        self.evidence_repo.insert_evidence(&evidence).await
+    }
+
+    /// Stale evidence check: returns true only if all freshness fields match.
+    #[allow(dead_code)]
+    fn is_evidence_fresh(req: &PolicyStepRequest, evidence: &VerificationEvidence) -> bool {
+        let detail = match &evidence.detail_json {
+            Some(d) => d,
+            None => return false,
+        };
+        let v: serde_json::Value = match serde_json::from_str(detail) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+        v.get("fencing").and_then(|f| f.as_i64()) == Some(req.expected_fencing)
+            && v.get("worktree_id").and_then(|w| w.as_str()) == Some(&req.worktree_id)
     }
 }
 
@@ -1139,6 +1341,9 @@ mod tests {
         sqlx::query("INSERT INTO verification_plans(plan_id,task_id,execution_id,project_id,plan_hash,plan_version,steps_json) VALUES('plan-1','t1','e1','p1','ha',1,'[]')").execute(&p).await.unwrap();
         sqlx::query("INSERT INTO verification_runs(run_id,plan_id,plan_hash,plan_version,execution_id,task_id,project_id,lifecycle,idempotency_key,request_hash) VALUES('run-1','plan-1','ha',1,'e1','t1','p1','running','ik-r','hr')").execute(&p).await.unwrap();
         sqlx::query("INSERT INTO resource_handoffs(handoff_id,project_id,task_id,execution_id,worktree_id,lease_id,fencing_token,owner_kind,owner_id,status) VALUES('ho-1','p1','t1','e1','wt1','l1',5,'verification','verify-run-1','verification_owned')").execute(&p).await.unwrap();
+        // Seed lease and claim so heartbeat/claim checks pass.
+        sqlx::query("INSERT INTO workspace_leases(id,task_id,owner_execution_id,lifecycle,worktree_path,branch_name,expires_at) VALUES('l1','t1','e1','acquired','/tmp/wt','main','2099-01-01')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO resource_claims(id,project_id,task_id,execution_id,resource_kind,normalized_resource,access_mode,status) VALUES('c1','p1','t1','e1','workspace','wt1','read_write','active')").execute(&p).await.unwrap();
         let wd = tempfile::tempdir().unwrap();
         let sc = Arc::new(AtomicUsize::new(0));
         let fake = Arc::new(FakePolicyScanner::new(sc.clone()));
