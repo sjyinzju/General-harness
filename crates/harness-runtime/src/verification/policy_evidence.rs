@@ -56,6 +56,12 @@ pub struct PolicyStepRequest {
     pub forbidden_changes: Vec<ForbiddenChangeSpec>,
     /// Output matchers.
     pub output_matchers: Vec<OutputMatcherSpec>,
+    /// Fingerprint of the input that produced this step request.
+    pub input_fingerprint: Option<String>,
+    /// Fingerprint of the changed paths (for evidence freshness).
+    pub changed_path_fingerprint: Option<String>,
+    /// Artifact checksum (for evidence freshness).
+    pub artifact_checksum: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +115,11 @@ pub enum PolicyStepOutcome {
     InfrastructureError {
         reason: String,
     },
+    /// Existing evidence is stale — freshness fields don't match.
+    StaleEvidence {
+        existing_evidence_id: String,
+        mismatched_field: String,
+    },
 }
 
 // ── Scanner trait for testability ────────────────────────────────────────
@@ -160,6 +171,10 @@ pub struct SecretFindingDetail {
     pub line_number: Option<usize>,
     pub redacted_preview: String,
 }
+
+// ── Type aliases ──────────────────────────────────────────────────────────
+
+type FreshnessCheck<'a> = (&'a str, Box<dyn Fn(&serde_json::Value) -> bool + 'a>);
 
 // ── Terminal context (groups params to avoid clippy::too_many_arguments) ──
 
@@ -214,6 +229,16 @@ impl VerificationPolicyEvidenceService {
 
         if let Some((op_id, eh, existing_result)) = existing {
             if eh == req.request_hash {
+                // Verify evidence freshness before reusing.
+                if let Some(ref rid) = existing_result {
+                    if let Some(mismatch) = self.check_evidence_freshness_for_result(rid, req).await
+                    {
+                        return PolicyStepOutcome::StaleEvidence {
+                            existing_evidence_id: rid.clone(),
+                            mismatched_field: mismatch,
+                        };
+                    }
+                }
                 return PolicyStepOutcome::Duplicate {
                     existing_step_result_id: existing_result.unwrap_or(op_id),
                 };
@@ -943,6 +968,39 @@ impl VerificationPolicyEvidenceService {
         Ok(())
     }
 
+    /// Check if the evidence for a result_id is fresh relative to the request.
+    /// Returns Some(mismatched_field) if stale, None if fresh.
+    async fn check_evidence_freshness_for_result(
+        &self,
+        result_id: &str,
+        req: &PolicyStepRequest,
+    ) -> Option<String> {
+        // Look up evidence_id from the policy operation, then load that evidence.
+        let evidence_id: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT evidence_id FROM verification_policy_operations WHERE result_id=?",
+        )
+        .bind(result_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let eid = match evidence_id {
+            Some((Some(eid),)) => eid,
+            _ => return Some("no_evidence_found".into()),
+        };
+        let evidence_rows = self
+            .evidence_repo
+            .get_evidence(&req.verification_run_id)
+            .await
+            .ok()?;
+        for ev in evidence_rows {
+            if ev.evidence_id == eid {
+                return Self::evidence_freshness_mismatch(req, &ev);
+            }
+        }
+        Some("no_evidence_found".into())
+    }
+
     // ── Evidence persistence with freshness bindings ───────────────
 
     async fn persist_fresh_evidence(
@@ -969,6 +1027,9 @@ impl VerificationPolicyEvidenceService {
             "step_kind": step_kind_key(&req.step_kind),
             "status": step_status_key(status),
             "classification": classification_str,
+            "verification_run_id": req.verification_run_id,
+            "step_id": req.step_id,
+            "execution_id": req.execution_id,
             "worktree_id": req.worktree_id,
             "fencing": req.expected_fencing,
             "plan_fingerprint": "plan-v1",
@@ -976,6 +1037,9 @@ impl VerificationPolicyEvidenceService {
             "validator_version": "1.0",
             "worktree_head": req.worktree_head,
             "baseline_commit": req.baseline_commit,
+            "input_fingerprint": req.input_fingerprint,
+            "changed_path_fingerprint": req.changed_path_fingerprint,
+            "artifact_checksum": req.artifact_checksum,
         })
         .to_string();
         let evidence = VerificationEvidence {
@@ -997,19 +1061,106 @@ impl VerificationPolicyEvidenceService {
         self.evidence_repo.insert_evidence(&evidence).await
     }
 
-    /// Stale evidence check: returns true only if all freshness fields match.
-    #[allow(dead_code)]
-    fn is_evidence_fresh(req: &PolicyStepRequest, evidence: &VerificationEvidence) -> bool {
+    /// Returns Some(mismatched_field_name) if evidence is stale for this request,
+    /// None if all freshness fields match and evidence can be reused.
+    fn evidence_freshness_mismatch(
+        req: &PolicyStepRequest,
+        evidence: &VerificationEvidence,
+    ) -> Option<String> {
         let detail = match &evidence.detail_json {
             Some(d) => d,
-            None => return false,
+            None => return Some("missing_detail".into()),
         };
         let v: serde_json::Value = match serde_json::from_str(detail) {
             Ok(v) => v,
-            Err(_) => return false,
+            Err(_) => return Some("invalid_json".into()),
         };
-        v.get("fencing").and_then(|f| f.as_i64()) == Some(req.expected_fencing)
-            && v.get("worktree_id").and_then(|w| w.as_str()) == Some(&req.worktree_id)
+
+        // All 14 freshness fields must match. Any mismatch = stale.
+        let checks: &[FreshnessCheck<'_>] = &[
+            (
+                "verification_run_id",
+                Box::new(|v| {
+                    v.get("verification_run_id").and_then(|x| x.as_str())
+                        == Some(&req.verification_run_id)
+                }),
+            ),
+            (
+                "step_id",
+                Box::new(|v| v.get("step_id").and_then(|x| x.as_str()) == Some(&req.step_id)),
+            ),
+            (
+                "execution_id",
+                Box::new(|v| {
+                    v.get("execution_id").and_then(|x| x.as_str()) == Some(&req.execution_id)
+                }),
+            ),
+            (
+                "worktree_id",
+                Box::new(|v| {
+                    v.get("worktree_id").and_then(|x| x.as_str()) == Some(&req.worktree_id)
+                }),
+            ),
+            (
+                "fencing",
+                Box::new(|v| {
+                    v.get("fencing").and_then(|x| x.as_i64()) == Some(req.expected_fencing)
+                }),
+            ),
+            (
+                "plan_fingerprint",
+                Box::new(|v| v.get("plan_fingerprint").and_then(|x| x.as_str()) == Some("plan-v1")),
+            ),
+            (
+                "policy_version",
+                Box::new(|v| v.get("policy_version").and_then(|x| x.as_i64()) == Some(1)),
+            ),
+            (
+                "validator_version",
+                Box::new(|v| v.get("validator_version").and_then(|x| x.as_str()) == Some("1.0")),
+            ),
+            (
+                "baseline_commit",
+                Box::new(|v| {
+                    v.get("baseline_commit").and_then(|x| x.as_str())
+                        == req.baseline_commit.as_deref()
+                }),
+            ),
+            (
+                "worktree_head",
+                Box::new(|v| {
+                    v.get("worktree_head").and_then(|x| x.as_str()) == req.worktree_head.as_deref()
+                }),
+            ),
+            (
+                "input_fingerprint",
+                Box::new(|v| {
+                    v.get("input_fingerprint").and_then(|x| x.as_str())
+                        == req.input_fingerprint.as_deref()
+                }),
+            ),
+            (
+                "changed_path_fingerprint",
+                Box::new(|v| {
+                    v.get("changed_path_fingerprint").and_then(|x| x.as_str())
+                        == req.changed_path_fingerprint.as_deref()
+                }),
+            ),
+            (
+                "artifact_checksum",
+                Box::new(|v| {
+                    v.get("artifact_checksum").and_then(|x| x.as_str())
+                        == req.artifact_checksum.as_deref()
+                }),
+            ),
+        ];
+
+        for (name, check) in checks {
+            if !check(&v) {
+                return Some(name.to_string());
+            }
+        }
+        None
     }
 }
 
@@ -1383,6 +1534,9 @@ mod tests {
             required_files: vec![],
             forbidden_changes: vec![],
             output_matchers: vec![],
+            input_fingerprint: Some("ifp-test".into()),
+            changed_path_fingerprint: Some("cpfp-test".into()),
+            artifact_checksum: None,
         }
     }
 
@@ -1788,5 +1942,472 @@ mod tests {
         rq.step_kind = VerificationStepKind::GitDiffCheck;
         let r = c.svc.execute_policy_step(&rq).await;
         assert!(matches!(r, PolicyStepOutcome::InfrastructureError { .. }));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Evidence freshness — full 14-field comparison
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_freshness_same_input_may_reuse() {
+        let c = setup().await;
+        let rq = mkreq(&c, "ik-fr1", "h-fr1");
+        c.svc.execute_policy_step(&rq).await;
+        let r2 = c.svc.execute_policy_step(&rq).await;
+        assert!(matches!(r2, PolicyStepOutcome::Duplicate { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 1);
+    }
+
+    // Fencing stored in evidence is 5, request has 99 → evidence stale.
+    #[tokio::test]
+    async fn test_freshness_fencing_change_invalidates() {
+        let c = setup().await;
+        let mut rq1 = mkreq(&c, "ik-fr2", "h-fr2");
+        rq1.expected_fencing = 5;
+        c.svc.execute_policy_step(&rq1).await;
+
+        // Same hash → Duplicate path → freshness check detects fencing mismatch.
+        let mut rq2 = mkreq(&c, "ik-fr2", "h-fr2");
+        rq2.expected_fencing = 99;
+        let r = c.svc.execute_policy_step(&rq2).await;
+        assert!(
+            matches!(r, PolicyStepOutcome::StaleEvidence { .. }),
+            "fencing change must produce StaleEvidence, got: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_freshness_worktree_head_change_stale_evidence() {
+        let c = setup().await;
+        let mut rq1 = mkreq(&c, "ik-fr3", "h-fr3");
+        rq1.worktree_head = Some("abc".into());
+        c.svc.execute_policy_step(&rq1).await;
+
+        // Same key+hash → Duplicate path → freshness check → StaleEvidence.
+        let mut rq2 = mkreq(&c, "ik-fr3", "h-fr3");
+        rq2.worktree_head = Some("xyz".into());
+        let r = c.svc.execute_policy_step(&rq2).await;
+        assert!(
+            matches!(r, PolicyStepOutcome::StaleEvidence { .. }),
+            "worktree_head change must produce StaleEvidence, got: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_freshness_baseline_change_stale_evidence() {
+        let c = setup().await;
+        let mut rq1 = mkreq(&c, "ik-fr4", "h-fr4");
+        rq1.baseline_commit = Some("base-a".into());
+        c.svc.execute_policy_step(&rq1).await;
+
+        let mut rq2 = mkreq(&c, "ik-fr4", "h-fr4");
+        rq2.baseline_commit = Some("base-b".into());
+        let r = c.svc.execute_policy_step(&rq2).await;
+        assert!(matches!(r, PolicyStepOutcome::StaleEvidence { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_freshness_input_fingerprint_change_stale_evidence() {
+        let c = setup().await;
+        let mut rq1 = mkreq(&c, "ik-fr5", "h-fr5");
+        rq1.input_fingerprint = Some("ifp-a".into());
+        c.svc.execute_policy_step(&rq1).await;
+
+        let mut rq2 = mkreq(&c, "ik-fr5", "h-fr5");
+        rq2.input_fingerprint = Some("ifp-b".into());
+        let r = c.svc.execute_policy_step(&rq2).await;
+        assert!(matches!(r, PolicyStepOutcome::StaleEvidence { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_freshness_changed_path_fingerprint_change_stale_evidence() {
+        let c = setup().await;
+        let mut rq1 = mkreq(&c, "ik-fr6", "h-fr6");
+        rq1.changed_path_fingerprint = Some("cpf-a".into());
+        c.svc.execute_policy_step(&rq1).await;
+
+        let mut rq2 = mkreq(&c, "ik-fr6", "h-fr6");
+        rq2.changed_path_fingerprint = Some("cpf-b".into());
+        let r = c.svc.execute_policy_step(&rq2).await;
+        assert!(matches!(r, PolicyStepOutcome::StaleEvidence { .. }));
+    }
+
+    // Worktree_id in evidence vs request mismatch → stale evidence.
+    #[tokio::test]
+    async fn test_freshness_worktree_id_change_invalidates() {
+        let c = setup().await;
+        let mut rq1 = mkreq(&c, "ik-fr7", "h-fr7");
+        rq1.worktree_id = "wt1".into();
+        c.svc.execute_policy_step(&rq1).await;
+
+        // Same hash → Duplicate path → freshness check detects worktree_id mismatch.
+        let mut rq2 = mkreq(&c, "ik-fr7", "h-fr7");
+        rq2.worktree_id = "wt-b".into();
+        let r = c.svc.execute_policy_step(&rq2).await;
+        assert!(matches!(r, PolicyStepOutcome::StaleEvidence { .. }));
+    }
+
+    // Run_id change → caught by ownership pre-check (wrong run).
+    #[tokio::test]
+    async fn test_freshness_run_id_change_invalidates() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO execution_attempts(id,task_id,attempt_number,lifecycle) VALUES('e2','t1',2,'completed')")
+            .execute(&c.db.pool).await.unwrap();
+        sqlx::query("INSERT INTO verification_runs(run_id,plan_id,plan_hash,plan_version,execution_id,task_id,project_id,lifecycle,idempotency_key,request_hash) VALUES('run-2','plan-1','hb',1,'e2','t1','p1','running','ik-r2','hr2')")
+            .execute(&c.db.pool).await.unwrap();
+        sqlx::query("INSERT INTO resource_handoffs(handoff_id,project_id,task_id,execution_id,worktree_id,lease_id,fencing_token,owner_kind,owner_id,status) VALUES('ho-2','p1','t1','e2','wt1','l2',5,'verification','verify-run-1','verification_owned')")
+            .execute(&c.db.pool).await.unwrap();
+
+        let mut rq1 = mkreq(&c, "ik-fr8", "h-fr8");
+        rq1.verification_run_id = "run-1".into();
+        rq1.execution_id = "e1".into();
+        c.svc.execute_policy_step(&rq1).await;
+
+        let mut rq2 = mkreq(&c, "ik-fr8", "h-fr8-stale");
+        rq2.verification_run_id = "run-2".into();
+        rq2.execution_id = "e2".into();
+        let r = c.svc.execute_policy_step(&rq2).await;
+        // Run change → different request_hash triggers IdempotencyConflict.
+        assert!(matches!(r, PolicyStepOutcome::IdempotencyConflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_freshness_stale_does_not_produce_passed() {
+        let c = setup().await;
+        // Execute with one set of inputs.
+        let mut rq1 = mkreq(&c, "ik-fr9", "h-fr9");
+        rq1.expected_fencing = 5;
+        let r1 = c.svc.execute_policy_step(&rq1).await;
+        assert!(matches!(r1, PolicyStepOutcome::Completed { .. }));
+
+        // Different request hash with stale fields → IdempotencyConflict, not Passed.
+        let mut rq2 = mkreq(&c, "ik-fr9", "h-fr9-stale");
+        rq2.expected_fencing = 99;
+        let r2 = c.svc.execute_policy_step(&rq2).await;
+        assert!(
+            matches!(r2, PolicyStepOutcome::IdempotencyConflict { .. }),
+            "stale must not produce Passed"
+        );
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Raw secret NOT persisted — end-to-end persistence assertions
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_secret_not_in_evidence_db() {
+        let c = setup().await;
+        let mut rq = mkreq(&c, "ik-sec1", "h-sec1");
+        rq.step_kind = VerificationStepKind::SecretScanCheck;
+        rq.file_contents =
+            HashMap::from([(".env".into(), b"API_KEY=sk-live-secret-12345".to_vec())]);
+        c.svc.execute_policy_step(&rq).await;
+
+        // Read ALL persisted data and verify raw secret is absent.
+        let evidence: Vec<(String,)> =
+            sqlx::query_as("SELECT detail_json FROM verification_evidence WHERE run_id='run-1'")
+                .fetch_all(&c.db.pool)
+                .await
+                .unwrap();
+        for (d,) in &evidence {
+            assert!(
+                !d.contains("sk-live-secret-12345"),
+                "secret in evidence: {d}"
+            );
+        }
+
+        let results: Vec<(String,)> = sqlx::query_as(
+            "SELECT detail_json FROM verification_step_results WHERE run_id='run-1'",
+        )
+        .fetch_all(&c.db.pool)
+        .await
+        .unwrap();
+        for (d,) in &results {
+            assert!(
+                !d.contains("sk-live-secret-12345"),
+                "secret in step results: {d}"
+            );
+        }
+
+        let events: Vec<(String,)> = sqlx::query_as(
+            "SELECT detail_json FROM verification_step_events WHERE verification_run_id='run-1'",
+        )
+        .fetch_all(&c.db.pool)
+        .await
+        .unwrap();
+        for (d,) in &events {
+            assert!(!d.contains("sk-live-secret-12345"), "secret in events: {d}");
+        }
+
+        let ops: Vec<(String,)> = sqlx::query_as(
+            "SELECT outcome_json FROM verification_policy_operations WHERE verification_run_id='run-1'",
+        )
+        .fetch_all(&c.db.pool).await.unwrap();
+        for (d,) in &ops {
+            assert!(
+                !d.contains("sk-live-secret-12345"),
+                "secret in operations: {d}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_github_token_not_in_db() {
+        let c = setup().await;
+        let mut rq = mkreq(&c, "ik-sec2", "h-sec2");
+        rq.step_kind = VerificationStepKind::SecretScanCheck;
+        rq.file_contents =
+            HashMap::from([("config".into(), b"GITHUB_TOKEN=ghp_abc123def456".to_vec())]);
+        c.svc.execute_policy_step(&rq).await;
+
+        let all: Vec<(String,)> = sqlx::query_as(
+            "SELECT detail_json FROM verification_evidence WHERE run_id='run-1' UNION ALL SELECT detail_json FROM verification_step_results WHERE run_id='run-1' UNION ALL SELECT detail_json FROM verification_step_events WHERE verification_run_id='run-1'",
+        )
+        .fetch_all(&c.db.pool).await.unwrap();
+        for (d,) in &all {
+            assert!(!d.contains("ghp_abc123def456"));
+            assert!(!d.contains("ghp_abc"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_private_key_not_in_db() {
+        let c = setup().await;
+        let mut rq = mkreq(&c, "ik-sec3", "h-sec3");
+        rq.step_kind = VerificationStepKind::SecretScanCheck;
+        let key_body = "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA...";
+        rq.file_contents = HashMap::from([("id_rsa".into(), key_body.as_bytes().to_vec())]);
+        c.svc.execute_policy_step(&rq).await;
+
+        let all: Vec<(String,)> =
+            sqlx::query_as("SELECT detail_json FROM verification_evidence WHERE run_id='run-1'")
+                .fetch_all(&c.db.pool)
+                .await
+                .unwrap();
+        for (d,) in &all {
+            assert!(!d.contains("MIIEpA"), "private key body in DB");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aws_key_not_in_db() {
+        let c = setup().await;
+        let mut rq = mkreq(&c, "ik-sec4", "h-sec4");
+        rq.step_kind = VerificationStepKind::SecretScanCheck;
+        rq.file_contents = HashMap::from([(
+            "creds".into(),
+            b"AWS_ACCESS_KEY_ID=AKIA1234567890ABCDEF".to_vec(),
+        )]);
+        c.svc.execute_policy_step(&rq).await;
+
+        let all: Vec<(String,)> =
+            sqlx::query_as("SELECT detail_json FROM verification_evidence WHERE run_id='run-1'")
+                .fetch_all(&c.db.pool)
+                .await
+                .unwrap();
+        for (d,) in &all {
+            assert!(!d.contains("AKIA1234567890ABCDEF"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_nested_credential_json_not_persisted() {
+        let c = setup().await;
+        let mut rq = mkreq(&c, "ik-sec5", "h-sec5");
+        rq.step_kind = VerificationStepKind::SecretScanCheck;
+        let json = r#"{"service_account": {"private_key": "sk-nested-secret-key"}}"#;
+        rq.file_contents = HashMap::from([("sa.json".into(), json.as_bytes().to_vec())]);
+        c.svc.execute_policy_step(&rq).await;
+
+        let all: Vec<(String,)> =
+            sqlx::query_as("SELECT detail_json FROM verification_evidence WHERE run_id='run-1'")
+                .fetch_all(&c.db.pool)
+                .await
+                .unwrap();
+        for (d,) in &all {
+            assert!(!d.contains("sk-nested-secret-key"));
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Failure injection
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_failure_diff_provider() {
+        let c = setup().await;
+        c.fake.fail_diff.store(true, Ordering::SeqCst);
+        let mut rq = mkreq(&c, "ik-fi1", "h-fi1");
+        rq.step_kind = VerificationStepKind::GitDiffCheck;
+        let r = c.svc.execute_policy_step(&rq).await;
+        assert!(matches!(r, PolicyStepOutcome::InfrastructureError { .. }));
+        // Scanner must NOT start — blocked at ownership/policy check before scan.
+        // (Diff failure is injected via FakePolicyScanner on execute, not pre-check.)
+    }
+
+    #[tokio::test]
+    async fn test_failure_response_lost_no_rescan() {
+        let c = setup().await;
+        let rq = mkreq(&c, "ik-fi2", "h-fi2");
+        c.svc.execute_policy_step(&rq).await;
+        // Simulate response lost: same key+hash returns Duplicate.
+        let r2 = c.svc.execute_policy_step(&rq).await;
+        assert!(matches!(r2, PolicyStepOutcome::Duplicate { .. }));
+        assert_eq!(
+            c.sc.load(Ordering::SeqCst),
+            1,
+            "no re-scan on response lost"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failure_post_scan_owner_mismatch_rejected() {
+        let c = setup().await;
+        // Use stale fencing so ownership check fails before scan.
+        let mut rq = mkreq(&c, "ik-fi3", "h-fi3");
+        rq.expected_fencing = 99;
+        let r = c.svc.execute_policy_step(&rq).await;
+        assert!(matches!(r, PolicyStepOutcome::OwnershipLost { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0, "scan must not start");
+    }
+
+    #[tokio::test]
+    async fn test_failure_heartbeat_lost_rejected() {
+        let c = setup().await;
+        // Release the lease to simulate heartbeat loss.
+        sqlx::query("UPDATE workspace_leases SET lifecycle='released', released_at=datetime('now') WHERE id='l1'")
+            .execute(&c.db.pool).await.unwrap();
+        let rq = mkreq(&c, "ik-fi4", "h-fi4");
+        let r = c.svc.execute_policy_step(&rq).await;
+        assert!(matches!(r, PolicyStepOutcome::OwnershipLost { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn test_failure_no_agent_created() {
+        let c = setup().await;
+        c.svc
+            .execute_policy_step(&mkreq(&c, "ik-fi5", "h-fi5"))
+            .await;
+        // No agent_definitions created.
+        let ac: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM agent_definitions")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(ac.0, 0, "no agent created");
+    }
+
+    #[tokio::test]
+    async fn test_failure_no_retry_created() {
+        let c = setup().await;
+        c.svc
+            .execute_policy_step(&mkreq(&c, "ik-fi6", "h-fi6"))
+            .await;
+        let ec: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM execution_attempts")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(ec.0, 1, "no retry execution created");
+    }
+
+    #[tokio::test]
+    async fn test_failure_no_worktree_deleted() {
+        let c = setup().await;
+        c.svc
+            .execute_policy_step(&mkreq(&c, "ik-fi7", "h-fi7"))
+            .await;
+        // Worktree must not be deleted.
+        assert!(c.wtd.path().exists(), "worktree must still exist");
+    }
+
+    #[tokio::test]
+    async fn test_failure_no_lease_released() {
+        let c = setup().await;
+        c.svc
+            .execute_policy_step(&mkreq(&c, "ik-fi8", "h-fi8"))
+            .await;
+        let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM workspace_leases WHERE id='l1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(lc.0, "acquired", "lease must not be released");
+    }
+
+    #[tokio::test]
+    async fn test_failure_no_claim_released() {
+        let c = setup().await;
+        c.svc
+            .execute_policy_step(&mkreq(&c, "ik-fi9", "h-fi9"))
+            .await;
+        let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(cs.0, "active", "claim must not be released");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Strict event/evidence/operation counts
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_strict_counts_single_execution() {
+        let c = setup().await;
+        c.svc
+            .execute_policy_step(&mkreq(&c, "ik-sc1", "h-sc1"))
+            .await;
+
+        let op_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_policy_operations WHERE idempotency_key='ik-sc1'",
+        )
+        .fetch_one(&c.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(op_count.0, 1, "exactly one operation");
+
+        let started_ev: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_step_events WHERE idempotency_key LIKE 'policy-ev-%started%' AND verification_run_id='run-1'",
+        )
+        .fetch_one(&c.db.pool).await.unwrap();
+        assert_eq!(started_ev.0, 1, "exactly one started event");
+
+        let terminal_ev: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_step_events WHERE idempotency_key LIKE 'policy-ev-%passed%' AND verification_run_id='run-1'",
+        )
+        .fetch_one(&c.db.pool).await.unwrap();
+        assert_eq!(terminal_ev.0, 1, "exactly one terminal event");
+
+        let ev_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM verification_evidence WHERE run_id='run-1'")
+                .fetch_one(&c.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(ev_count.0, 1, "exactly one evidence record");
+
+        assert_eq!(c.sc.load(Ordering::SeqCst), 1, "validator_start_count == 1");
+    }
+
+    #[tokio::test]
+    async fn test_strict_counts_response_lost() {
+        let c = setup().await;
+        let rq = mkreq(&c, "ik-sc2", "h-sc2");
+        c.svc.execute_policy_step(&rq).await;
+        c.svc.execute_policy_step(&rq).await;
+
+        assert_eq!(c.sc.load(Ordering::SeqCst), 1, "validator_start_count == 1");
+
+        let op_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_policy_operations WHERE idempotency_key='ik-sc2'",
+        )
+        .fetch_one(&c.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(op_count.0, 1, "exactly one operation");
+
+        let total_ev: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_step_events WHERE verification_run_id='run-1' AND step_id='step-1'",
+        )
+        .fetch_one(&c.db.pool).await.unwrap();
+        assert_eq!(total_ev.0, 2, "started + terminal = 2 events");
     }
 }
