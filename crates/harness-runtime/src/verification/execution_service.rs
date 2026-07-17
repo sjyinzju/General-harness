@@ -15,7 +15,9 @@ use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use super::approval_validator::{ApprovalDecision, ApprovalIdentity, ApprovalValidator};
 use super::content_validator::VerificationContentValidator;
+use crate::policy::command::{CommandPolicyEngine, PolicyDecision};
 use crate::process::manager::ProcessManager;
 use crate::process::types::{
     CapturePolicy, ProcessSpec, ProcessState, ProcessTermination, StdinMode,
@@ -57,6 +59,11 @@ pub struct StepExecutionRequest {
     pub step_kind: VerificationStepKind,
     pub required: bool,
     pub sequence_index: u32,
+    /// Optional approval ID for commands that require approval.
+    pub approval_id: Option<String>,
+    /// Optional override for step_op_id (test determinism). If None, a
+    /// UUID is generated. Never set in production.
+    pub step_op_id_override: Option<String>,
 }
 
 // ── Step execution outcome ────────────────────────────────────────────
@@ -282,11 +289,19 @@ impl ProcessExecutor for FakeProcessExecutor {
 pub struct VerificationExecutionService {
     pool: SqlitePool,
     executor: Arc<dyn ProcessExecutor>,
+    policy_engine: CommandPolicyEngine,
+    approval_validator: ApprovalValidator,
 }
 
 impl VerificationExecutionService {
     pub fn new(pool: SqlitePool, executor: Arc<dyn ProcessExecutor>) -> Self {
-        Self { pool, executor }
+        let pool_c = pool.clone();
+        Self {
+            pool,
+            executor,
+            policy_engine: CommandPolicyEngine::new(),
+            approval_validator: ApprovalValidator::new(pool_c),
+        }
     }
 
     /// Execute a single verification step with step events and idempotency.
@@ -309,19 +324,24 @@ impl VerificationExecutionService {
             };
         }
 
-        // ── 1. Ownership + workspace + policy ───────────────────────
+        // ── 0.5. Pre-generate op_id for approval identity binding ────
+        let op_id = req
+            .step_op_id_override
+            .clone()
+            .unwrap_or_else(|| format!("step-op-{}", Uuid::new_v4()));
+
+        // ── 1. Ownership + workspace + policy + approval ────────────
         if let Some(o) = self.check_ownership(req).await {
             return o;
         }
         if let Some(o) = self.validate_workspace(&req.working_directory, &req.worktree_path) {
             return o;
         }
-        if let Some(o) = evaluate_policy(&req.executable, &req.args) {
+        if let Some(o) = self.evaluate_command_policy(req, &op_id).await {
             return o;
         }
 
         // ── 2. Insert step op + Started event (atomic) ──────────────
-        let op_id = format!("step-op-{}", Uuid::new_v4());
         if let Err(e) = self.insert_step_op(&op_id, req).await {
             return StepExecutionOutcome::InfrastructureError {
                 reason: format!("insert op: {e}"),
@@ -458,6 +478,87 @@ impl VerificationExecutionService {
 
     // ── Helpers ────────────────────────────────────────────────────
 
+    /// Evaluate command policy via CommandPolicyEngine, then validate any
+    /// required approval through ApprovalValidator. Shells are denied by
+    /// the engine; commands requiring approval are blocked without a valid
+    /// approval. The op_id is pre-generated so the approval identity check
+    /// binds to the actual step operation.
+    async fn evaluate_command_policy(
+        &self,
+        req: &StepExecutionRequest,
+        op_id: &str,
+    ) -> Option<StepExecutionOutcome> {
+        let exe_str = req.executable.to_string_lossy();
+        let env_names: Vec<String> = req.allowed_env_var_names.clone();
+
+        let policy = match self.policy_engine.evaluate_command(
+            &exe_str,
+            &req.args,
+            &req.working_directory,
+            &env_names,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                return Some(StepExecutionOutcome::InfrastructureError {
+                    reason: format!("policy eval: {e}"),
+                })
+            }
+        };
+
+        match policy {
+            PolicyDecision::Allow => None,
+            PolicyDecision::Deny { reason } => Some(StepExecutionOutcome::PolicyBlocked { reason }),
+            PolicyDecision::RequireApproval {
+                reason,
+                fingerprint,
+            } => {
+                let approval_id = match &req.approval_id {
+                    Some(aid) => aid.clone(),
+                    None => {
+                        return Some(StepExecutionOutcome::PolicyBlocked {
+                            reason: format!("approval required: {reason}"),
+                        });
+                    }
+                };
+
+                // step_op_id binding uses the actual generated op_id so the
+                // approval is tied to this specific execution attempt.
+                let identity = ApprovalIdentity {
+                    verification_run_id: req.verification_run_id.clone(),
+                    step_id: req.step_id.clone(),
+                    step_op_id: op_id.to_string(),
+                    cmd_fingerprint: fingerprint.composite_key(),
+                    worktree_id: req.worktree_id.clone(),
+                    fencing: req.expected_fencing,
+                };
+
+                match self
+                    .approval_validator
+                    .validate_and_consume(&approval_id, &identity)
+                    .await
+                {
+                    ApprovalDecision::Approved { .. } => None,
+                    ApprovalDecision::NotRequired => None,
+                    ApprovalDecision::Denied { reason: r } => {
+                        Some(StepExecutionOutcome::PolicyBlocked {
+                            reason: format!("approval denied: {r}"),
+                        })
+                    }
+                    ApprovalDecision::AlreadyConsumed { .. } => {
+                        Some(StepExecutionOutcome::PolicyBlocked {
+                            reason: "approval already consumed".into(),
+                        })
+                    }
+                    ApprovalDecision::Error { reason: r } => {
+                        Some(StepExecutionOutcome::InfrastructureError {
+                            reason: format!("approval error: {r}"),
+                        })
+                    }
+                }
+            }
+        }
+    }
+
     async fn check_ownership(&self, req: &StepExecutionRequest) -> Option<StepExecutionOutcome> {
         let lc: Option<(String,)> =
             sqlx::query_as("SELECT lifecycle FROM verification_runs WHERE run_id = ?")
@@ -585,35 +686,6 @@ impl VerificationExecutionService {
             .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("mark: {e}"), ErrorSource::System))?;
         Ok(())
     }
-}
-
-// ── Policy ─────────────────────────────────────────────────────────────
-
-fn evaluate_policy(exe: &Path, args: &[String]) -> Option<StepExecutionOutcome> {
-    let lower = exe.to_string_lossy().to_lowercase();
-    if lower.contains("cmd.exe")
-        || lower.contains("powershell")
-        || lower.contains("bash")
-        || lower.contains("sh")
-    {
-        return Some(StepExecutionOutcome::PolicyBlocked {
-            reason: "shell denied by default".into(),
-        });
-    }
-    for a in args {
-        let al = a.to_lowercase();
-        if al.contains("&&")
-            || al.contains("||")
-            || al.contains(";")
-            || al.contains("`")
-            || al.contains("$(")
-        {
-            return Some(StepExecutionOutcome::PolicyBlocked {
-                reason: format!("metachar: {a}"),
-            });
-        }
-    }
-    None
 }
 
 // ── Classification ────────────────────────────────────────────────────
@@ -757,8 +829,8 @@ mod tests {
             verification_owner_id: "verify-run-1".into(),
             idempotency_key: ikey.into(),
             request_hash: hash.into(),
-            executable: PathBuf::from("test-exe"),
-            args: vec!["--check".into()],
+            executable: PathBuf::from("cargo"),
+            args: vec!["--version".into()],
             working_directory: ctx.wtd.path().to_path_buf(),
             timeout: Duration::from_secs(5),
             allowed_env_var_names: vec![],
@@ -766,7 +838,45 @@ mod tests {
             step_kind: VerificationStepKind::AcceptanceCheck,
             required: true,
             sequence_index: 0,
+            approval_id: None,
+            step_op_id_override: None,
         }
+    }
+
+    /// Insert an approval directly for test setup. The approval binds to the
+    /// given identity so it can be validated during execute_step.
+    async fn insert_approval(
+        pool: &SqlitePool,
+        aid: &str,
+        identity: &ApprovalIdentity,
+        single_use: bool,
+        expires: Option<&str>,
+    ) {
+        sqlx::query("INSERT OR REPLACE INTO verification_approvals (approval_id, verification_run_id, step_id, step_op_id, cmd_fingerprint, worktree_id, fencing_token, single_use, lifecycle, expires_at) VALUES (?,?,?,?,?,?,?,?,'pending',?)")
+            .bind(aid)
+            .bind(&identity.verification_run_id)
+            .bind(&identity.step_id)
+            .bind(&identity.step_op_id)
+            .bind(&identity.cmd_fingerprint)
+            .bind(&identity.worktree_id)
+            .bind(identity.fencing)
+            .bind(single_use)
+            .bind(expires)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// Count approval lifecycle events for a given approval.
+    async fn approval_consume_count(pool: &SqlitePool, aid: &str) -> i64 {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_approvals WHERE approval_id=? AND lifecycle='consumed'",
+        )
+        .bind(aid)
+        .fetch_one(pool)
+        .await
+        .unwrap_or((0,));
+        row.0
     }
 
     #[tokio::test]
@@ -992,6 +1102,389 @@ mod tests {
         let results = c.svc.execute_plan_steps(&[r]).await;
         assert_eq!(results.len(), 1);
         assert!(matches!(results[0], StepExecutionOutcome::Duplicate { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    // ── Approval integration tests ──────────────────────────────────
+
+    /// Compute the same fingerprint the CommandPolicyEngine produces so
+    /// tests can create approvals with matching cmd_fingerprint.
+    fn test_fingerprint(exe: &str, args: &[&str], cwd: &Path) -> String {
+        use std::hash::{Hash, Hasher};
+        fn hs(s: &str) -> String {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            s.hash(&mut h);
+            format!("{:016x}", h.finish())
+        }
+        let args_joined = args.join("\x00");
+        let cwd_s = cwd.to_string_lossy();
+        format!("{}|{}|{}|{}", hs(exe), hs(&args_joined), hs(&cwd_s), hs(""))
+    }
+
+    fn mk_identity(
+        req: &StepExecutionRequest,
+        op_id: &str,
+        exe: &str,
+        args: &[&str],
+    ) -> ApprovalIdentity {
+        ApprovalIdentity {
+            verification_run_id: req.verification_run_id.clone(),
+            step_id: req.step_id.clone(),
+            step_op_id: op_id.to_string(),
+            cmd_fingerprint: test_fingerprint(exe, args, &req.working_directory),
+            worktree_id: req.worktree_id.clone(),
+            fencing: req.expected_fencing,
+        }
+    }
+
+    /// Build a request for a command that requires approval (not in allow list).
+    fn mk_approval_req(ctx: &Ctx, ikey: &str, hash: &str, op_id: &str) -> StepExecutionRequest {
+        let mut r = mkreq(ctx, ikey, hash);
+        r.executable = PathBuf::from("my-tool");
+        r.args = vec!["scan".into()];
+        r.step_op_id_override = Some(op_id.to_string());
+        r.approval_id = None;
+        r
+    }
+
+    /// ── Normal allowed command (no approval needed) ──────────────
+    #[tokio::test]
+    async fn test_approval_normal_allowed_command() {
+        let c = setup().await;
+        *c.exec.exit_code.lock().unwrap() = 0;
+        // "cargo --version" is in allowed_build_tools → Allow.
+        let r = c.svc.execute_step(&mkreq(&c, "ik-aa1", "h-aa1")).await;
+        assert!(matches!(r, StepExecutionOutcome::Completed { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 1);
+    }
+
+    /// ── ApprovalRequired, no approval → blocked ──────────────────
+    #[tokio::test]
+    async fn test_approval_required_no_approval_blocked() {
+        let c = setup().await;
+        let rq = mk_approval_req(&c, "ik-ar1", "h-ar1", "op-ar1");
+        // No approval_id set → PolicyBlocked.
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    /// ── Valid approval → process starts ──────────────────────────
+    #[tokio::test]
+    async fn test_approval_valid_approval_executes() {
+        let c = setup().await;
+        *c.exec.exit_code.lock().unwrap() = 0;
+        let op_id = "op-av1";
+        let rq = mk_approval_req(&c, "ik-av1", "h-av1", op_id);
+        let identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        insert_approval(&c.db.pool, "appr-av1", &identity, false, None).await;
+        let mut rq = rq;
+        rq.approval_id = Some("appr-av1".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::Completed { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 1);
+    }
+
+    /// ── Wrong run (approval bound to different run) → blocked ───
+    #[tokio::test]
+    async fn test_approval_wrong_run_blocked() {
+        let c = setup().await;
+        let op_id = "op-awr";
+        // Insert a second execution + run so the FK on verification_approvals is satisfied.
+        sqlx::query("INSERT INTO execution_attempts(id,task_id,attempt_number,lifecycle) VALUES('e2','t1',2,'completed')")
+            .execute(&c.db.pool).await.unwrap();
+        sqlx::query("INSERT INTO verification_runs(run_id,plan_id,plan_hash,plan_version,execution_id,task_id,project_id,lifecycle,idempotency_key,request_hash) VALUES('run-other','plan-1','hb',1,'e2','t1','p1','created','ik2','hr2')")
+            .execute(&c.db.pool).await.unwrap();
+        let rq = mk_approval_req(&c, "ik-awr", "h-awr", op_id);
+        // Create approval with a DIFFERENT run_id than the request.
+        let mut identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        identity.verification_run_id = "run-other".into();
+        insert_approval(&c.db.pool, "appr-awr", &identity, false, None).await;
+        let mut rq = rq;
+        rq.approval_id = Some("appr-awr".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    /// ── Wrong worktree → blocked ─────────────────────────────────
+    #[tokio::test]
+    async fn test_approval_wrong_worktree_blocked() {
+        let c = setup().await;
+        let op_id = "op-aww";
+        let mut rq = mk_approval_req(&c, "ik-aww", "h-aww", op_id);
+        let identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        insert_approval(&c.db.pool, "appr-aww", &identity, false, None).await;
+        rq.worktree_id = "wrong-wt".into();
+        rq.approval_id = Some("appr-aww".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    /// ── Stale fencing (approval at different epoch) → blocked ────
+    #[tokio::test]
+    async fn test_approval_stale_fencing_blocked() {
+        let c = setup().await;
+        let op_id = "op-asf";
+        let rq = mk_approval_req(&c, "ik-asf", "h-asf", op_id);
+        // Create approval with a DIFFERENT fencing token.
+        let mut identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        identity.fencing = 99;
+        insert_approval(&c.db.pool, "appr-asf", &identity, false, None).await;
+        let mut rq = rq;
+        rq.approval_id = Some("appr-asf".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    /// ── Expired approval → blocked ───────────────────────────────
+    #[tokio::test]
+    async fn test_approval_expired_blocked() {
+        let c = setup().await;
+        let op_id = "op-aex";
+        let rq = mk_approval_req(&c, "ik-aex", "h-aex", op_id);
+        let identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        insert_approval(
+            &c.db.pool,
+            "appr-aex",
+            &identity,
+            false,
+            Some("2020-01-01 00:00:00"),
+        )
+        .await;
+        let mut rq = rq;
+        rq.approval_id = Some("appr-aex".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    /// ── Revoked approval → blocked ───────────────────────────────
+    #[tokio::test]
+    async fn test_approval_revoked_blocked() {
+        let c = setup().await;
+        let op_id = "op-arv";
+        let rq = mk_approval_req(&c, "ik-arv", "h-arv", op_id);
+        let identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        insert_approval(&c.db.pool, "appr-arv", &identity, false, None).await;
+        // Directly revoke via SQL.
+        sqlx::query(
+            "UPDATE verification_approvals SET lifecycle='revoked' WHERE approval_id='appr-arv'",
+        )
+        .execute(&c.db.pool)
+        .await
+        .unwrap();
+        let mut rq = rq;
+        rq.approval_id = Some("appr-arv".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    /// ── Wrong command fingerprint → blocked ──────────────────────
+    #[tokio::test]
+    async fn test_approval_wrong_fingerprint_blocked() {
+        let c = setup().await;
+        let op_id = "op-awcf";
+        let rq = mk_approval_req(&c, "ik-awcf", "h-awcf", op_id);
+        // Create approval with a DIFFERENT fingerprint (different args).
+        let wrong_id = mk_identity(&rq, op_id, "my-tool", &["other"]);
+        insert_approval(&c.db.pool, "appr-awcf", &wrong_id, false, None).await;
+        let mut rq = rq;
+        rq.approval_id = Some("appr-awcf".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    /// ── Wrong step → blocked ─────────────────────────────────────
+    #[tokio::test]
+    async fn test_approval_wrong_step_blocked() {
+        let c = setup().await;
+        let op_id = "op-aws";
+        let mut rq = mk_approval_req(&c, "ik-aws", "h-aws", op_id);
+        let identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        insert_approval(&c.db.pool, "appr-aws", &identity, false, None).await;
+        rq.step_id = "wrong-step".into();
+        rq.approval_id = Some("appr-aws".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    /// ── Wrong operation → blocked ────────────────────────────────
+    #[tokio::test]
+    async fn test_approval_wrong_operation_blocked() {
+        let c = setup().await;
+        let op_id = "op-awo";
+        let rq = mk_approval_req(&c, "ik-awo", "h-awo", op_id);
+        let identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        insert_approval(&c.db.pool, "appr-awo", &identity, false, None).await;
+        let mut rq = rq;
+        rq.step_op_id_override = Some("different-op".into());
+        rq.approval_id = Some("appr-awo".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    /// ── Absolute deny + valid approval → still blocked ───────────
+    #[tokio::test]
+    async fn test_approval_absolute_deny_overrides() {
+        let c = setup().await;
+        let op_id = "op-aad";
+        let mut rq = mk_approval_req(&c, "ik-aad", "h-aad", op_id);
+        // Use a shell command (always denied by CommandPolicyEngine).
+        rq.executable = PathBuf::from("sh");
+        rq.args = vec!["-c".into(), "echo hi".into()];
+        rq.step_op_id_override = Some(op_id.to_string());
+        // Even with a valid approval, shells are absolutely denied.
+        let identity = mk_identity(&rq, op_id, "sh", &["-c", "echo hi"]);
+        insert_approval(&c.db.pool, "appr-aad", &identity, false, None).await;
+        rq.approval_id = Some("appr-aad".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 0);
+    }
+
+    /// ── Single-use: consume → approved, retry → AlreadyConsumed ──
+    #[tokio::test]
+    async fn test_approval_single_use_consumed_once() {
+        let c = setup().await;
+        *c.exec.exit_code.lock().unwrap() = 0;
+        let op_id = "op-asu";
+        let mut rq = mk_approval_req(&c, "ik-asu", "h-asu", op_id);
+        let identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        insert_approval(&c.db.pool, "appr-asu", &identity, true, None).await;
+        rq.approval_id = Some("appr-asu".into());
+
+        // First execution — approved.
+        let r1 = c.svc.execute_step(&rq).await;
+        assert!(matches!(r1, StepExecutionOutcome::Completed { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 1);
+        assert_eq!(approval_consume_count(&c.db.pool, "appr-asu").await, 1);
+
+        // Second attempt (response-lost retry) — AlreadyConsumed, process NOT restarted.
+        let r2 = c.svc.execute_step(&rq).await;
+        assert!(matches!(r2, StepExecutionOutcome::Duplicate { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 1, "no second process");
+        assert_eq!(
+            approval_consume_count(&c.db.pool, "appr-asu").await,
+            1,
+            "still consumed once"
+        );
+    }
+
+    /// ── Single-use different operation reuse → rejected ──────────
+    #[tokio::test]
+    async fn test_approval_different_operation_rejected() {
+        let c = setup().await;
+        *c.exec.exit_code.lock().unwrap() = 0;
+        let op_id1 = "op-ado1";
+        let mut rq1 = mk_approval_req(&c, "ik-ado1", "h-ado1", op_id1);
+        let identity = mk_identity(&rq1, op_id1, "my-tool", &["scan"]);
+        insert_approval(&c.db.pool, "appr-ado", &identity, true, None).await;
+        rq1.approval_id = Some("appr-ado".into());
+
+        // First execution — approved.
+        let r1 = c.svc.execute_step(&rq1).await;
+        assert!(matches!(r1, StepExecutionOutcome::Completed { .. }));
+        assert_eq!(c.sc.load(Ordering::SeqCst), 1);
+
+        // Different operation, different idempotency key — should be blocked
+        // because approval is already consumed.
+        let op_id2 = "op-ado2";
+        let mut rq2 = mk_approval_req(&c, "ik-ado2", "h-ado2", op_id2);
+        rq2.approval_id = Some("appr-ado".into());
+        let r2 = c.svc.execute_step(&rq2).await;
+        assert!(
+            matches!(r2, StepExecutionOutcome::PolicyBlocked { .. }),
+            "different op reuse must block"
+        );
+        assert_eq!(c.sc.load(Ordering::SeqCst), 1, "no second process");
+    }
+
+    /// ── Two-pool single-use: only one winner ─────────────────────
+    #[tokio::test]
+    async fn test_approval_two_pool_one_winner() {
+        let c = setup().await;
+        *c.exec.exit_code.lock().unwrap() = 0;
+        let op_id = "op-atp";
+        let mut rq = mk_approval_req(&c, "ik-atp", "h-atp", op_id);
+        let identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        insert_approval(&c.db.pool, "appr-atp", &identity, true, None).await;
+        rq.approval_id = Some("appr-atp".into());
+
+        let s2 = VerificationExecutionService::new(c.db.pool.clone(), c.exec.clone());
+        let (r1, r2) = tokio::join!(c.svc.execute_step(&rq), s2.execute_step(&rq));
+
+        // At least one must succeed.
+        let completed = matches!(r1, StepExecutionOutcome::Completed { .. })
+            || matches!(r2, StepExecutionOutcome::Completed { .. });
+        assert!(completed, "at least one must complete");
+
+        // Exactly one process started.
+        assert_eq!(c.sc.load(Ordering::SeqCst), 1, "exactly one process");
+        // Exactly one consume.
+        assert_eq!(
+            approval_consume_count(&c.db.pool, "appr-atp").await,
+            1,
+            "consumed exactly once"
+        );
+    }
+
+    /// ── Approval event count in step events ──────────────────────
+    #[tokio::test]
+    async fn test_approval_no_credential_in_events() {
+        let c = setup().await;
+        *c.exec.exit_code.lock().unwrap() = 0;
+        let op_id = "op-anc";
+        let mut rq = mk_approval_req(&c, "ik-anc", "h-anc", op_id);
+        let identity = mk_identity(&rq, op_id, "my-tool", &["scan"]);
+        insert_approval(&c.db.pool, "appr-anc", &identity, false, None).await;
+        rq.approval_id = Some("appr-anc".into());
+
+        c.svc.execute_step(&rq).await;
+        let rows: Vec<(String, Option<String>)> =
+            sqlx::query_as("SELECT event_type, detail_json FROM verification_step_events")
+                .fetch_all(&c.db.pool)
+                .await
+                .unwrap();
+        for (_et, detail) in &rows {
+            let d = detail.as_deref().unwrap_or("");
+            assert!(
+                !d.contains("appr-anc"),
+                "event must not contain approval id raw"
+            );
+            assert!(!d.contains("lease_token"));
+        }
+    }
+
+    /// ── Approved shell still denied at policy level ──────────────
+    #[tokio::test]
+    async fn test_approval_shell_denied_even_with_approval() {
+        let c = setup().await;
+        // bash → shell denied by CommandPolicyEngine (deny: true pattern).
+        let mut rq = mkreq(&c, "ik-ash", "h-ash");
+        rq.executable = PathBuf::from("sh");
+        rq.args = vec!["-c".into(), "echo hi".into()];
+        rq.approval_id = Some("any-approval".into());
+        rq.step_op_id_override = Some("op-ash".into());
+
+        let r = c.svc.execute_step(&rq).await;
+        assert!(matches!(r, StepExecutionOutcome::PolicyBlocked { .. }));
         assert_eq!(c.sc.load(Ordering::SeqCst), 0);
     }
 }
