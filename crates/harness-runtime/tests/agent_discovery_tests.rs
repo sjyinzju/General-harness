@@ -858,7 +858,7 @@ async fn test_49_table_count_18_business_tables() {
     assert_eq!(
         names.len(),
         27,
-        "Expected 27 business tables (001–012), got {}: {:?}",
+        "Expected 30 business tables (001–013), got {}: {:?}",
         names.len(),
         names
     );

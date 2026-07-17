@@ -129,13 +129,16 @@ mod tests {
                 "tasks",
                 "verification_diagnostics",
                 "verification_evidence",
+                "verification_ownership_events",
                 "verification_plans",
                 "verification_runs",
+                "verification_step_operations",
+                "verification_step_processes",
                 "verification_step_results",
                 "workspace_leases",
                 "worktrees"
             ],
-            "27 business tables expected (001–012)"
+            "30 business tables expected (001–013)"
         );
     }
 
