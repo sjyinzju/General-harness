@@ -130,6 +130,7 @@ mod tests {
                 "verification_approvals",
                 "verification_diagnostics",
                 "verification_evidence",
+                "verification_finalization_operations",
                 "verification_ownership_events",
                 "verification_plans",
                 "verification_policy_operations",
@@ -141,7 +142,7 @@ mod tests {
                 "workspace_leases",
                 "worktrees"
             ],
-            "33 business tables expected (001\u{2013}016)"
+            "34 business tables expected (001\u{2013}017)"
         );
     }
 

@@ -7,6 +7,7 @@ pub mod approval_validator;
 pub mod content_validator;
 pub mod evidence_repo;
 pub mod execution_service;
+pub mod finalization;
 pub mod ownership_service;
 pub mod plan_repo;
 pub mod policy_evidence;
@@ -17,6 +18,10 @@ pub use evidence_repo::VerificationEvidenceRepo;
 pub use execution_service::{
     FakeProcessExecutor, ProcessExecutor, ProcessManagerAdapter, ProcessResult,
     StepExecutionOutcome, StepExecutionRequest, VerificationExecutionService,
+};
+pub use finalization::{
+    FinalizationDossier, FinalizationOutcome, FinalizationRequest, NextActionCategory,
+    VerificationFinalizationService, VerificationOutcomeAggregator,
 };
 pub use ownership_service::{
     OwnershipTakeoverResult, TakeoverRequest, VerificationOwnershipService,
