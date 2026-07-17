@@ -3,6 +3,7 @@
 //! Batch 1: Model, persistence, idempotency.
 //! Later batches: plan execution, diff/secret/policy checks, finalization.
 
+pub mod approval_validator;
 pub mod content_validator;
 pub mod evidence_repo;
 pub mod execution_service;

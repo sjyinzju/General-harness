@@ -127,6 +127,7 @@ mod tests {
                 "scheduler_reservations",
                 "task_dependencies",
                 "tasks",
+                "verification_approvals",
                 "verification_diagnostics",
                 "verification_evidence",
                 "verification_ownership_events",
@@ -139,7 +140,7 @@ mod tests {
                 "workspace_leases",
                 "worktrees"
             ],
-            "31 business tables expected (001–014)"
+            "32 business tables expected (001–015)"
         );
     }
 
