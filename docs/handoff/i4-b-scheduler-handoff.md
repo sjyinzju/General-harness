@@ -1,10 +1,10 @@
-# I4-B Task DAG Scheduler — Handoff (Closure)
+# I4-B Task DAG Scheduler — Handoff (Final Closure)
 
-> **Status**: I4-B Closure complete, all quality gates green
+> **Status**: I4-B Closure complete, all quality gates green, working tree clean
 > **Date**: 2026-07-17
 > **Branch**: `main`
 > **Pre-I4-B HEAD**: `b27a836` — `docs: finalize agent runtime handoff`
-> **Closure HEAD**: see commits below
+> **Closure HEAD**: `3a63fe0` — `test(i4-b): add scheduler orchestrator golden path tests`
 
 ---
 
@@ -17,8 +17,10 @@
 | `bb35c93` | fix(i4-b): make scheduler dispatch idempotent |
 | `3d5858a` | fix(i4-b): close scheduler resource lifecycle gaps |
 | `e2df317` | feat(i4-b): complete scheduler reconciliation |
+| `ba6933f` | feat(i4-b): add persistent verification resource handoff |
+| `3a63fe0` | test(i4-b): add scheduler orchestrator golden path tests |
 
-5 commits total (2 original + 3 closure).
+7 commits total (5 original + 2 final closure).
 
 ## 2. Quality Gates (Final)
 
@@ -26,9 +28,9 @@
 |------|--------|
 | `cargo fmt --all --check` | **PASS** |
 | `cargo clippy --workspace --all-targets -- -D warnings` | **PASS** |
-| `cargo test --workspace` | **562 passed / 0 failed / 0 ignored** |
+| `cargo test --workspace` | **602 passed / 0 failed / 0 ignored** |
 | `git diff --check` | PASS |
-| `git status --short` | clean |
+| `git status --porcelain=v1` | clean (no output) |
 
 ## 3. Test Progression
 
@@ -36,18 +38,23 @@
 |-------|-------|
 | I4-A Closure | 518 |
 | I4-B Initial (handoff) | 543 |
-| I4-B Closure | **562** |
+| I4-B Closure (pre-coordinator) | 562 |
+| I4-B Final Closure | **602** |
 
-+19 new tests in closure:
-- +6 dispatch_repo tests (idempotency, spawn evidence, resources, concurrent, conflict)
-- +3 event_sink redaction tests (message, tool_result, raw_vendor_event)
-- +10 reconciler tests (lease-without-claim, failed-exec-active-resources, awaiting-verification-missing, running-without-process, process-terminal-exec-nonterminal, heartbeat-missing, concurrent-reconcilers, no-retry, no-worktree-deletion, no-provider-switch)
+New in final closure (+40 tests):
+- +8 HeartbeatRegistry tests (register, inspect, takeover, cancel, fencing, mark_lost)
+- +10 HandoffRepository tests (create, get, takeover CAS, version conflict, idempotent, contested, terminal, heartbeat, lost/released, lease_token absence)
+- +8 ResourceHandoffCoordinator tests (takeover, idempotent, contested, stale fencing, mismatch detection, cancel owner/fencing checks, lease_token absence)
+- +1 Reconciler HandoffRegistryMismatch test
+- +6 SchedulerOrchestrator integration tests (golden path, response-lost, adapter failure, heartbeat continuation, takeover, strict two-pool winner)
+- +7 additional test coverage from strengthened assertions and formatting
 
-## 4. Migration
+## 4. Migrations
 
 `010_scheduler.sql` — additive, migrations 001–009 **frozen and untouched**.
+`011_resource_handoff.sql` — additive, migrations 001–010 **frozen and untouched**.
 
-Business tables: 18 → 21.
+Business tables: 18 → 22.
 
 ## 5. Dispatch Order (Safe Sequence)
 
@@ -167,8 +174,10 @@ Execution terminal → Task Submitted/AwaitingVerification
 | 16 | RunningExecutionWithoutProcessRegistry | running exec, stale session | ❌ |
 | 17 | ProcessTerminalExecutionNonterminal | process_exited event, running exec | ❌ |
 | 18 | HeartbeatMissingForRetainedLease | active lease, stale heartbeat | ❌ |
+| 19 | HandoffRegistryMismatch | DB/registry owner/fencing disagreement, DB Released but registry running | ✅ (safe heartbeat stop) |
 
 Safety: no retry, no provider switch, no worktree deletion, INSERT OR IGNORE for concurrent reconcilers.
+Never auto-starts Verification. Never re-acquires Lease/Claim.
 
 ## 14. State Mapping
 
@@ -186,7 +195,6 @@ No new FSM states. All transitions use Gate C frozen FSM.
 ## 15. Explicitly NOT Implemented
 
 - I4-C Verification Pipeline
-- SchedulerOrchestrator end-to-end integration tests with fake Agent (Batch D deferred)
 - Automatic retry creation
 - Commit/Integration Queue
 - Supervisor IPC
@@ -194,6 +202,55 @@ No new FSM states. All transitions use Gate C frozen FSM.
 - Project Goal Loop
 - LLM-driven Task DAG re-planning
 - Active validation auto-trigger
+
+## 15a. Persistent Resource Handoff (migration 011)
+
+`resource_handoffs` table links execution_id, worktree_id, lease_id, claim_group_id.
+Created on Agent success. No lease tokens persisted.
+
+Takeover uses CAS with version optimistic locking:
+- SchedulerOwned → VerificationOwned (only if version matches)
+- Same owner repeat → idempotent AlreadyOwned
+- Different owner → Contested
+- Terminal state (Released/Lost) → rejected
+
+## 15b. HeartbeatRegistry
+
+Runtime-owned registry (`Arc<RwLock<HashMap>>`) decoupled from dispatch local variables.
+Heartbeat survives `dispatch()` return — cancellation token held by registry entry.
+
+I4-C API:
+- `inspect(execution_id)` / `inspect_by_lease(lease_id)` — discover active heartbeats
+- `takeover(execution_id, owner, fencing)` — CAS ownership transfer
+- `cancel(execution_id, owner, fencing)` — stop heartbeat with owner+fencing validation
+- `mark_lost(execution_id)` / `remove_after_finalization(execution_id)`
+- `cancel_all()` — runtime shutdown
+
+Security: old fencing rejected, wrong owner rejected, no lease token in Debug/entry.
+
+## 15c. ResourceHandoffCoordinator
+
+Single entry point for I4-C Verification takeover. Coordinates both layers atomically:
+
+```text
+1. Read DB handoff + runtime heartbeat
+2. Validate execution/lease/claim/fencing/owner consistency
+3. DB CAS SchedulerOwned → VerificationOwned
+4. Runtime registry takeover
+5. Re-read and confirm DB/registry owner consistent
+6. Return Acquired only if both layers agree
+```
+
+If DB CAS succeeds but registry takeover fails:
+- Returns HandoffStateMismatch (NOT Acquired)
+- Marks handoff as reconciliation_required
+- Does NOT allow Verification to proceed
+
+API:
+- `inspect_consistent(execution_id)` — compares both layers
+- `takeover_for_verification(execution_id, owner, fencing)` — coordinated two-phase
+- `cancel_after_verification(execution_id, owner, fencing)` — checks both owners before cancel
+- `mark_reconciliation_required(execution_id, reason)`
 
 ## 16. I4-B Final Exit Conditions
 
@@ -214,27 +271,46 @@ No new FSM states. All transitions use Gate C frozen FSM.
 | Worktree/Lease/Claim ordering safe | ✅ |
 | Agent via AgentAdapter/ProcessManager only | ✅ |
 | AgentEvent sequential persistence with redaction | ✅ |
-| Profile-scoped environment filtering | ✅ |
+| Profile-scoped environment filtering (fail-closed) | ✅ |
 | Heartbeat survives dispatch return | ✅ |
-| Success: reservation released, Lease/Claim retained | ✅ |
+| Success: reservation released, Lease/Claim/Worktree retained | ✅ |
 | Failure: full resource release | ✅ |
-| Scheduler Reconciler (18 anomaly types) | ✅ |
+| Scheduler Reconciler (19 anomaly types) | ✅ |
+| HandoffRegistryMismatch detection (DB/registry consistency) | ✅ |
+| ResourceHandoffCoordinator (two-phase DB+registry takeover) | ✅ |
+| Strict two-pool winner: assert_eq!(total_start_count, 1) | ✅ |
+| Golden path: worktree DB+FS, lease expiry, coordinator inspect | ✅ |
 | No automatic retry | ✅ |
 | No silent provider switching | ✅ |
 | No Verification started | ✅ |
-| Migrations 001–009 untouched | ✅ |
-| 562 tests, 0 failed, 0 ignored | ✅ |
+| Migrations 001–010 untouched | ✅ |
+| Migration 011 additive, no lease token | ✅ |
+| 602 tests, 0 failed, 0 ignored | ✅ |
 | fmt / clippy -D warnings green | ✅ |
-| git status clean | ✅ |
+| `git status --porcelain=v1` returns empty | ✅ |
 
-## 17. Remaining Items for I4-C
+## 17. Known Gaps and Remaining Items for I4-C
 
-- SchedulerOrchestrator end-to-end integration tests with fake Agent (28 scenarios)
-- Verification pipeline (I4-C)
-- Heartbeat handoff from I4-B runtime to I4-C verification
-- True concurrency tests with independent SqlitePools on file-based DB
-- `allowed_env_var_names` field on RuntimeProfile type (currently derived from agent_kind)
+### I4-C Must Implement
+- Verification pipeline (I4-C core)
+- Commit/Integration Queue
+- Supervisor IPC
+- TUI
+- Project Goal Loop
+- LLM-driven Task DAG re-planning
+- Active validation auto-trigger
+
+### I4-C Should Integrate With
+- `ResourceHandoffCoordinator::takeover_for_verification()` — the single entry point for I4-C to claim scheduler resources
+- `ResourceHandoffCoordinator::inspect_consistent()` — to verify DB/registry agreement before verification
+- `ResourceHandoffCoordinator::cancel_after_verification()` — to release resources after verification
+
+### Low-Priority Follow-ups
+- `allowed_env_var_names` field on RuntimeProfile type (currently derived from agent_kind — fail-closed, no leakage risk)
+- Filesystem-level worktree existence check in reconciler (DB-level checks already in place)
+- Explicit `HandoffStateMismatch` handling in I4-C verification start guard
 
 ## 18. Ready for I4-C Verification
 
-**Yes.** All I4-B exit conditions met.
+**Yes.** All I4-B exit conditions met. Working tree clean at `3a63fe0`.
+602 tests, 0 failed, 0 ignored. All gates green.
