@@ -26,16 +26,25 @@ impl ConcurrencyManager {
         repository_id: Option<&str>,
     ) -> Result<ReservationResult, CoreError> {
         let mut tx = self.pool.begin().await.map_err(|e| {
-            CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System)
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                e.to_string(),
+                ErrorSource::System,
+            )
         })?;
 
         // Check global limit
-        let global_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM scheduler_reservations WHERE status='active'",
-        )
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
+        let global_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM scheduler_reservations WHERE status='active'")
+                .fetch_one(&mut *tx)
+                .await
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        e.to_string(),
+                        ErrorSource::System,
+                    )
+                })?;
 
         if global_count.0 >= self.config.global_max as i64 {
             return Ok(ReservationResult::GlobalLimitReached);
@@ -92,7 +101,11 @@ impl ConcurrencyManager {
         match result {
             Ok(_) => {
                 tx.commit().await.map_err(|e| {
-                    CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System)
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        e.to_string(),
+                        ErrorSource::System,
+                    )
                 })?;
                 Ok(ReservationResult::Reserved {
                     reservation_id,
@@ -112,7 +125,11 @@ impl ConcurrencyManager {
                         ErrorSource::System,
                     ))
                 } else {
-                    Err(CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))
+                    Err(CoreError::new(
+                        ErrorCode::PersistenceError,
+                        e.to_string(),
+                        ErrorSource::System,
+                    ))
                 }
             }
         }
@@ -146,7 +163,13 @@ impl ConcurrencyManager {
         .bind(task_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                e.to_string(),
+                ErrorSource::System,
+            )
+        })?;
         Ok(count.0 > 0)
     }
 }
@@ -222,7 +245,9 @@ mod tests {
 
         // Force expire by setting expires_at to past
         sqlx::query("UPDATE scheduler_reservations SET expires_at='2000-01-01' WHERE task_id='t1'")
-            .execute(&db.pool).await.unwrap();
+            .execute(&db.pool)
+            .await
+            .unwrap();
 
         let expired = mgr.expire_stale().await.unwrap();
         assert!(expired > 0);
@@ -235,8 +260,17 @@ mod tests {
     async fn create_project_and_task(db: &Database, task_id: &str) {
         let pid = format!("proj-{}", task_id);
         sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES (?,'test','active')")
-            .bind(&pid).execute(&db.pool).await.unwrap();
-        sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?,?,'test','pending')")
-            .bind(task_id).bind(&pid).execute(&db.pool).await.unwrap();
+            .bind(&pid)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?,?,'test','pending')",
+        )
+        .bind(task_id)
+        .bind(&pid)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     }
 }

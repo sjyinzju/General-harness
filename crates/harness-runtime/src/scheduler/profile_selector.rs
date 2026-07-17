@@ -1,12 +1,29 @@
 //! RuntimeProfileSelector — deterministic profile selection for task dispatch.
 //! Never guesses capability from model name. Never treats env var presence as auth.
 
-use harness_core::contracts::scheduler::ProfileSelection;
 use harness_core::contracts::runtime_profile::{
     AuthCheckStatus, CoreStatus, ExecutionStatus, RuntimeProfile,
 };
+use harness_core::contracts::scheduler::ProfileSelection;
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
+
+/// Row type for profile queries — avoids clippy::type_complexity.
+type ProfileFullRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
 
 pub struct RuntimeProfileSelector {
     pool: SqlitePool,
@@ -107,9 +124,7 @@ impl RuntimeProfileSelector {
 
     /// Load a RuntimeProfile from the database by ID.
     pub async fn get_profile(&self, profile_id: &str) -> Result<Option<RuntimeProfile>, CoreError> {
-        let row: Option<(
-            String, String, String, String, String, String, String, String, String, String, String, String, String,
-        )> = sqlx::query_as(
+        let row: Option<ProfileFullRow> = sqlx::query_as(
             "SELECT id, agent_definition_id, agent_kind, adapter_kind, agent_version, executable_path, provider, provider_source, model, base_url, auth_mode, auth_status, core_status FROM runtime_profiles WHERE id = ?",
         )
         .bind(profile_id)
@@ -118,7 +133,21 @@ impl RuntimeProfileSelector {
         .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
 
         Ok(row.map(
-            |(id, def_id, kind, adapter, ver, exe, prov, prov_src, mdl, url, auth_m, auth_s, core)| {
+            |(
+                id,
+                def_id,
+                kind,
+                adapter,
+                ver,
+                exe,
+                prov,
+                prov_src,
+                mdl,
+                url,
+                auth_m,
+                auth_s,
+                core,
+            )| {
                 RuntimeProfile {
                     id,
                     agent_definition_id: def_id,
@@ -133,31 +162,41 @@ impl RuntimeProfileSelector {
                     ),
                     model: Some(mdl),
                     base_url: Some(url),
-                    auth_mode: serde_json::from_str(&auth_m).unwrap_or(
-                        harness_core::contracts::runtime_profile::AuthMode::Unknown,
-                    ),
-                    auth_status: serde_json::from_str(&auth_s).unwrap_or(
-                        harness_core::contracts::runtime_profile::AuthStatus::Unknown,
-                    ),
+                    auth_mode: serde_json::from_str(&auth_m)
+                        .unwrap_or(harness_core::contracts::runtime_profile::AuthMode::Unknown),
+                    auth_status: serde_json::from_str(&auth_s)
+                        .unwrap_or(harness_core::contracts::runtime_profile::AuthStatus::Unknown),
                     credential_ref: None,
                     capabilities: harness_core::contracts::runtime_profile::CapabilitySet {
                         required: harness_core::contracts::runtime_profile::RequiredCapabilities {
                             execute: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            working_directory: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            stream_output: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            process_exit: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            cancellation: harness_core::contracts::runtime_profile::TriState::Unknown,
+                            working_directory:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
+                            stream_output:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
+                            process_exit:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
+                            cancellation:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
                             timeout: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            final_result: harness_core::contracts::runtime_profile::TriState::Unknown,
+                            final_result:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
                         },
                         optional: harness_core::contracts::runtime_profile::OptionalCapabilities {
-                            native_session_resume: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            structured_output: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            tool_events: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            file_change_events: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            reasoning_summary: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            interactive_approval: harness_core::contracts::runtime_profile::TriState::Unknown,
-                            usage_reporting: harness_core::contracts::runtime_profile::TriState::Unknown,
+                            native_session_resume:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
+                            structured_output:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
+                            tool_events:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
+                            file_change_events:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
+                            reasoning_summary:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
+                            interactive_approval:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
+                            usage_reporting:
+                                harness_core::contracts::runtime_profile::TriState::Unknown,
                         },
                         workspace_modes: vec![],
                         supported_languages: vec![],
@@ -203,7 +242,14 @@ mod tests {
         Database::open_in_memory().await.unwrap()
     }
 
-    async fn insert_profile(db: &Database, id: &str, kind: &str, adapter: &str, core: &str, exec: &str) {
+    async fn insert_profile(
+        db: &Database,
+        id: &str,
+        kind: &str,
+        adapter: &str,
+        core: &str,
+        exec: &str,
+    ) {
         sqlx::query(
             "INSERT INTO runtime_profiles (id, agent_kind, adapter_kind, agent_version, executable_path, provider, provider_source, auth_mode, auth_status, core_status, authentication_status, execution_status) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
         )
@@ -215,30 +261,64 @@ mod tests {
     #[tokio::test]
     async fn test_explicit_profile_selected() {
         let db = setup().await;
-        insert_profile(&db, "p1", "claude-code", "claude-cli", "available", "untested").await;
+        insert_profile(
+            &db,
+            "p1",
+            "claude-code",
+            "claude-cli",
+            "available",
+            "untested",
+        )
+        .await;
         insert_profile(&db, "p2", "codex", "codex-cli", "available", "untested").await;
         let selector = RuntimeProfileSelector::new(db.pool.clone());
         let result = selector.select(Some("p1"), &[], &[]).await.unwrap();
-        assert!(matches!(result, ProfileSelection::Selected { profile_id, .. } if profile_id == "p1"));
+        assert!(
+            matches!(result, ProfileSelection::Selected { profile_id, .. } if profile_id == "p1")
+        );
     }
 
     #[tokio::test]
     async fn test_explicit_profile_unavailable() {
         let db = setup().await;
         let selector = RuntimeProfileSelector::new(db.pool.clone());
-        let result = selector.select(Some("nonexistent"), &[], &[]).await.unwrap();
-        assert!(matches!(result, ProfileSelection::ExplicitProfileUnavailable { .. }));
+        let result = selector
+            .select(Some("nonexistent"), &[], &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ProfileSelection::ExplicitProfileUnavailable { .. }
+        ));
     }
 
     #[tokio::test]
     async fn test_deterministic_tie_break() {
         let db = setup().await;
-        insert_profile(&db, "p-b", "claude-code", "claude-cli", "available", "untested").await;
-        insert_profile(&db, "p-a", "claude-code", "claude-cli", "available", "untested").await;
+        insert_profile(
+            &db,
+            "p-b",
+            "claude-code",
+            "claude-cli",
+            "available",
+            "untested",
+        )
+        .await;
+        insert_profile(
+            &db,
+            "p-a",
+            "claude-code",
+            "claude-cli",
+            "available",
+            "untested",
+        )
+        .await;
         let selector = RuntimeProfileSelector::new(db.pool.clone());
         // Should pick p-a due to alphabetical sort
         let result = selector.select(None, &[], &[]).await.unwrap();
-        assert!(matches!(result, ProfileSelection::Selected { profile_id, .. } if profile_id == "p-a"));
+        assert!(
+            matches!(result, ProfileSelection::Selected { profile_id, .. } if profile_id == "p-a")
+        );
     }
 
     #[tokio::test]
@@ -246,18 +326,45 @@ mod tests {
         let db = setup().await;
         insert_profile(&db, "p1", "codex", "codex-cli", "available", "untested").await;
         let selector = RuntimeProfileSelector::new(db.pool.clone());
-        let result = selector.select(None, &["claude-code".to_string()], &[]).await.unwrap();
-        assert!(matches!(result, ProfileSelection::NoCompatibleProfile { .. }));
+        let result = selector
+            .select(None, &["claude-code".to_string()], &[])
+            .await
+            .unwrap();
+        assert!(matches!(
+            result,
+            ProfileSelection::NoCompatibleProfile { .. }
+        ));
     }
 
     #[tokio::test]
     async fn test_no_silent_provider_switching() {
         let db = setup().await;
-        insert_profile(&db, "p-claude", "claude-code", "claude-cli", "available", "untested").await;
-        insert_profile(&db, "p-codex", "codex", "codex-cli", "available", "untested").await;
+        insert_profile(
+            &db,
+            "p-claude",
+            "claude-code",
+            "claude-cli",
+            "available",
+            "untested",
+        )
+        .await;
+        insert_profile(
+            &db,
+            "p-codex",
+            "codex",
+            "codex-cli",
+            "available",
+            "untested",
+        )
+        .await;
         let selector = RuntimeProfileSelector::new(db.pool.clone());
         // Asking for claude-code should return claude, not codex
-        let result = selector.select(None, &["claude-code".to_string()], &[]).await.unwrap();
-        assert!(matches!(result, ProfileSelection::Selected { agent_kind, .. } if agent_kind == "claude-code"));
+        let result = selector
+            .select(None, &["claude-code".to_string()], &[])
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, ProfileSelection::Selected { agent_kind, .. } if agent_kind == "claude-code")
+        );
     }
 }

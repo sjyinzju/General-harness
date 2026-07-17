@@ -53,13 +53,14 @@ impl SchedulerReconciler {
         .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
 
         for (exec_id, dispatch_id) in &stale_spawns {
-            let _ = self.record_anomaly(
-                &SchedulerAnomaly::IntentWithoutSpawn,
-                "dispatch",
-                Some(dispatch_id),
-                "spawn intent older than 10min without completion",
-            )
-            .await;
+            let _ = self
+                .record_anomaly(
+                    &SchedulerAnomaly::IntentWithoutSpawn,
+                    "dispatch",
+                    Some(dispatch_id),
+                    "spawn intent older than 10min without completion",
+                )
+                .await;
             // Mark execution as Lost
             let _ = sqlx::query(
                 "UPDATE execution_attempts SET lifecycle='lost' WHERE id=? AND lifecycle='running'",
@@ -154,8 +155,12 @@ mod tests {
     #[tokio::test]
     async fn test_orphan_reservation_reclaimed() {
         let db = setup().await;
-        sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')")
-            .execute(&db.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES ('t1','p1','test','pending')")
             .execute(&db.pool).await.unwrap();
         sqlx::query(
@@ -171,8 +176,12 @@ mod tests {
     #[tokio::test]
     async fn test_duplicate_active_execution_detected() {
         let db = setup().await;
-        sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')")
-            .execute(&db.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES ('t1','p1','test','running')")
             .execute(&db.pool).await.unwrap();
         sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'running')")
@@ -188,8 +197,12 @@ mod tests {
     #[tokio::test]
     async fn test_repeated_reconcile_idempotent() {
         let db = setup().await;
-        sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')")
-            .execute(&db.pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES ('t1','p1','test','pending')")
             .execute(&db.pool).await.unwrap();
         sqlx::query(

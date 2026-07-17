@@ -18,19 +18,18 @@ impl TaskReadinessEvaluator {
 
     /// Evaluate readiness for a single Task by ID.
     pub async fn evaluate(&self, task_id: &str) -> Result<ReadyStatus, CoreError> {
-        let task: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT id, lifecycle, project_id FROM tasks WHERE id = ?",
-        )
-        .bind(task_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| {
-            CoreError::new(
-                ErrorCode::PersistenceError,
-                format!("readiness query: {e}"),
-                ErrorSource::System,
-            )
-        })?;
+        let task: Option<(String, String, String)> =
+            sqlx::query_as("SELECT id, lifecycle, project_id FROM tasks WHERE id = ?")
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        format!("readiness query: {e}"),
+                        ErrorSource::System,
+                    )
+                })?;
 
         let (_tid, lc_str, _project_id) = match task {
             Some(t) => t,
@@ -61,18 +60,25 @@ impl TaskReadinessEvaluator {
             .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
 
             if let Some((exec_id,)) = exec {
-                return Ok(ReadyStatus::ActiveExecutionExists { execution_id: exec_id });
+                return Ok(ReadyStatus::ActiveExecutionExists {
+                    execution_id: exec_id,
+                });
             }
         }
 
         // Check dependencies
-        let deps: Vec<(String,)> = sqlx::query_as(
-            "SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?",
-        )
-        .bind(task_id)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
+        let deps: Vec<(String,)> =
+            sqlx::query_as("SELECT depends_on_task_id FROM task_dependencies WHERE task_id = ?")
+                .bind(task_id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        e.to_string(),
+                        ErrorSource::System,
+                    )
+                })?;
 
         if deps.is_empty() {
             // No dependencies — check if Task is in a dispatchable state
@@ -106,28 +112,33 @@ impl TaskReadinessEvaluator {
         let mut failed: Vec<String> = Vec::new();
 
         for dep_id in &dep_ids {
-            let dep_state: Option<(String,)> = sqlx::query_as(
-                "SELECT lifecycle FROM tasks WHERE id = ?",
-            )
-            .bind(dep_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|e| {
-                CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System)
-            })?;
+            let dep_state: Option<(String,)> =
+                sqlx::query_as("SELECT lifecycle FROM tasks WHERE id = ?")
+                    .bind(dep_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| {
+                        CoreError::new(
+                            ErrorCode::PersistenceError,
+                            e.to_string(),
+                            ErrorSource::System,
+                        )
+                    })?;
 
             match dep_state {
                 None => {
                     missing.push(dep_id.clone());
                 }
                 Some((lc,)) => {
-                    let dep_lc: TaskLifecycle =
-                        serde_json::from_str(&format!("\"{lc}\"")).unwrap_or(TaskLifecycle::Pending);
+                    let dep_lc: TaskLifecycle = serde_json::from_str(&format!("\"{lc}\""))
+                        .unwrap_or(TaskLifecycle::Pending);
                     match dep_lc {
                         TaskLifecycle::Done | TaskLifecycle::Verified => {
                             // Satisfied — these are success states
                         }
-                        TaskLifecycle::Failed | TaskLifecycle::Cancelled | TaskLifecycle::Superseded => {
+                        TaskLifecycle::Failed
+                        | TaskLifecycle::Cancelled
+                        | TaskLifecycle::Superseded => {
                             failed.push(dep_id.clone());
                         }
                         _ => {
@@ -172,7 +183,10 @@ impl TaskReadinessEvaluator {
         let mut visited: HashSet<String> = HashSet::new();
 
         for dep in deps {
-            graph.entry(start.to_string()).or_default().push(dep.clone());
+            graph
+                .entry(start.to_string())
+                .or_default()
+                .push(dep.clone());
             queue.push_back(dep.clone());
         }
 
@@ -187,7 +201,11 @@ impl TaskReadinessEvaluator {
             .fetch_all(&self.pool)
             .await
             .map_err(|e| {
-                CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System)
+                CoreError::new(
+                    ErrorCode::PersistenceError,
+                    e.to_string(),
+                    ErrorSource::System,
+                )
             })?;
 
             for (dep_id,) in sub_deps {
@@ -254,7 +272,13 @@ impl TaskReadinessEvaluator {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                e.to_string(),
+                ErrorSource::System,
+            )
+        })?;
 
         let mut ready: Vec<String> = Vec::new();
         for (tid,) in rows {
@@ -276,19 +300,23 @@ mod tests {
     }
 
     async fn create_task(db: &Database, id: &str, lc: &str) {
-        sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?, 'p1', 'test', ?)")
-            .bind(id)
-            .bind(lc)
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES (?, 'p1', 'test', ?)",
+        )
+        .bind(id)
+        .bind(lc)
+        .execute(&db.pool)
+        .await
+        .unwrap();
     }
 
     async fn create_project(db: &Database) {
-        sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')")
-            .execute(&db.pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')",
+        )
+        .execute(&db.pool)
+        .await
+        .unwrap();
     }
 
     async fn add_dep(db: &Database, task_id: &str, depends_on: &str) {
@@ -356,7 +384,9 @@ mod tests {
         add_dep(&db, "t1", "dep1").await;
         // Delete the dependency task (cascade removes dep row)
         sqlx::query("DELETE FROM tasks WHERE id = 'dep1'")
-            .execute(&db.pool).await.unwrap();
+            .execute(&db.pool)
+            .await
+            .unwrap();
         let eval = TaskReadinessEvaluator::new(db.pool.clone());
         // After cascade delete, dep row is gone, but t1 still references dep1 in its dep list
         // The FK CASCADE should have removed the row, so t1 now has no deps and should be Ready

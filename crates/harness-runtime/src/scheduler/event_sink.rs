@@ -95,7 +95,10 @@ impl AgentEventSink for SchedulerEventSink {
                             "Failed to write large event to artifact"
                         );
                     }
-                    (serde_json::json!({"content_ref": path.to_string_lossy()}).to_string(), Some(path.to_string_lossy().to_string()))
+                    (
+                        serde_json::json!({"content_ref": path.to_string_lossy()}).to_string(),
+                        Some(path.to_string_lossy().to_string()),
+                    )
                 } else {
                     (event_json, None)
                 }
@@ -165,8 +168,6 @@ fn event_type_str(event: &AgentEvent) -> &'static str {
 mod tests {
     use super::*;
     use crate::db::Database;
-    use harness_core::contracts::agent_event::TerminationReason;
-
     #[tokio::test]
     async fn test_event_sink_persists() {
         let db = Database::open_in_memory().await.unwrap();
