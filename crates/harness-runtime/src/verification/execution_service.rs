@@ -135,10 +135,16 @@ impl ProcessExecutor for ProcessManagerAdapter {
             stdin_mode: StdinMode::Closed,
             timeout,
             graceful_shutdown_timeout: Duration::from_secs(2),
-            stdout_capture: CapturePolicy::Spool { max_memory_bytes: 4096 },
-            stderr_capture: CapturePolicy::Spool { max_memory_bytes: 4096 },
+            stdout_capture: CapturePolicy::Spool {
+                max_memory_bytes: 4096,
+            },
+            stderr_capture: CapturePolicy::Spool {
+                max_memory_bytes: 4096,
+            },
             output_byte_limit: 64 * 1024,
-            spool_dir: Some(std::env::temp_dir().join(format!("harness-vrfy-{}", uuid::Uuid::new_v4()))),
+            spool_dir: Some(
+                std::env::temp_dir().join(format!("harness-vrfy-{}", uuid::Uuid::new_v4())),
+            ),
             known_secrets: vec![],
             allowed_env_var_names: env.keys().cloned().collect(),
             execution_id: format!("vrfy-{}", uuid::Uuid::new_v4()),
@@ -148,10 +154,16 @@ impl ProcessExecutor for ProcessManagerAdapter {
         let start = std::time::Instant::now();
         let handle = match self.manager.spawn(&spec).await {
             Ok(h) => h,
-            Err(_) => return ProcessResult {
-                exit_code: -1, duration_ms: 0, stdout_preview: None,
-                stderr_preview: None, timed_out: false, terminated: false,
-            },
+            Err(_) => {
+                return ProcessResult {
+                    exit_code: -1,
+                    duration_ms: 0,
+                    stdout_preview: None,
+                    stderr_preview: None,
+                    timed_out: false,
+                    terminated: false,
+                }
+            }
         };
 
         // Poll until terminal.
@@ -173,9 +185,12 @@ impl ProcessExecutor for ProcessManagerAdapter {
                 ProcessState::Starting | ProcessState::Running => {
                     if start.elapsed() > timeout + Duration::from_secs(5) {
                         return ProcessResult {
-                            exit_code: -1, duration_ms: timeout.as_millis() as u64,
-                            stdout_preview: None, stderr_preview: None,
-                            timed_out: true, terminated: false,
+                            exit_code: -1,
+                            duration_ms: timeout.as_millis() as u64,
+                            stdout_preview: None,
+                            stderr_preview: None,
+                            timed_out: true,
+                            terminated: false,
                         };
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -223,17 +238,24 @@ impl ProcessExecutor for FakeProcessExecutor {
 
         if self.fail_spawn.load(Ordering::SeqCst) {
             return ProcessResult {
-                exit_code: -1, duration_ms: 0, stdout_preview: None,
-                stderr_preview: None, timed_out: false, terminated: false,
+                exit_code: -1,
+                duration_ms: 0,
+                stdout_preview: None,
+                stderr_preview: None,
+                timed_out: false,
+                terminated: false,
             };
         }
 
         if self.hang_forever.load(Ordering::SeqCst) {
             tokio::time::sleep(timeout + Duration::from_millis(100)).await;
             return ProcessResult {
-                exit_code: -1, duration_ms: timeout.as_millis() as u64,
-                stdout_preview: None, stderr_preview: None,
-                timed_out: true, terminated: false,
+                exit_code: -1,
+                duration_ms: timeout.as_millis() as u64,
+                stdout_preview: None,
+                stderr_preview: None,
+                timed_out: true,
+                terminated: false,
             };
         }
 
@@ -241,7 +263,9 @@ impl ProcessExecutor for FakeProcessExecutor {
         let stdout = self.stdout_text.lock().unwrap().clone();
         let stderr = self.stderr_text.lock().unwrap().clone();
         ProcessResult {
-            exit_code: ec, duration_ms: 10, terminated: true,
+            exit_code: ec,
+            duration_ms: 10,
+            terminated: true,
             stdout_preview: if stdout.is_empty() {
                 None
             } else {
