@@ -499,8 +499,13 @@ mod tests {
             blockers: vec![],
             findings_count: 1,
         };
-        let result = repo.set_outcome("run-sec", &outcome, &VerificationRunLifecycle::Failed).await;
-        assert!(result.is_err(), "secret in outcome summary must be rejected");
+        let result = repo
+            .set_outcome("run-sec", &outcome, &VerificationRunLifecycle::Failed)
+            .await;
+        assert!(
+            result.is_err(),
+            "secret in outcome summary must be rejected"
+        );
 
         // Previous safe state preserved (still Created, no outcome).
         let loaded = repo.load_run_by_id("run-sec").await.unwrap().unwrap();
@@ -522,7 +527,10 @@ mod tests {
             blockers: vec!["Secret ghp_token_abc found in src/main.rs".into()],
             findings_count: 1,
         };
-        assert!(repo.set_outcome("run-blk", &outcome, &VerificationRunLifecycle::Failed).await.is_err());
+        assert!(repo
+            .set_outcome("run-blk", &outcome, &VerificationRunLifecycle::Failed)
+            .await
+            .is_err());
 
         // Previous state preserved.
         let loaded = repo.load_run_by_id("run-blk").await.unwrap().unwrap();
@@ -543,7 +551,9 @@ mod tests {
             blockers: vec![],
             findings_count: 0,
         };
-        repo.set_outcome("run-safe", &outcome, &VerificationRunLifecycle::Completed).await.unwrap();
+        repo.set_outcome("run-safe", &outcome, &VerificationRunLifecycle::Completed)
+            .await
+            .unwrap();
 
         let loaded = repo.load_run_by_id("run-safe").await.unwrap().unwrap();
         assert_eq!(loaded.lifecycle, VerificationRunLifecycle::Completed);

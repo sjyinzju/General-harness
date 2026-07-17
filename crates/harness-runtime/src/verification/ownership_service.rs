@@ -40,7 +40,10 @@ pub struct TakeoverRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OwnershipTakeoverResult {
     /// Takeover succeeded, VerificationRun is now Running.
-    Acquired { run_id: String, execution_id: String },
+    Acquired {
+        run_id: String,
+        execution_id: String,
+    },
     /// Same verification owner already owns this run (idempotent).
     AlreadyOwned { run_id: String },
     /// Another verification run already owns this handoff.
@@ -66,7 +69,10 @@ pub enum OwnershipTakeoverResult {
     /// Handoff is in a terminal state.
     TerminalHandoff { status: String },
     /// Idempotency conflict (same key, different hash).
-    IdempotencyConflict { existing_hash: String, new_hash: String },
+    IdempotencyConflict {
+        existing_hash: String,
+        new_hash: String,
+    },
     /// Verification run was not found.
     RunNotFound { run_id: String },
     /// Verification run is in a terminal state and cannot be taken over.
@@ -111,10 +117,7 @@ impl VerificationOwnershipService {
     ///
     /// Idempotent: same request_hash on same run returns AlreadyOwned.
     /// Never starts an Agent, creates a retry, or deletes a Worktree.
-    pub async fn start_or_resume_takeover(
-        &self,
-        req: &TakeoverRequest,
-    ) -> OwnershipTakeoverResult {
+    pub async fn start_or_resume_takeover(&self, req: &TakeoverRequest) -> OwnershipTakeoverResult {
         // ── 1. Load verification run ────────────────────────────────
         let run_row: Option<(String, String, i64)> = match sqlx::query_as(
             "SELECT lifecycle, request_hash, version FROM verification_runs WHERE run_id = ?",
@@ -124,20 +127,32 @@ impl VerificationOwnershipService {
         .await
         {
             Ok(r) => r,
-            Err(_) => return OwnershipTakeoverResult::RunNotFound { run_id: req.verification_run_id.clone() },
+            Err(_) => {
+                return OwnershipTakeoverResult::RunNotFound {
+                    run_id: req.verification_run_id.clone(),
+                }
+            }
         };
 
         let (run_lc, existing_hash, run_version) = match run_row {
             Some(r) => r,
-            None => return OwnershipTakeoverResult::RunNotFound { run_id: req.verification_run_id.clone() },
+            None => {
+                return OwnershipTakeoverResult::RunNotFound {
+                    run_id: req.verification_run_id.clone(),
+                }
+            }
         };
 
         // Already Running — idempotent or contested.
         if run_lc == "running" {
             if existing_hash == req.request_hash {
-                return OwnershipTakeoverResult::AlreadyOwned { run_id: req.verification_run_id.clone() };
+                return OwnershipTakeoverResult::AlreadyOwned {
+                    run_id: req.verification_run_id.clone(),
+                };
             }
-            return OwnershipTakeoverResult::Contested { current_owner: "another-verification-run".into() };
+            return OwnershipTakeoverResult::Contested {
+                current_owner: "another-verification-run".into(),
+            };
         }
 
         // Terminal — cannot take over.
@@ -154,16 +169,21 @@ impl VerificationOwnershipService {
         }
 
         // ── 2. Load handoff ─────────────────────────────────────────
-        let handoff: HandoffRecord = match self.handoff_repo.get_by_execution(&req.execution_id).await {
-            Ok(Some(h)) => h,
-            Ok(None) => return OwnershipTakeoverResult::ReconciliationRequired {
-                handoff_id: req.handoff_id.clone(),
-                status: "missing".into(),
-            },
-            Err(_) => return OwnershipTakeoverResult::ValidationFailed {
-                reason: "failed to load handoff".into(),
-            },
-        };
+        let handoff: HandoffRecord =
+            match self.handoff_repo.get_by_execution(&req.execution_id).await {
+                Ok(Some(h)) => h,
+                Ok(None) => {
+                    return OwnershipTakeoverResult::ReconciliationRequired {
+                        handoff_id: req.handoff_id.clone(),
+                        status: "missing".into(),
+                    }
+                }
+                Err(_) => {
+                    return OwnershipTakeoverResult::ValidationFailed {
+                        reason: "failed to load handoff".into(),
+                    }
+                }
+            };
 
         // Handoff identity must match.
         if handoff.handoff_id != req.handoff_id
@@ -181,7 +201,9 @@ impl VerificationOwnershipService {
         // Terminal handoff.
         match handoff.status.as_str() {
             "released" | "lost" => {
-                return OwnershipTakeoverResult::TerminalHandoff { status: handoff.status.clone() };
+                return OwnershipTakeoverResult::TerminalHandoff {
+                    status: handoff.status.clone(),
+                };
             }
             "reconciliation_required" => {
                 return OwnershipTakeoverResult::ReconciliationRequired {
@@ -195,31 +217,36 @@ impl VerificationOwnershipService {
         // ── 3. Validate worktree ────────────────────────────────────
         let wt_id = handoff.worktree_id.as_deref().unwrap_or("");
         if wt_id.is_empty() || wt_id != req.expected_worktree_id {
-            return OwnershipTakeoverResult::WorktreeMissing { worktree_id: wt_id.into() };
+            return OwnershipTakeoverResult::WorktreeMissing {
+                worktree_id: wt_id.into(),
+            };
         }
 
-        let wt_exists: (i64,) = match sqlx::query_as(
-            "SELECT COUNT(*) FROM worktrees WHERE id = ?",
-        )
-        .bind(wt_id)
-        .fetch_one(&self.pool)
-        .await
+        let wt_exists: (i64,) = match sqlx::query_as("SELECT COUNT(*) FROM worktrees WHERE id = ?")
+            .bind(wt_id)
+            .fetch_one(&self.pool)
+            .await
         {
             Ok(r) => r,
-            Err(_) => return OwnershipTakeoverResult::WorktreeMissing { worktree_id: wt_id.into() },
+            Err(_) => {
+                return OwnershipTakeoverResult::WorktreeMissing {
+                    worktree_id: wt_id.into(),
+                }
+            }
         };
         if wt_exists.0 == 0 {
-            return OwnershipTakeoverResult::WorktreeMissing { worktree_id: wt_id.into() };
+            return OwnershipTakeoverResult::WorktreeMissing {
+                worktree_id: wt_id.into(),
+            };
         }
 
         // Check filesystem worktree path.
-        let wt_path: Option<(Option<String>,)> = sqlx::query_as(
-            "SELECT worktree_path FROM worktrees WHERE id = ?",
-        )
-        .bind(wt_id)
-        .fetch_optional(&self.pool)
-        .await
-        .unwrap_or(None);
+        let wt_path: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT worktree_path FROM worktrees WHERE id = ?")
+                .bind(wt_id)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or(None);
         if let Some((Some(ref path),)) = wt_path {
             if !std::path::Path::new(path).exists() {
                 return OwnershipTakeoverResult::WorktreePathMissing { path: path.clone() };
@@ -229,7 +256,9 @@ impl VerificationOwnershipService {
         // ── 4. Validate lease ───────────────────────────────────────
         let lease_id = handoff.lease_id.as_deref().unwrap_or("");
         if lease_id.is_empty() || lease_id != req.expected_lease_id {
-            return OwnershipTakeoverResult::LeaseInactive { lease_id: lease_id.into() };
+            return OwnershipTakeoverResult::LeaseInactive {
+                lease_id: lease_id.into(),
+            };
         }
 
         let lease_active: (i64,) = match sqlx::query_as(
@@ -240,10 +269,16 @@ impl VerificationOwnershipService {
         .await
         {
             Ok(r) => r,
-            Err(_) => return OwnershipTakeoverResult::LeaseInactive { lease_id: lease_id.into() },
+            Err(_) => {
+                return OwnershipTakeoverResult::LeaseInactive {
+                    lease_id: lease_id.into(),
+                }
+            }
         };
         if lease_active.0 == 0 {
-            return OwnershipTakeoverResult::LeaseInactive { lease_id: lease_id.into() };
+            return OwnershipTakeoverResult::LeaseInactive {
+                lease_id: lease_id.into(),
+            };
         }
 
         // ── 5. Validate fencing ─────────────────────────────────────
@@ -258,11 +293,15 @@ impl VerificationOwnershipService {
         let hb = self.heartbeat_registry.inspect(&req.execution_id).await;
         match hb {
             None => {
-                return OwnershipTakeoverResult::HeartbeatMissing { execution_id: req.execution_id.clone() };
+                return OwnershipTakeoverResult::HeartbeatMissing {
+                    execution_id: req.execution_id.clone(),
+                };
             }
             Some(ref hb_info) => {
                 if !hb_info.status.contains("healthy") && !hb_info.status.contains("degraded") {
-                    return OwnershipTakeoverResult::HeartbeatMissing { execution_id: req.execution_id.clone() };
+                    return OwnershipTakeoverResult::HeartbeatMissing {
+                        execution_id: req.execution_id.clone(),
+                    };
                 }
                 if hb_info.fencing_token != req.expected_fencing {
                     return OwnershipTakeoverResult::StaleFencing {
@@ -276,7 +315,11 @@ impl VerificationOwnershipService {
         // ── 7. Coordinated takeover ─────────────────────────────────
         let takeover = self
             .coordinator
-            .takeover_for_verification(&req.execution_id, &req.verification_owner_id, req.expected_fencing)
+            .takeover_for_verification(
+                &req.execution_id,
+                &req.verification_owner_id,
+                req.expected_fencing,
+            )
             .await;
 
         match takeover {
@@ -290,7 +333,9 @@ impl VerificationOwnershipService {
                     .bind(&req.verification_run_id).bind(run_version)
                     .execute(&self.pool).await;
                 }
-                return OwnershipTakeoverResult::AlreadyOwned { run_id: req.verification_run_id.clone() };
+                return OwnershipTakeoverResult::AlreadyOwned {
+                    run_id: req.verification_run_id.clone(),
+                };
             }
             CoordinatedTakeoverResult::Contested { current_owner } => {
                 return OwnershipTakeoverResult::Contested { current_owner };
@@ -326,17 +371,18 @@ impl VerificationOwnershipService {
             Ok(_) => {
                 // Run was already transitioned or version mismatch.
                 // Coordinator already succeeded — verify run state.
-                let current: Option<(String,)> = sqlx::query_as(
-                    "SELECT lifecycle FROM verification_runs WHERE run_id = ?",
-                )
-                .bind(&req.verification_run_id)
-                .fetch_optional(&self.pool)
-                .await
-                .unwrap_or(None);
+                let current: Option<(String,)> =
+                    sqlx::query_as("SELECT lifecycle FROM verification_runs WHERE run_id = ?")
+                        .bind(&req.verification_run_id)
+                        .fetch_optional(&self.pool)
+                        .await
+                        .unwrap_or(None);
 
                 if let Some((lc,)) = current {
                     if lc == "running" {
-                        return OwnershipTakeoverResult::AlreadyOwned { run_id: req.verification_run_id.clone() };
+                        return OwnershipTakeoverResult::AlreadyOwned {
+                            run_id: req.verification_run_id.clone(),
+                        };
                     }
                 }
                 return OwnershipTakeoverResult::ValidationFailed {
@@ -415,8 +461,12 @@ mod tests {
         let wt_path_str = wt_path.to_string_lossy().to_string();
 
         // Seed prerequisite rows.
-        sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')")
-            .execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES ('t1','p1','test','submitted')")
             .execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'completed')")
@@ -434,35 +484,70 @@ mod tests {
 
         // Create handoff via repository.
         let handoff_repo = HandoffRepository::new(pool.clone());
-        handoff_repo.create("ho-1", "p1", "t1", CreateHandoffParams {
-            execution_id: "e1", worktree_id: Some("wt1"), lease_id: Some("l1"),
-            claim_group_id: Some("cg1"), fencing_token: 5, owner_id: "scheduler-main",
-        }).await.unwrap();
+        handoff_repo
+            .create(
+                "ho-1",
+                "p1",
+                "t1",
+                CreateHandoffParams {
+                    execution_id: "e1",
+                    worktree_id: Some("wt1"),
+                    lease_id: Some("l1"),
+                    claim_group_id: Some("cg1"),
+                    fencing_token: 5,
+                    owner_id: "scheduler-main",
+                },
+            )
+            .await
+            .unwrap();
 
         // Heartbeat registry.
         let registry = Arc::new(HeartbeatRegistry::new());
-        registry.register(HeartbeatEntry {
-            execution_id: "e1".into(), task_id: "t1".into(), worktree_id: "wt1".into(),
-            lease_id: "l1".into(), claim_group_id: Some("cg1".into()),
-            fencing_token: 5, owner_kind: OwnerKind::Scheduler, owner_id: "scheduler-main".into(),
-            status: HeartbeatStatus::Healthy,
-            last_heartbeat_at: Some(chrono::Utc::now()),
-            cancel_token: CancellationToken::new(), last_error: None,
-        }).await.unwrap();
+        registry
+            .register(HeartbeatEntry {
+                execution_id: "e1".into(),
+                task_id: "t1".into(),
+                worktree_id: "wt1".into(),
+                lease_id: "l1".into(),
+                claim_group_id: Some("cg1".into()),
+                fencing_token: 5,
+                owner_kind: OwnerKind::Scheduler,
+                owner_id: "scheduler-main".into(),
+                status: HeartbeatStatus::Healthy,
+                last_heartbeat_at: Some(chrono::Utc::now()),
+                cancel_token: CancellationToken::new(),
+                last_error: None,
+            })
+            .await
+            .unwrap();
 
         let coordinator = ResourceHandoffCoordinator::new(handoff_repo.clone(), registry.clone());
-        let svc = VerificationOwnershipService::new(pool, coordinator, handoff_repo, registry.clone());
-        TestContext { svc, db, registry, db_path, _td: td }
+        let svc =
+            VerificationOwnershipService::new(pool, coordinator, handoff_repo, registry.clone());
+        TestContext {
+            svc,
+            db,
+            registry,
+            db_path,
+            _td: td,
+        }
     }
 
     fn make_req(run_id: &str, ikey: &str, hash: &str) -> TakeoverRequest {
         TakeoverRequest {
-            verification_run_id: run_id.into(), execution_id: "e1".into(),
-            task_id: "t1".into(), project_id: "p1".into(), plan_hash: "hash-aaa".into(),
-            handoff_id: "ho-1".into(), expected_worktree_id: "wt1".into(),
-            expected_lease_id: "l1".into(), expected_claim_group_id: Some("cg1".into()),
-            expected_fencing: 5, verification_owner_id: "verify-run-1".into(),
-            idempotency_key: ikey.into(), request_hash: hash.into(),
+            verification_run_id: run_id.into(),
+            execution_id: "e1".into(),
+            task_id: "t1".into(),
+            project_id: "p1".into(),
+            plan_hash: "hash-aaa".into(),
+            handoff_id: "ho-1".into(),
+            expected_worktree_id: "wt1".into(),
+            expected_lease_id: "l1".into(),
+            expected_claim_group_id: Some("cg1".into()),
+            expected_fencing: 5,
+            verification_owner_id: "verify-run-1".into(),
+            idempotency_key: ikey.into(),
+            request_hash: hash.into(),
         }
     }
 
@@ -482,8 +567,11 @@ mod tests {
         assert!(matches!(result, OwnershipTakeoverResult::Acquired { .. }));
 
         // Run must now be Running.
-        let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM verification_runs WHERE run_id='run-1'")
-            .fetch_one(&ctx.db.pool).await.unwrap();
+        let lc: (String,) =
+            sqlx::query_as("SELECT lifecycle FROM verification_runs WHERE run_id='run-1'")
+                .fetch_one(&ctx.db.pool)
+                .await
+                .unwrap();
         assert_eq!(lc.0, "running");
     }
 
@@ -498,7 +586,12 @@ mod tests {
         assert!(matches!(r1, OwnershipTakeoverResult::Acquired { .. }));
 
         let r2 = ctx.svc.start_or_resume_takeover(&req).await;
-        assert_eq!(r2, OwnershipTakeoverResult::AlreadyOwned { run_id: "run-2".into() });
+        assert_eq!(
+            r2,
+            OwnershipTakeoverResult::AlreadyOwned {
+                run_id: "run-2".into()
+            }
+        );
     }
 
     // ── Response-lost recovery ──────────────────────────────────────
@@ -512,7 +605,12 @@ mod tests {
         ctx.svc.start_or_resume_takeover(&req).await;
         // Simulate response lost — same request again.
         let result = ctx.svc.start_or_resume_takeover(&req).await;
-        assert_eq!(result, OwnershipTakeoverResult::AlreadyOwned { run_id: "run-rl".into() });
+        assert_eq!(
+            result,
+            OwnershipTakeoverResult::AlreadyOwned {
+                run_id: "run-rl".into()
+            }
+        );
     }
 
     // ── Stale fencing rejected ──────────────────────────────────────
@@ -524,10 +622,17 @@ mod tests {
         req.expected_fencing = 99; // wrong fencing
 
         let result = ctx.svc.start_or_resume_takeover(&req).await;
-        assert!(matches!(result, OwnershipTakeoverResult::StaleFencing { .. }));
+        assert!(matches!(
+            result,
+            OwnershipTakeoverResult::StaleFencing { .. }
+        ));
 
         // Run must still be Created.
-        let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM verification_runs WHERE run_id='run-sf'").fetch_one(&ctx.db.pool).await.unwrap();
+        let lc: (String,) =
+            sqlx::query_as("SELECT lifecycle FROM verification_runs WHERE run_id='run-sf'")
+                .fetch_one(&ctx.db.pool)
+                .await
+                .unwrap();
         assert_eq!(lc.0, "created");
     }
 
@@ -540,7 +645,10 @@ mod tests {
         let req = make_req("run-term", "ikey-term", "hash-term");
 
         let result = ctx.svc.start_or_resume_takeover(&req).await;
-        assert!(matches!(result, OwnershipTakeoverResult::RunTerminal { .. }));
+        assert!(matches!(
+            result,
+            OwnershipTakeoverResult::RunTerminal { .. }
+        ));
     }
 
     // ── Worktree missing ────────────────────────────────────────────
@@ -552,7 +660,10 @@ mod tests {
         req.expected_worktree_id = "wt-nonexistent".into();
 
         let result = ctx.svc.start_or_resume_takeover(&req).await;
-        assert!(matches!(result, OwnershipTakeoverResult::WorktreeMissing { .. }));
+        assert!(matches!(
+            result,
+            OwnershipTakeoverResult::WorktreeMissing { .. }
+        ));
     }
 
     // ── Lease inactive ──────────────────────────────────────────────
@@ -564,7 +675,10 @@ mod tests {
         req.expected_lease_id = "l-nonexistent".into();
 
         let result = ctx.svc.start_or_resume_takeover(&req).await;
-        assert!(matches!(result, OwnershipTakeoverResult::LeaseInactive { .. }));
+        assert!(matches!(
+            result,
+            OwnershipTakeoverResult::LeaseInactive { .. }
+        ));
     }
 
     // ── Heartbeat missing ───────────────────────────────────────────
@@ -577,7 +691,10 @@ mod tests {
         let req = make_req("run-hm", "ikey-hm", "hash-hm");
 
         let result = ctx.svc.start_or_resume_takeover(&req).await;
-        assert!(matches!(result, OwnershipTakeoverResult::HeartbeatMissing { .. }));
+        assert!(matches!(
+            result,
+            OwnershipTakeoverResult::HeartbeatMissing { .. }
+        ));
     }
 
     // ── Terminal handoff rejected ───────────────────────────────────
@@ -591,7 +708,10 @@ mod tests {
         let req = make_req("run-th", "ikey-th", "hash-th");
 
         let result = ctx.svc.start_or_resume_takeover(&req).await;
-        assert!(matches!(result, OwnershipTakeoverResult::TerminalHandoff { .. }));
+        assert!(matches!(
+            result,
+            OwnershipTakeoverResult::TerminalHandoff { .. }
+        ));
     }
 
     // ── DB/registry mismatch ────────────────────────────────────────
@@ -604,7 +724,10 @@ mod tests {
         let req = make_req("run-mm", "ikey-mm", "hash-mm");
 
         let result = ctx.svc.start_or_resume_takeover(&req).await;
-        assert!(matches!(result, OwnershipTakeoverResult::HandoffStateMismatch { .. }));
+        assert!(matches!(
+            result,
+            OwnershipTakeoverResult::HandoffStateMismatch { .. }
+        ));
     }
 
     // ── No command started before takeover ──────────────────────────
@@ -626,7 +749,10 @@ mod tests {
         assert_eq!(exec_count.0, 0, "no new execution created");
 
         // Verify no retry task.
-        let task_lc: (String,) = sqlx::query_as("SELECT lifecycle FROM tasks WHERE id='t1'").fetch_one(&ctx.db.pool).await.unwrap();
+        let task_lc: (String,) = sqlx::query_as("SELECT lifecycle FROM tasks WHERE id='t1'")
+            .fetch_one(&ctx.db.pool)
+            .await
+            .unwrap();
         assert_eq!(task_lc.0, "submitted", "task lifecycle unchanged");
     }
 
@@ -643,15 +769,26 @@ mod tests {
 
         // Create pool2 connected to the same file.
         let db_path_str = ctx.db_path.to_string_lossy().to_string();
-        let opts2 = SqliteConnectOptions::from_str(&db_path_str).unwrap()
-            .create_if_missing(false).foreign_keys(true)
+        let opts2 = SqliteConnectOptions::from_str(&db_path_str)
+            .unwrap()
+            .create_if_missing(false)
+            .foreign_keys(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(30));
-        let pool2 = SqlitePoolOptions::new().max_connections(5).connect_with(opts2).await.unwrap();
+        let pool2 = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(opts2)
+            .await
+            .unwrap();
 
         let hr2 = HandoffRepository::new(pool2.clone());
         let coord2 = ResourceHandoffCoordinator::new(hr2, ctx.registry.clone());
-        let svc2 = VerificationOwnershipService::new(pool2.clone(), coord2, HandoffRepository::new(pool2), ctx.registry);
+        let svc2 = VerificationOwnershipService::new(
+            pool2.clone(),
+            coord2,
+            HandoffRepository::new(pool2),
+            ctx.registry,
+        );
 
         let req = make_req("run-conc", "ikey-conc", "hash-conc");
 
@@ -694,8 +831,11 @@ mod tests {
 
         ctx.svc.start_or_resume_takeover(&req).await;
 
-        let exec_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM execution_attempts WHERE task_id='t1'")
-            .fetch_one(&ctx.db.pool).await.unwrap();
+        let exec_count: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM execution_attempts WHERE task_id='t1'")
+                .fetch_one(&ctx.db.pool)
+                .await
+                .unwrap();
         assert_eq!(exec_count.0, 1, "no retry execution created");
     }
 
@@ -709,9 +849,15 @@ mod tests {
         ctx.svc.start_or_resume_takeover(&req).await;
 
         // Profile must not have changed — verify no provider switch.
-        let prof: (Option<String>,) = sqlx::query_as("SELECT profile_id FROM execution_attempts WHERE id='e1'")
-            .fetch_one(&ctx.db.pool).await.unwrap();
-        assert!(prof.0.is_none() || prof.0.as_deref() == Some(""), "profile must not be set or changed");
+        let prof: (Option<String>,) =
+            sqlx::query_as("SELECT profile_id FROM execution_attempts WHERE id='e1'")
+                .fetch_one(&ctx.db.pool)
+                .await
+                .unwrap();
+        assert!(
+            prof.0.is_none() || prof.0.as_deref() == Some(""),
+            "profile must not be set or changed"
+        );
     }
 
     // ── No worktree deletion ────────────────────────────────────────
@@ -724,7 +870,9 @@ mod tests {
         ctx.svc.start_or_resume_takeover(&req).await;
 
         let wt: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM worktrees WHERE id='wt1'")
-            .fetch_one(&ctx.db.pool).await.unwrap();
+            .fetch_one(&ctx.db.pool)
+            .await
+            .unwrap();
         assert_eq!(wt.0, 1, "worktree must not be deleted");
     }
 }

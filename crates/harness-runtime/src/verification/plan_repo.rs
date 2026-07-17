@@ -286,7 +286,10 @@ mod tests {
         plan.steps[0].config_json = r#"{"api_key":"sk-secret-in-config"}"#.to_string();
 
         let result = repo.create_plan(&plan).await;
-        assert!(result.is_err(), "secret in step config must be rejected by repo");
+        assert!(
+            result.is_err(),
+            "secret in step config must be rejected by repo"
+        );
 
         // Zero rows persisted.
         assert!(!repo.plan_exists("e2").await.unwrap());

@@ -390,7 +390,9 @@ mod tests {
         let db = setup().await;
         let repo = VerificationEvidenceRepo::new(db.pool.clone());
         let evidence = VerificationEvidence {
-            evidence_id: "ev-bad".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            evidence_id: "ev-bad".into(),
+            run_id: "run-1".into(),
+            step_id: "step-1".into(),
             evidence_kind: VerificationEvidenceKind::FileDiffSummary,
             summary: "safe summary".into(),
             detail_json: Some(r#"{"key": "sk-live-secret-12345"}"#.into()),
@@ -400,7 +402,10 @@ mod tests {
         let result = repo.insert_evidence(&evidence).await;
         assert!(result.is_err(), "secret in detail must be rejected by repo");
         let items = repo.get_evidence("run-1").await.unwrap();
-        assert!(!items.iter().any(|e| e.evidence_id == "ev-bad"), "rejected evidence must leave zero rows");
+        assert!(
+            !items.iter().any(|e| e.evidence_id == "ev-bad"),
+            "rejected evidence must leave zero rows"
+        );
     }
 
     #[tokio::test]
@@ -408,10 +413,13 @@ mod tests {
         let db = setup().await;
         let repo = VerificationEvidenceRepo::new(db.pool.clone());
         let evidence = VerificationEvidence {
-            evidence_id: "ev-sum".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            evidence_id: "ev-sum".into(),
+            run_id: "run-1".into(),
+            step_id: "step-1".into(),
             evidence_kind: VerificationEvidenceKind::FileDiffSummary,
             summary: "Bearer eyJhbGciOiJIUzI1NiJ9.token found".into(),
-            detail_json: None, artifact_ref: None,
+            detail_json: None,
+            artifact_ref: None,
             collected_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         };
         assert!(repo.insert_evidence(&evidence).await.is_err());
@@ -422,7 +430,8 @@ mod tests {
         let db = setup().await;
         let repo = VerificationEvidenceRepo::new(db.pool.clone());
         let diag = VerificationDiagnostic {
-            diagnostic_id: "d-bad".into(), run_id: "run-1".into(),
+            diagnostic_id: "d-bad".into(),
+            run_id: "run-1".into(),
             level: VerificationDiagnosticLevel::Error,
             message: "-----BEGIN RSA PRIVATE KEY----- found".into(),
             context_json: None,
@@ -438,10 +447,16 @@ mod tests {
         let db = setup().await;
         let repo = VerificationEvidenceRepo::new(db.pool.clone());
         let result = VerificationStepResult {
-            result_id: "sr-bad".into(), run_id: "run-1".into(), step_id: "step-1".into(),
-            plan_id: "plan-1".into(), status: VerificationStepStatus::Failed,
+            result_id: "sr-bad".into(),
+            run_id: "run-1".into(),
+            step_id: "step-1".into(),
+            plan_id: "plan-1".into(),
+            status: VerificationStepStatus::Failed,
             detail_json: Some(r#"{"password": "super-secret"}"#.into()),
-            started_at: None, completed_at: None, duration_ms: None, error_message: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            error_message: None,
         };
         assert!(repo.insert_step_result(&result).await.is_err());
         let results = repo.get_step_results("run-1").await.unwrap();
@@ -453,9 +468,12 @@ mod tests {
         let db = setup().await;
         let repo = VerificationEvidenceRepo::new(db.pool.clone());
         let evidence = VerificationEvidence {
-            evidence_id: "ev-big".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            evidence_id: "ev-big".into(),
+            run_id: "run-1".into(),
+            step_id: "step-1".into(),
             evidence_kind: VerificationEvidenceKind::FileDiffSummary,
-            summary: "safe".into(), detail_json: Some("x".repeat(300_000)),
+            summary: "safe".into(),
+            detail_json: Some("x".repeat(300_000)),
             artifact_ref: None,
             collected_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         };
@@ -467,7 +485,9 @@ mod tests {
         let db = setup().await;
         let repo = VerificationEvidenceRepo::new(db.pool.clone());
         let evidence = VerificationEvidence {
-            evidence_id: "ev-art".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            evidence_id: "ev-art".into(),
+            run_id: "run-1".into(),
+            step_id: "step-1".into(),
             evidence_kind: VerificationEvidenceKind::ArtifactRef,
             summary: "artifact captured".into(),
             detail_json: Some(r#"{"artifact_id":"art-abc"}"#.into()),
@@ -475,7 +495,12 @@ mod tests {
             collected_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
         };
         repo.insert_evidence(&evidence).await.unwrap();
-        assert!(repo.get_evidence("run-1").await.unwrap().iter().any(|e| e.evidence_id == "ev-art"));
+        assert!(repo
+            .get_evidence("run-1")
+            .await
+            .unwrap()
+            .iter()
+            .any(|e| e.evidence_id == "ev-art"));
     }
 
     #[tokio::test]
@@ -483,7 +508,9 @@ mod tests {
         let db = setup().await;
         let repo = VerificationEvidenceRepo::new(db.pool.clone());
         let evidence = VerificationEvidence {
-            evidence_id: "ev-err".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            evidence_id: "ev-err".into(),
+            run_id: "run-1".into(),
+            step_id: "step-1".into(),
             evidence_kind: VerificationEvidenceKind::FileDiffSummary,
             summary: "safe".into(),
             detail_json: Some(r#"{"token":"sk-abc-secret"}"#.into()),
@@ -492,6 +519,9 @@ mod tests {
         };
         let err = repo.insert_evidence(&evidence).await.unwrap_err();
         let err_str = format!("{:?}", err);
-        assert!(!err_str.contains("sk-abc-secret"), "error must not leak raw secret");
+        assert!(
+            !err_str.contains("sk-abc-secret"),
+            "error must not leak raw secret"
+        );
     }
 }
