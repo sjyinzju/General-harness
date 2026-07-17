@@ -4,6 +4,7 @@
 //! Batch 2: Dispatch saga (worktree → lease → claim → adapter → events).
 //! Batch 3: Scheduler reconciler (anomaly detection and repair).
 
+pub mod composition;
 pub mod concurrency;
 pub mod dispatch;
 pub mod dispatch_repo;
@@ -15,6 +16,7 @@ pub mod profile_selector;
 pub mod readiness;
 pub mod reconciler;
 
+pub use composition::SchedulerServices;
 pub use concurrency::ConcurrencyManager;
 pub use dispatch::{DispatchRequest, SchedulerOrchestrator};
 pub use dispatch_repo::DispatchRepository;

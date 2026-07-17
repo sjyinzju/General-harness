@@ -22,21 +22,32 @@ use super::heartbeat_registry::HeartbeatRegistry;
 
 pub struct SchedulerReconciler {
     pool: SqlitePool,
-    heartbeat_registry: Option<Arc<HeartbeatRegistry>>,
+    pub(crate) heartbeat_registry: Arc<HeartbeatRegistry>,
 }
 
 impl SchedulerReconciler {
-    pub fn new(pool: SqlitePool) -> Self {
+    /// Production constructor. Requires a shared HeartbeatRegistry for
+    /// HandoffRegistryMismatch detection. Use [`new_for_tests`] in test code
+    /// where a registry is not needed.
+    pub fn new(pool: SqlitePool, heartbeat_registry: Arc<HeartbeatRegistry>) -> Self {
         Self {
             pool,
-            heartbeat_registry: None,
+            heartbeat_registry,
         }
     }
 
-    /// Attach a heartbeat registry for HandoffRegistryMismatch detection.
-    pub fn with_heartbeat_registry(mut self, registry: Arc<HeartbeatRegistry>) -> Self {
-        self.heartbeat_registry = Some(registry);
-        self
+    /// Test-only constructor without a HeartbeatRegistry.
+    /// HandoffRegistryMismatch detection is silently disabled when using this
+    /// constructor — do NOT use in production paths.
+    #[doc(hidden)]
+    pub fn new_for_tests(pool: SqlitePool) -> Self {
+        // Create a dummy registry that never contains entries. This ensures
+        // detect_handoff_registry_mismatch always returns Ok(false) rather
+        // than panicking on a missing registry.
+        Self {
+            pool,
+            heartbeat_registry: Arc::new(HeartbeatRegistry::new()),
+        }
     }
 
     pub async fn reconcile(&self) -> Result<Vec<SchedulerAnomaly>, CoreError> {
@@ -472,10 +483,9 @@ impl SchedulerReconciler {
     /// Safety: never starts Verification, never re-acquires Lease/Claim.
     /// Can safely stop heartbeat for lost ownership.
     async fn detect_handoff_registry_mismatch(&self) -> Result<bool, CoreError> {
-        let registry = match &self.heartbeat_registry {
-            Some(r) => r,
-            None => return Ok(false),
-        };
+        // Always uses the shared registry. When constructed via new_for_tests(),
+        // the dummy registry is empty and detection correctly finds nothing.
+        let registry = &self.heartbeat_registry;
 
         let mut found = false;
 
@@ -677,7 +687,7 @@ mod tests {
         seed_project_task(&db, "t1", "pending").await;
         sqlx::query("INSERT INTO scheduler_reservations (id, task_id, status, expires_at) VALUES ('r1','t1','active','2000-01-01')")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
         assert!(anomalies.contains(&SchedulerAnomaly::OrphanReservation));
     }
@@ -690,7 +700,7 @@ mod tests {
             .execute(&db.pool).await.unwrap();
         sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e2','t1',2,'running')")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
         assert!(anomalies.contains(&SchedulerAnomaly::DuplicateActiveExecutions));
     }
@@ -701,7 +711,7 @@ mod tests {
         seed_project_task(&db, "t1", "pending").await;
         sqlx::query("INSERT INTO scheduler_reservations (id, task_id, status, expires_at) VALUES ('r1','t1','active','2000-01-01')")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         rec.reconcile().await.unwrap();
         let result = rec.reconcile().await;
         assert!(result.is_ok());
@@ -716,7 +726,7 @@ mod tests {
         insert_worktree(&db).await;
         sqlx::query("INSERT INTO workspace_leases (id, worktree_id, project_id, task_id, owner_execution_id, lease_token, fencing_token, lifecycle, expires_at) VALUES ('l1','wt1','p1','t1','e1','tok',1,'active',datetime('now','+10 minutes'))")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
         assert!(anomalies.contains(&SchedulerAnomaly::LeaseWithoutClaim));
     }
@@ -729,7 +739,7 @@ mod tests {
             .execute(&db.pool).await.unwrap();
         insert_worktree(&db).await;
         insert_active_lease(&db).await;
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
         assert!(anomalies.contains(&SchedulerAnomaly::FailedExecutionWithActiveLeaseOrClaim));
         let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM workspace_leases WHERE id='l1'")
@@ -743,7 +753,7 @@ mod tests {
     async fn test_awaiting_verification_resources_missing_detected() {
         let db = setup().await;
         seed_project_task(&db, "t1", "submitted").await;
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
         assert!(anomalies.contains(&SchedulerAnomaly::AwaitingVerificationResourcesMissing));
     }
@@ -761,7 +771,7 @@ mod tests {
         // but use old started_at so running_without_process still detects the stale session.
         sqlx::query("INSERT INTO dispatch_operations (id, project_id, task_id, selected_profile_id, request_hash, idempotency_key, status, stage, agent_session_id, execution_id, started_at) VALUES ('d1','p1','t1','prof1','hash','ikey-d1','preparing','dispatched','sess1','e1',datetime('now','-16 minutes'))")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
         assert!(anomalies.contains(&SchedulerAnomaly::RunningExecutionWithoutProcessRegistry));
     }
@@ -774,7 +784,7 @@ mod tests {
             .execute(&db.pool).await.unwrap();
         sqlx::query("INSERT INTO event_log (id, stream_id, stream_version, event_type, payload_json, schema_version, correlation_id, idempotency_key, source) VALUES ('ev1','e1',1,'process_exited','{}',1,'c1','ik1','agent')")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
         assert!(anomalies.contains(&SchedulerAnomaly::ProcessTerminalExecutionNonterminal));
     }
@@ -788,7 +798,7 @@ mod tests {
         insert_worktree(&db).await;
         sqlx::query("INSERT INTO workspace_leases (id, worktree_id, project_id, task_id, owner_execution_id, lease_token, fencing_token, lifecycle, heartbeat_at, expires_at) VALUES ('l1','wt1','p1','t1','e1','tok',1,'active','2000-01-01',datetime('now','+10 minutes'))")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
         assert!(anomalies.contains(&SchedulerAnomaly::HeartbeatMissingForRetainedLease));
     }
@@ -802,7 +812,7 @@ mod tests {
         // Use resource_handoffs (no FK on worktree_id) to test missing worktree detection
         sqlx::query("INSERT INTO resource_handoffs (handoff_id, project_id, task_id, execution_id, worktree_id, lease_id, fencing_token, owner_kind, owner_id, status) VALUES ('ho1','p1','t1','e1','wt-missing','l1',1,'scheduler','scheduler-main','scheduler_owned')")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
         assert!(anomalies.contains(&SchedulerAnomaly::WorktreeMissing));
     }
@@ -815,8 +825,8 @@ mod tests {
         sqlx::query("INSERT INTO scheduler_reservations (id, task_id, status, expires_at) VALUES ('r1','t1','active','2000-01-01')")
             .execute(&db.pool).await.unwrap();
         let pool = Arc::new(db.pool.clone());
-        let rec1 = SchedulerReconciler::new((*pool).clone());
-        let rec2 = SchedulerReconciler::new((*pool).clone());
+        let rec1 = SchedulerReconciler::new_for_tests((*pool).clone());
+        let rec2 = SchedulerReconciler::new_for_tests((*pool).clone());
         let (r1, r2) = tokio::join!(rec1.reconcile(), rec2.reconcile());
         assert!(r1.is_ok());
         assert!(r2.is_ok());
@@ -828,7 +838,7 @@ mod tests {
         seed_project_task(&db, "t1", "failed").await;
         sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'failed')")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         rec.reconcile().await.unwrap();
         let count: (i64,) =
             sqlx::query_as("SELECT COUNT(*) FROM execution_attempts WHERE task_id='t1'")
@@ -845,7 +855,7 @@ mod tests {
         insert_worktree(&db).await;
         sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'failed')")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         rec.reconcile().await.unwrap();
         let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM worktrees WHERE id='wt1'")
             .fetch_one(&db.pool)
@@ -860,7 +870,7 @@ mod tests {
         seed_project_task(&db, "t1", "running").await;
         sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id) VALUES ('e1','t1',1,'running','prof-claude')")
             .execute(&db.pool).await.unwrap();
-        let rec = SchedulerReconciler::new(db.pool.clone());
+        let rec = SchedulerReconciler::new_for_tests(db.pool.clone());
         rec.reconcile().await.unwrap();
         let prof: (String,) =
             sqlx::query_as("SELECT profile_id FROM execution_attempts WHERE id='e1'")
@@ -909,7 +919,7 @@ mod tests {
             .await
             .unwrap();
 
-        let rec = SchedulerReconciler::new(db.pool.clone()).with_heartbeat_registry(registry);
+        let rec = SchedulerReconciler::new(db.pool.clone(), registry);
         let anomalies = rec.reconcile().await.unwrap();
         assert!(
             anomalies.contains(&SchedulerAnomaly::HandoffRegistryMismatch),

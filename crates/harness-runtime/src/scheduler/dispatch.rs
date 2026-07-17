@@ -111,6 +111,13 @@ impl SchedulerOrchestrator {
         }
     }
 
+    /// Test-only: get a reference to the heartbeat registry for verifying
+    /// shared-instance wiring in service composition tests.
+    #[doc(hidden)]
+    pub fn get_heartbeat_registry_for_tests(&self) -> Arc<HeartbeatRegistry> {
+        self.heartbeat_registry.clone()
+    }
+
     /// Full dispatch saga. Returns outcome with compensation info.
     ///
     /// Idempotent: same logical request returns the original outcome without
