@@ -926,7 +926,10 @@ mod tests {
             "SELECT COUNT(*) FROM verification_ownership_events WHERE verification_run_id='run-ev2'",
         )
         .fetch_one(&ctx.db.pool).await.unwrap();
-        assert_eq!(count.0, 1, "event count must stay 1 after repeated takeover");
+        assert_eq!(
+            count.0, 1,
+            "event count must stay 1 after repeated takeover"
+        );
     }
 
     #[tokio::test]
