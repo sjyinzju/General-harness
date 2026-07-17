@@ -46,6 +46,36 @@ impl SchedulerEventSink {
         }
     }
 
+    /// Create a sink and initialize its sequence counter from the database,
+    /// skipping past any stream_versions already written by transition_execution.
+    /// Uses MAX+2 to leave room for one more transition_execution event (which
+    /// writes at version = current_execution_version + 1).
+    pub async fn new_with_db_init(
+        pool: SqlitePool,
+        execution_id: String,
+        artifact_dir: Option<std::path::PathBuf>,
+    ) -> Self {
+        let max_version: Option<i64> =
+            sqlx::query_scalar("SELECT MAX(stream_version) FROM event_log WHERE stream_id = ?")
+                .bind(&execution_id)
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten();
+
+        // Leave room for one more transition_execution event
+        let start = max_version.unwrap_or(0) as u64 + 2;
+        Self {
+            pool,
+            execution_id,
+            sequence: Arc::new(AtomicU64::new(start)),
+            closed: Arc::new(AtomicBool::new(false)),
+            artifact_dir,
+            last_persisted_seq: Arc::new(Mutex::new(start)),
+            redactor: Arc::new(ProcessEventRedactor::new()),
+        }
+    }
+
     /// Create a sink with a pre-configured redactor containing known secrets.
     pub fn with_redactor(
         pool: SqlitePool,

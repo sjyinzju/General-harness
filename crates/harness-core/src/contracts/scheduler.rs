@@ -183,15 +183,26 @@ impl TerminalOutcome {
 #[serde(rename_all = "snake_case")]
 pub enum SchedulerAnomaly {
     OrphanReservation,
-    IntentWithoutSpawn,
-    ProcessMissing,
-    TerminalProcessNotReflected,
-    StaleFencing,
+    TerminalExecutionWithActiveReservation,
+    StaleSpawnIntent,
+    TaskRunningWithoutActiveExecution,
+    DuplicateActiveExecutions,
     LeaseWithoutClaim,
     ClaimWithoutLease,
-    TerminalExecutionResourcesActive,
-    DuplicateActiveExecution,
-    AwaitingVerificationResourceLost,
-    EventTerminalMissingTransition,
-    ReservationExpiredNotReleased,
+    StaleFencing,
+    WorktreeMissing,
+    RuntimeProfileMissingOrDisabled,
+    AwaitingVerificationResourcesMissing,
+    TerminalEventWithoutTransition,
+    FailedExecutionWithActiveLeaseOrClaim,
+    ReservationWithoutTaskOrExecution,
+    IncompleteSpawnIntent,
+    RunningExecutionWithoutProcessRegistry,
+    ProcessTerminalExecutionNonterminal,
+    HeartbeatMissingForRetainedLease,
+    /// DB resource_handoffs owner/status disagrees with runtime HeartbeatRegistry.
+    /// May indicate: DB owner ≠ registry owner, DB Active but registry missing,
+    /// registry Active but DB missing, fencing mismatch, or DB Released/Lost
+    /// while registry heartbeat is still running.
+    HandoffRegistryMismatch,
 }

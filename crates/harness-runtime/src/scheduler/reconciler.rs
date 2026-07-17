@@ -11,18 +11,32 @@
 //!   - When a failed owner can be determined, release resources
 //!   - Awaiting-Verification legitimate Lease/Claim must not be released
 
+use std::sync::Arc;
+
 use harness_core::contracts::scheduler::SchedulerAnomaly;
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
+use super::heartbeat_registry::HeartbeatRegistry;
+
 pub struct SchedulerReconciler {
     pool: SqlitePool,
+    heartbeat_registry: Option<Arc<HeartbeatRegistry>>,
 }
 
 impl SchedulerReconciler {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            heartbeat_registry: None,
+        }
+    }
+
+    /// Attach a heartbeat registry for HandoffRegistryMismatch detection.
+    pub fn with_heartbeat_registry(mut self, registry: Arc<HeartbeatRegistry>) -> Self {
+        self.heartbeat_registry = Some(registry);
+        self
     }
 
     pub async fn reconcile(&self) -> Result<Vec<SchedulerAnomaly>, CoreError> {
@@ -32,16 +46,16 @@ impl SchedulerReconciler {
             anomalies.push(SchedulerAnomaly::OrphanReservation);
         }
         if self.detect_terminal_exec_active_reservation().await? {
-            anomalies.push(SchedulerAnomaly::TerminalExecutionResourcesActive);
+            anomalies.push(SchedulerAnomaly::TerminalExecutionWithActiveReservation);
         }
         if self.detect_stale_spawn_intent().await? {
-            anomalies.push(SchedulerAnomaly::IntentWithoutSpawn);
+            anomalies.push(SchedulerAnomaly::StaleSpawnIntent);
         }
         if self.detect_task_running_without_exec().await? {
-            anomalies.push(SchedulerAnomaly::ProcessMissing);
+            anomalies.push(SchedulerAnomaly::TaskRunningWithoutActiveExecution);
         }
         if self.detect_duplicate_active_execs().await? {
-            anomalies.push(SchedulerAnomaly::DuplicateActiveExecution);
+            anomalies.push(SchedulerAnomaly::DuplicateActiveExecutions);
         }
         if self.detect_lease_without_claim().await? {
             anomalies.push(SchedulerAnomaly::LeaseWithoutClaim);
@@ -52,32 +66,38 @@ impl SchedulerReconciler {
         if self.detect_stale_fencing().await? {
             anomalies.push(SchedulerAnomaly::StaleFencing);
         }
+        if self.detect_worktree_missing().await? {
+            anomalies.push(SchedulerAnomaly::WorktreeMissing);
+        }
         if self.detect_profile_missing().await? {
-            anomalies.push(SchedulerAnomaly::IntentWithoutSpawn);
+            anomalies.push(SchedulerAnomaly::RuntimeProfileMissingOrDisabled);
         }
         if self.detect_awaiting_verification_missing().await? {
-            anomalies.push(SchedulerAnomaly::AwaitingVerificationResourceLost);
+            anomalies.push(SchedulerAnomaly::AwaitingVerificationResourcesMissing);
         }
         if self.detect_terminal_event_no_transition().await? {
-            anomalies.push(SchedulerAnomaly::EventTerminalMissingTransition);
+            anomalies.push(SchedulerAnomaly::TerminalEventWithoutTransition);
         }
         if self.detect_failed_exec_active_lease().await? {
-            anomalies.push(SchedulerAnomaly::TerminalExecutionResourcesActive);
+            anomalies.push(SchedulerAnomaly::FailedExecutionWithActiveLeaseOrClaim);
         }
         if self.detect_reservation_without_task().await? {
-            anomalies.push(SchedulerAnomaly::ReservationExpiredNotReleased);
+            anomalies.push(SchedulerAnomaly::ReservationWithoutTaskOrExecution);
         }
         if self.detect_incomplete_spawn().await? {
-            anomalies.push(SchedulerAnomaly::IntentWithoutSpawn);
+            anomalies.push(SchedulerAnomaly::IncompleteSpawnIntent);
         }
         if self.detect_running_without_process().await? {
-            anomalies.push(SchedulerAnomaly::ProcessMissing);
+            anomalies.push(SchedulerAnomaly::RunningExecutionWithoutProcessRegistry);
         }
         if self.detect_process_exit_exec_running().await? {
-            anomalies.push(SchedulerAnomaly::TerminalProcessNotReflected);
+            anomalies.push(SchedulerAnomaly::ProcessTerminalExecutionNonterminal);
         }
         if self.detect_heartbeat_missing().await? {
-            anomalies.push(SchedulerAnomaly::StaleFencing);
+            anomalies.push(SchedulerAnomaly::HeartbeatMissingForRetainedLease);
+        }
+        if self.detect_handoff_registry_mismatch().await? {
+            anomalies.push(SchedulerAnomaly::HandoffRegistryMismatch);
         }
 
         let _ = self.expire_stale_reservations().await?;
@@ -228,6 +248,46 @@ impl SchedulerReconciler {
             .await?;
         }
         Ok(!rows.is_empty())
+    }
+
+    async fn detect_worktree_missing(&self) -> Result<bool, CoreError> {
+        let mut found = false;
+
+        // Case 1: Active lease referencing a worktree that does not exist in DB
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT wl.id, wl.worktree_id FROM workspace_leases wl WHERE wl.lifecycle = 'active' AND wl.worktree_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM worktrees w WHERE w.id = wl.worktree_id)",
+        )
+        .fetch_all(&self.pool).await.map_err(db_err)?;
+        for (lease_id, wt_id) in &rows {
+            found = true;
+            self.record_evidence(
+                "worktree_missing_db",
+                "lease",
+                Some(lease_id),
+                &format!("active lease references missing worktree DB record: {wt_id}"),
+                false,
+            )
+            .await?;
+        }
+
+        // Case 2: Active resource_handoff referencing a worktree that does not exist in DB
+        let rows2: Vec<(String, String)> = sqlx::query_as(
+            "SELECT rh.handoff_id, rh.worktree_id FROM resource_handoffs rh WHERE rh.status IN ('scheduler_owned','verification_owned') AND rh.worktree_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM worktrees w WHERE w.id = rh.worktree_id)",
+        )
+        .fetch_all(&self.pool).await.map_err(db_err)?;
+        for (handoff_id, wt_id) in &rows2 {
+            found = true;
+            self.record_evidence(
+                "worktree_missing_handoff",
+                "handoff",
+                Some(handoff_id),
+                &format!("handoff references missing worktree DB record: {wt_id}"),
+                false,
+            )
+            .await?;
+        }
+
+        Ok(found)
     }
 
     async fn detect_profile_missing(&self) -> Result<bool, CoreError> {
@@ -400,6 +460,143 @@ impl SchedulerReconciler {
         Ok(!rows.is_empty())
     }
 
+    /// Detect mismatches between DB resource_handoffs and runtime HeartbeatRegistry.
+    ///
+    /// Checks:
+    ///   - DB owner ≠ registry owner for active handoffs
+    ///   - DB handoff active but registry entry missing
+    ///   - Registry entry active but DB handoff missing
+    ///   - Fencing token mismatch between layers
+    ///   - DB Released/Lost but registry heartbeat still Healthy/Degraded
+    ///
+    /// Safety: never starts Verification, never re-acquires Lease/Claim.
+    /// Can safely stop heartbeat for lost ownership.
+    async fn detect_handoff_registry_mismatch(&self) -> Result<bool, CoreError> {
+        let registry = match &self.heartbeat_registry {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+
+        let mut found = false;
+
+        // Query all non-terminal handoffs from DB
+        let db_rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+            "SELECT execution_id, owner_kind, owner_id, status, fencing_token FROM resource_handoffs WHERE status IN ('scheduler_owned','verification_owned','reconciliation_required')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        for (exec_id, db_owner_kind, db_owner_id, db_status, db_fencing) in &db_rows {
+            let reg = registry.inspect(exec_id).await;
+
+            match reg {
+                None => {
+                    // DB has active handoff but registry has no entry
+                    found = true;
+                    self.record_evidence(
+                        "handoff_registry_mismatch",
+                        "handoff",
+                        Some(exec_id),
+                        &format!(
+                            "DB status={db_status} owner={db_owner_kind}/{db_owner_id} but registry entry missing"
+                        ),
+                        false,
+                    )
+                    .await?;
+                }
+                Some(reg_result) => {
+                    // Compare owners
+                    if db_owner_kind != &reg_result.owner_kind
+                        || db_owner_id != &reg_result.owner_id
+                    {
+                        found = true;
+                        self.record_evidence(
+                            "handoff_registry_mismatch",
+                            "handoff",
+                            Some(exec_id),
+                            &format!(
+                                "owner mismatch: DB={db_owner_kind}/{db_owner_id} registry={}/{}",
+                                reg_result.owner_kind, reg_result.owner_id
+                            ),
+                            false,
+                        )
+                        .await?;
+                    }
+                    // Compare fencing
+                    if *db_fencing != reg_result.fencing_token {
+                        found = true;
+                        self.record_evidence(
+                            "handoff_registry_mismatch",
+                            "handoff",
+                            Some(exec_id),
+                            &format!(
+                                "fencing mismatch: DB={db_fencing} registry={}",
+                                reg_result.fencing_token
+                            ),
+                            false,
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
+
+        // Check for registry entries without DB handoffs (orphan registry entries)
+        let active_registry_ids = registry.list_active().await;
+        for exec_id in &active_registry_ids {
+            let db_exists: (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM resource_handoffs WHERE execution_id = ?")
+                    .bind(exec_id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(db_err)?;
+
+            if db_exists.0 == 0 {
+                found = true;
+                self.record_evidence(
+                    "handoff_registry_mismatch",
+                    "heartbeat",
+                    Some(exec_id),
+                    "registry has active heartbeat but no DB handoff record",
+                    false,
+                )
+                .await?;
+            }
+        }
+
+        // Check DB Released/Lost handoffs whose registry heartbeat is still running
+        let terminal_db: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT execution_id, owner_kind, status FROM resource_handoffs WHERE status IN ('released','lost')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        for (exec_id, _db_owner_kind, db_status) in &terminal_db {
+            if let Some(reg_result) = registry.inspect(exec_id).await {
+                if reg_result.status.contains("healthy") || reg_result.status.contains("degraded") {
+                    found = true;
+                    self.record_evidence(
+                        "handoff_registry_mismatch",
+                        "handoff",
+                        Some(exec_id),
+                        &format!(
+                            "DB status={db_status} but registry heartbeat still {}/{}",
+                            reg_result.status, reg_result.owner_kind
+                        ),
+                        false,
+                    )
+                    .await?;
+                    // Safe to stop: DB says released/lost
+                    registry.mark_lost(exec_id).await;
+                }
+            }
+        }
+
+        Ok(found)
+    }
+
     async fn expire_stale_reservations(&self) -> Result<usize, CoreError> {
         let result = sqlx::query(
             "UPDATE scheduler_reservations SET status='expired' WHERE status='active' AND expires_at < datetime('now')",
@@ -495,7 +692,7 @@ mod tests {
             .execute(&db.pool).await.unwrap();
         let rec = SchedulerReconciler::new(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
-        assert!(anomalies.contains(&SchedulerAnomaly::DuplicateActiveExecution));
+        assert!(anomalies.contains(&SchedulerAnomaly::DuplicateActiveExecutions));
     }
 
     #[tokio::test]
@@ -534,7 +731,7 @@ mod tests {
         insert_active_lease(&db).await;
         let rec = SchedulerReconciler::new(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
-        assert!(anomalies.contains(&SchedulerAnomaly::TerminalExecutionResourcesActive));
+        assert!(anomalies.contains(&SchedulerAnomaly::FailedExecutionWithActiveLeaseOrClaim));
         let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM workspace_leases WHERE id='l1'")
             .fetch_one(&db.pool)
             .await
@@ -548,20 +745,25 @@ mod tests {
         seed_project_task(&db, "t1", "submitted").await;
         let rec = SchedulerReconciler::new(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
-        assert!(anomalies.contains(&SchedulerAnomaly::AwaitingVerificationResourceLost));
+        assert!(anomalies.contains(&SchedulerAnomaly::AwaitingVerificationResourcesMissing));
     }
 
     #[tokio::test]
     async fn test_running_without_process_detected() {
         let db = setup().await;
         seed_project_task(&db, "t1", "running").await;
-        sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'running')")
+        // Insert a runtime profile so profile_missing detection doesn't fire
+        sqlx::query("INSERT INTO runtime_profiles (id, agent_kind, adapter_kind, agent_version, executable_path, provider, provider_source, auth_mode, auth_status, core_status, authentication_status, execution_status) VALUES ('prof1','fake','fake','1.0','/bin/fake','test','user_declared','none','unknown','available','unknown','untested')")
             .execute(&db.pool).await.unwrap();
-        sqlx::query("INSERT INTO dispatch_operations (id, project_id, task_id, selected_profile_id, request_hash, idempotency_key, status, stage, agent_session_id, execution_id, started_at) VALUES ('d1','p1','t1','prof1','hash','ikey-d1','preparing','agent_running','sess1','e1','2000-01-01')")
+        sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id) VALUES ('e1','t1',1,'running','prof1')")
+            .execute(&db.pool).await.unwrap();
+        // Use stage 'dispatched' so stale_spawn_intent (checks agent_starting/agent_running) doesn't fire,
+        // but use old started_at so running_without_process still detects the stale session.
+        sqlx::query("INSERT INTO dispatch_operations (id, project_id, task_id, selected_profile_id, request_hash, idempotency_key, status, stage, agent_session_id, execution_id, started_at) VALUES ('d1','p1','t1','prof1','hash','ikey-d1','preparing','dispatched','sess1','e1',datetime('now','-16 minutes'))")
             .execute(&db.pool).await.unwrap();
         let rec = SchedulerReconciler::new(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
-        assert!(anomalies.contains(&SchedulerAnomaly::ProcessMissing));
+        assert!(anomalies.contains(&SchedulerAnomaly::RunningExecutionWithoutProcessRegistry));
     }
 
     #[tokio::test]
@@ -574,7 +776,7 @@ mod tests {
             .execute(&db.pool).await.unwrap();
         let rec = SchedulerReconciler::new(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
-        assert!(anomalies.contains(&SchedulerAnomaly::TerminalProcessNotReflected));
+        assert!(anomalies.contains(&SchedulerAnomaly::ProcessTerminalExecutionNonterminal));
     }
 
     #[tokio::test]
@@ -588,7 +790,21 @@ mod tests {
             .execute(&db.pool).await.unwrap();
         let rec = SchedulerReconciler::new(db.pool.clone());
         let anomalies = rec.reconcile().await.unwrap();
-        assert!(anomalies.contains(&SchedulerAnomaly::StaleFencing));
+        assert!(anomalies.contains(&SchedulerAnomaly::HeartbeatMissingForRetainedLease));
+    }
+
+    #[tokio::test]
+    async fn test_worktree_missing_detected() {
+        let db = setup().await;
+        seed_project_task(&db, "t1", "completed").await;
+        sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'completed')")
+            .execute(&db.pool).await.unwrap();
+        // Use resource_handoffs (no FK on worktree_id) to test missing worktree detection
+        sqlx::query("INSERT INTO resource_handoffs (handoff_id, project_id, task_id, execution_id, worktree_id, lease_id, fencing_token, owner_kind, owner_id, status) VALUES ('ho1','p1','t1','e1','wt-missing','l1',1,'scheduler','scheduler-main','scheduler_owned')")
+            .execute(&db.pool).await.unwrap();
+        let rec = SchedulerReconciler::new(db.pool.clone());
+        let anomalies = rec.reconcile().await.unwrap();
+        assert!(anomalies.contains(&SchedulerAnomaly::WorktreeMissing));
     }
 
     #[tokio::test]
@@ -652,5 +868,53 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(prof.0, "prof-claude", "reconciler must not switch profiles");
+    }
+
+    #[tokio::test]
+    async fn test_handoff_registry_mismatch_detected() {
+        use crate::scheduler::heartbeat_registry::{HeartbeatEntry, HeartbeatStatus, OwnerKind};
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        let db = setup().await;
+        seed_project_task(&db, "t1", "completed").await;
+        sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'completed')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Seed DB handoff with scheduler owner
+        sqlx::query("INSERT INTO resource_handoffs (handoff_id, project_id, task_id, execution_id, worktree_id, lease_id, fencing_token, owner_kind, owner_id, status) VALUES ('ho1','p1','t1','e1','wt1','l1',5,'scheduler','scheduler-main','scheduler_owned')")
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        // Seed runtime registry with a DIFFERENT owner to trigger mismatch
+        let registry = Arc::new(HeartbeatRegistry::new());
+        registry
+            .register(HeartbeatEntry {
+                execution_id: "e1".to_string(),
+                task_id: "t1".to_string(),
+                worktree_id: "wt1".to_string(),
+                lease_id: "l1".to_string(),
+                claim_group_id: Some("cg1".to_string()),
+                fencing_token: 5,
+                owner_kind: OwnerKind::Verification, // <-- different from DB
+                owner_id: "verify-run-1".to_string(),
+                status: HeartbeatStatus::Healthy,
+                last_heartbeat_at: Some(chrono::Utc::now()),
+                cancel_token: CancellationToken::new(),
+                last_error: None,
+            })
+            .await
+            .unwrap();
+
+        let rec = SchedulerReconciler::new(db.pool.clone()).with_heartbeat_registry(registry);
+        let anomalies = rec.reconcile().await.unwrap();
+        assert!(
+            anomalies.contains(&SchedulerAnomaly::HandoffRegistryMismatch),
+            "should detect DB owner=scheduler vs registry owner=verification mismatch, got: {:?}",
+            anomalies
+        );
     }
 }

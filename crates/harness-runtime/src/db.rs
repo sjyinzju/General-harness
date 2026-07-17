@@ -27,7 +27,7 @@ impl Database {
             .busy_timeout(std::time::Duration::from_secs(5));
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(1) // SQLite single-writer
+            .max_connections(5) // WAL mode allows concurrent reads, one writer
             .connect_with(opts)
             .await?;
 
@@ -44,7 +44,7 @@ impl Database {
             .foreign_keys(true);
 
         let pool = SqlitePoolOptions::new()
-            .max_connections(1)
+            .max_connections(5)
             .connect_with(opts)
             .await?;
 
@@ -121,6 +121,7 @@ mod tests {
                 "projects",
                 "resource_claim_groups",
                 "resource_claims",
+                "resource_handoffs",
                 "runtime_profiles",
                 "scheduler_reconciliations",
                 "scheduler_reservations",
@@ -129,7 +130,7 @@ mod tests {
                 "workspace_leases",
                 "worktrees"
             ],
-            "21 business tables expected (001–010)"
+            "22 business tables expected (001–011)"
         );
     }
 

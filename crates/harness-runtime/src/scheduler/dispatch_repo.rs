@@ -82,6 +82,7 @@ impl DispatchRepository {
     ///    a. Same request_hash → return the existing outcome (duplicate)
     ///    b. Different request_hash → return IdempotencyConflict
     /// 2. Otherwise → insert new intent with status='preparing'
+    #[allow(clippy::too_many_arguments)]
     pub async fn record_intent(
         &self,
         op_id: &str,

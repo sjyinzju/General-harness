@@ -38,6 +38,8 @@ use uuid::Uuid;
 use super::concurrency::ConcurrencyManager;
 use super::dispatch_repo::{DispatchRepository, IntentOutcome};
 use super::event_sink::SchedulerEventSink;
+use super::handoff_repo::{CreateHandoffParams, HandoffRepository};
+use super::heartbeat_registry::{HeartbeatEntry, HeartbeatRegistry, HeartbeatStatus, OwnerKind};
 use crate::lease::runner::LeaseHeartbeatRunner;
 use crate::lease::service::WorkspaceLeaseService;
 use crate::lease::types::LeaseSpec;
@@ -79,9 +81,12 @@ pub struct SchedulerOrchestrator {
     worktree_mgr: Arc<WorktreeManager>,
     lease_service: Arc<WorkspaceLeaseService>,
     claim_service: Arc<ResourceClaimService>,
+    heartbeat_registry: Arc<HeartbeatRegistry>,
+    handoff_repo: HandoffRepository,
 }
 
 impl SchedulerOrchestrator {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         pool: SqlitePool,
         transitions: TransitionService,
@@ -89,6 +94,8 @@ impl SchedulerOrchestrator {
         worktree_mgr: Arc<WorktreeManager>,
         lease_service: Arc<WorkspaceLeaseService>,
         claim_service: Arc<ResourceClaimService>,
+        heartbeat_registry: Arc<HeartbeatRegistry>,
+        handoff_repo: HandoffRepository,
     ) -> Self {
         let dispatch_repo = DispatchRepository::new(pool.clone());
         Self {
@@ -99,6 +106,8 @@ impl SchedulerOrchestrator {
             worktree_mgr,
             lease_service,
             claim_service,
+            heartbeat_registry,
+            handoff_repo,
         }
     }
 
@@ -357,6 +366,17 @@ impl SchedulerOrchestrator {
             )
             .await;
 
+        // Transition Task → Running (dispatched agent is now running)
+        let _ = self
+            .transitions
+            .transition_task(
+                req.task_id,
+                &TaskLifecycle::Dispatched,
+                &TaskLifecycle::Running,
+                &format!("{}-trun", ikey),
+            )
+            .await;
+
         // ── 12. Send task envelope ─────────────────────────────────
         let envelope = harness_core::contracts::task_envelope::TaskEnvelope {
             task_id: req.task_id.to_string(),
@@ -396,7 +416,8 @@ impl SchedulerOrchestrator {
         }
 
         // ── 13. Receive events via persistent sink ─────────────────
-        let mut event_sink = SchedulerEventSink::new(self.pool.clone(), exec_id.clone(), None);
+        let mut event_sink =
+            SchedulerEventSink::new_with_db_init(self.pool.clone(), exec_id.clone(), None).await;
         let receive_result = session.receive_events(&mut event_sink).await;
         let _ = session.dispose().await;
 
@@ -429,11 +450,15 @@ impl SchedulerOrchestrator {
         if terminal.retain_resources() {
             // Success: release concurrency only, retain Lease/Claim/Worktree/Heartbeat
             let _ = self.concurrency.release(req.task_id).await;
+            let current_task_lc = self
+                .get_task_lc(req.task_id)
+                .await
+                .unwrap_or(TaskLifecycle::Dispatched);
             let _ = self
                 .transitions
                 .transition_task(
                     req.task_id,
-                    &TaskLifecycle::Running,
+                    &current_task_lc,
                     &TaskLifecycle::Submitted,
                     &format!("{}-sub", ikey),
                 )
@@ -441,6 +466,61 @@ impl SchedulerOrchestrator {
             self.dispatch_repo
                 .update_status(&op_id, "agent_completed", None)
                 .await?;
+
+            // ── Create resource handoff for I4-C Verification ─────────
+            let handoff_id = format!("handoff-{}", Uuid::new_v4());
+            let wt_id = resources.worktree_id.as_deref().unwrap_or("");
+            let lease_id = resources
+                .lease_record
+                .as_ref()
+                .map(|r| r.lease_id.as_str())
+                .unwrap_or("");
+            let cg_id = resources.claim_group_id.as_deref();
+            let fencing = resources
+                .lease_record
+                .as_ref()
+                .map(|r| r.fencing_token)
+                .unwrap_or(0);
+
+            // Register in runtime registry
+            if let Some(ref _lease_rec) = resources.lease_record {
+                let entry = HeartbeatEntry {
+                    execution_id: exec_id.clone(),
+                    task_id: req.task_id.to_string(),
+                    worktree_id: wt_id.to_string(),
+                    lease_id: lease_id.to_string(),
+                    claim_group_id: cg_id.map(|s| s.to_string()),
+                    fencing_token: fencing,
+                    owner_kind: OwnerKind::Scheduler,
+                    owner_id: "scheduler-main".to_string(),
+                    status: HeartbeatStatus::Healthy,
+                    last_heartbeat_at: Some(chrono::Utc::now()),
+                    cancel_token: resources
+                        .heartbeat_cancel
+                        .clone()
+                        .unwrap_or_else(CancellationToken::new),
+                    last_error: None,
+                };
+                let _ = self.heartbeat_registry.register(entry).await;
+            }
+
+            // Persist handoff record
+            let _ = self
+                .handoff_repo
+                .create(
+                    &handoff_id,
+                    req.project_id,
+                    req.task_id,
+                    CreateHandoffParams {
+                        execution_id: &exec_id,
+                        worktree_id: Some(wt_id),
+                        lease_id: Some(lease_id),
+                        claim_group_id: cg_id,
+                        fencing_token: fencing,
+                        owner_id: "scheduler-main",
+                    },
+                )
+                .await;
 
             Ok(DispatchOutcome {
                 dispatch_op_id: op_id,
@@ -583,7 +663,7 @@ impl SchedulerOrchestrator {
             }
         };
 
-        // Start heartbeat runner
+        // Start heartbeat runner with registry integration
         let heartbeat_cancel = CancellationToken::new();
         let hb_cancel_child = heartbeat_cancel.clone();
         let hb_runner = LeaseHeartbeatRunner::new(
@@ -593,11 +673,26 @@ impl SchedulerOrchestrator {
             lease_record.fencing_token,
         );
 
+        let hb_exec_id = exec_id.to_string();
+        let hb_registry = self.heartbeat_registry.clone();
+        let hb_handoff_repo = HandoffRepository::new(self.pool.clone());
+
         tokio::spawn(async move {
             hb_runner
-                .run(hb_cancel_child, |_result| {
-                    // Heartbeat results are logged internally by the runner.
-                    // Critical failures would surface via reconciler.
+                .run(hb_cancel_child, move |result| {
+                    let exec_id = hb_exec_id.clone();
+                    let registry = hb_registry.clone();
+                    let handoff_repo = hb_handoff_repo.clone();
+                    tokio::spawn(async move {
+                        if result.ok {
+                            registry.update_heartbeat_status(&exec_id, true, None).await;
+                            let _ = handoff_repo.update_heartbeat(&exec_id).await;
+                        } else if let Some(ref err) = result.error {
+                            registry
+                                .update_heartbeat_status(&exec_id, false, Some(err.clone()))
+                                .await;
+                        }
+                    });
                 })
                 .await;
         });
