@@ -563,25 +563,31 @@ async fn test_claim_cannot_exceed_lease_expiry() {
     let db = Database::open_in_memory().await.unwrap();
     seed_world(&db.pool, "p1", "t1", "e1").await;
 
-    struct AlreadyExpiredLease;
+    // Use a validator with a short-lived lease for acquire.
+    struct ShortLeaseValidator;
     #[async_trait::async_trait]
-    impl ResourceClaimLeaseValidator for AlreadyExpiredLease {
+    impl ResourceClaimLeaseValidator for ShortLeaseValidator {
         async fn validate_lease(
             &self,
             _lease_id: &str,
             _token: &str,
             _fencing: i64,
         ) -> Result<(), CoreError> {
-            Ok(()) // Validation still passes (for test purposes).
+            Ok(())
         }
         async fn get_lease_expires_at(&self, _lease_id: &str) -> Result<Option<String>, CoreError> {
-            // Lease already expired.
-            Ok(Some("2020-01-01 00:00:00".to_string()))
+            // Lease expires in 2 seconds.
+            let exp = (chrono::Utc::now() + chrono::Duration::seconds(2))
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string();
+            Ok(Some(exp))
         }
     }
 
-    let svc = make_service(db.pool.clone(), Box::new(AlreadyExpiredLease));
+    let svc = make_service(db.pool.clone(), Box::new(ShortLeaseValidator));
     let spec = spec_exact("src/a.rs", AccessMode::Write);
+
+    // Acquire succeeds with bounded (short) expiry.
     let result = svc
         .acquire_group(&spec, &guard(), "ikey-past")
         .await
@@ -591,9 +597,31 @@ async fn test_claim_cannot_exceed_lease_expiry() {
         _ => panic!("expected Acquired"),
     };
 
+    // Wait for the lease to expire.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    // Now create a service with an already-expired lease validator.
+    struct AlreadyExpiredLease;
+    #[async_trait::async_trait]
+    impl ResourceClaimLeaseValidator for AlreadyExpiredLease {
+        async fn validate_lease(
+            &self,
+            _lease_id: &str,
+            _token: &str,
+            _fencing: i64,
+        ) -> Result<(), CoreError> {
+            Ok(())
+        }
+        async fn get_lease_expires_at(&self, _lease_id: &str) -> Result<Option<String>, CoreError> {
+            Ok(Some("2020-01-01 00:00:00".to_string()))
+        }
+    }
+
+    let svc_expired = make_service(db.pool.clone(), Box::new(AlreadyExpiredLease));
+
     // Renew should fail because lease already expired.
-    let result = svc.renew_group(&group_id, &guard(), 300).await;
-    assert!(result.is_err());
+    let result = svc_expired.renew_group(&group_id, &guard(), 300).await;
+    assert!(result.is_err(), "renew with expired lease should fail");
 }
 
 #[tokio::test]

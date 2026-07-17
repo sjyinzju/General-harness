@@ -1,9 +1,10 @@
 # I3 Resource Claim Kernel — Final Closure Report
 
-> **状态**: I3 完成，质量门全绿，就绪交付 I4
-> **日期**: 2026-07-16
+> **状态**: I3 Pre-I4 Closure 完成，质量门全绿，就绪交付 I4
+> **日期**: 2026-07-16 (初版) / 2026-07-17 (Closure)
 > **Branch**: `main`
-> **HEAD**: `d0d134e` (feat(i3-c): integrate resource claims with lease and recovery)
+> **HEAD (I3-C code)**: `d0d134e` (feat(i3-c): integrate resource claims with lease and recovery)
+> **HEAD (Closure fix)**: see `fix(i3): close transaction and concurrency audit gaps`
 
 ---
 
@@ -50,14 +51,15 @@
 |---|---|
 | `cargo fmt --all --check` | PASS |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| `cargo test --workspace` | PASS，**386 passed / 0 failed / 0 ignored** |
+| `cargo test --workspace` | PASS，**399 passed / 0 failed / 0 ignored** |
 | `git diff --check` | PASS |
 | `git status --short` | clean |
 
-测试增长：286 (I2B) → 386 (I3)，+100 测试：
+测试增长：286 (I2B) → 399 (I3+Closure)，+113 测试：
 - I3-A: +52 纯逻辑测试（harness-core）
 - I3-B: +22 持久化测试（resource_claim_persistence）
 - I3-C: +19 集成测试（resource_claim_integration）+7 adapter 单测
+- I3 Closure: +13 跨连接并发/原子事件/幂等/reconciler 测试（resource_claim_closure）
 
 ---
 
@@ -112,10 +114,12 @@ enum ResourceKind {
 
 ## 6. SQLite 跨连接仲裁
 
-- 所有 acquire/replace 操作使用 `BEGIN IMMEDIATE` 事务
-- 事务内：加载 active claims → 运行 overlap engine → insert group + rows
-- Conflict check 与 insert 在同一串行化区间
-- 两个不同连接同时请求冲突资源 → 最多一个成功
+- 所有 acquire/release/replace 操作使用 raw `BEGIN IMMEDIATE` 事务（非 sqlx 默认的 `BEGIN DEFERRED`）
+- `BEGIN IMMEDIATE` 在事务开始时即获取写锁，保证后续 active claims 读取看到最新提交状态
+- 事务内：idempotency 检查 → 加载 active claims → 运行 overlap engine → insert group + rows + idempotency + DomainEvent
+- Conflict check、idempotency 检查与 insert 在同一串行化区间
+- 两个不同 Pool 同时请求同一文件型 SQLite DB 的冲突资源 → 最多一个成功
+- 跨连接并发测试使用临时文件 DB + 两个独立 `SqlitePool`（`max_connections=2`），不使用 in-memory 隔离
 
 ---
 
@@ -141,9 +145,10 @@ Migrations 001–007 未修改。业务表从 14 增加到 15。
 - `resource_claim_group_released`
 - `resource_claim_group_expired`
 - `resource_claim_group_replaced`
-- `resource_claim_conflict_observed`（采样，非高频）
+- `resource_claim_conflict_observed`（采样，INSERT OR IGNORE 按冲突 pair 去重，防止无限膨胀）
 
-状态变更与事件同事务。使用递增 stream_version 避免 UNIQUE 冲突。
+状态变更、idempotency 记录与事件在**同一事务**内完成。无 crash window。
+递增 stream_version 避免 UNIQUE 冲突。
 
 ---
 
@@ -160,7 +165,7 @@ Migrations 001–007 未修改。业务表从 14 增加到 15。
 
 ## 10. Reconciler
 
-`ResourceClaimReconciler` 检测 13 种异常类型：
+`ResourceClaimReconciler` 检测 13 种异常类型（全部有真实检测逻辑，无 stub）：
 - ACTIVE_BUT_EXPIRED → 自动 expire
 - ACTIVE_LEASE_RELEASED / ACTIVE_LEASE_EXPIRED → 自动 expire
 - STALE_FENCING_TOKEN → 报告但不自动修复
@@ -169,10 +174,14 @@ Migrations 001–007 未修改。业务表从 14 增加到 15。
 - WORKTREE_REMOVED → 自动 expire
 - CLAIM_GROUP_WITHOUT_ROWS → 自动 expire
 - CLAIM_ROWS_WITHOUT_GROUP → 报告
+- INCOMPLETE_CLAIM_GROUP（group active 但部分 row 非 active）→ 自动 expire
+- REPOSITORY_IDENTITY_MISMATCH（group 与 worktree 的 repository_identity 不一致）→ 仅报告
 - MULTIPLE_CONFLICTING_ACTIVE_GROUPS → 报告
 - 不自动恢复 terminal group
 - 不删除 Worktree
 - 不抢占合法 owner
+
+INCOMPLETE_ACQUIRE/RELEASE/REPLACE 不适用：所有 I3 操作均在单一 DB 事务中完成，失败即全回滚，不存在可恢复的中间 Operation 记录。
 
 ---
 
@@ -233,7 +242,50 @@ Migrations 001–007 未修改。业务表从 14 增加到 15。
 
 ---
 
-## 15. I3 退出条件核验
+## 15. Pre-I4 Closure (2026-07-17)
+
+独立审计发现 7 项问题，均已修复：
+
+### 15.1 真实跨连接并发
+- 新增 `resource_claim_closure.rs` 测试文件（13 tests）
+- 使用临时文件 SQLite DB + 两个独立 `SqlitePool`（`max_connections=2`）
+- 验证：exact Write 一个胜出、directory vs exact 一个胜出、Read/Read 两个成功、不同 repo 两个成功
+- 生产连接池配置 `max_connections(1)` 为有意的单写者设计——SQLite 单写者架构下多连接不提升吞吐，仅增加 busy 重试
+
+### 15.2 明确事务仲裁
+- 替换 `pool.begin()`（DEFERRED）+ CREATE TEMP TABLE hack 为 raw `BEGIN IMMEDIATE`
+- 辅助函数 `begin_immediate()`/`commit_immediate()`/`rollback_immediate()`
+- 事务注释与实现精确一致
+
+### 15.3 状态与 DomainEvent 原子
+- `write_event_in_conn()` 在事务内写入 event_log
+- acquire/release/expire/replace 的 group/rows/idempotency/event 在同一事务中 COMMIT
+- 移除了先 COMMIT 状态再独立写事件的 `emit_claim_event()` 模式
+
+### 15.4 Idempotency TOCTOU 修复
+- 决定性 idempotency 检查移入 `BEGIN IMMEDIATE` 事务内
+- 并发相同 ikey 不产生裸 UNIQUE 约束错误——返回 AlreadyAcquired 或 IdempotencyConflict
+- `test_concurrent_same_ikey_no_db_error` 验证
+
+### 15.5 Reconciler 声明一致性
+- `IncompleteClaimGroup`：已实现真实检测（group active 但部分 claim row 非 active）
+- `RepositoryIdentityMismatch`：已实现真实检测（group 与 worktree 的 repository_identity 不一致）
+- INCOMPLETE_ACQUIRE/RELEASE/REPLACE：判定为不适用——I3 操作在单一 DB 事务中完成，失败全回滚
+
+### 15.6 ConflictObserved 事件
+- 已实现 `resource_claim_conflict_observed` 事件
+- 在 acquire/replace 冲突路径中写入（同一事务）
+- `INSERT OR IGNORE` + 冲突 pair 去重 key 防止无限 event-log 膨胀
+
+### 15.7 Defense-in-depth
+- Repo 不再硬编码 TTL（移除 `guard_expires_sql()`）
+- Repo 接收 service 已裁剪的明确 `expires_at` 参数
+- Service 的 `compute_claim_expires_at()` 确保 claim expiry ≤ lease expiry
+- lease_token 不存入 DB（仅 fencing_token 和 lease_id 入库）
+
+---
+
+## 16. I3 退出条件核验
 
 | 条件 | 满足 |
 |---|---|

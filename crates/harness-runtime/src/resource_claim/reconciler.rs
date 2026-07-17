@@ -118,7 +118,14 @@ impl ResourceClaimReconciler {
         // 7. Orphan claim rows.
         self.detect_rows_without_groups(&mut report).await?;
 
-        // 8. Conflicting active groups.
+        // 8. Incomplete claim groups (active group with mixed-lifecycle rows).
+        self.detect_incomplete_claim_groups(&mut report).await?;
+
+        // 9. Repository identity mismatch between group and worktree.
+        self.detect_repository_identity_mismatch(&mut report)
+            .await?;
+
+        // 10. Conflicting active groups.
         self.detect_conflicting_active(&mut report).await?;
 
         Ok(report)
@@ -317,6 +324,56 @@ impl ResourceClaimReconciler {
                 claim_id: claim_id.clone(),
                 group_id: group_id.clone(),
             });
+        }
+        Ok(())
+    }
+
+    /// Detect active groups where some child claim rows have a different
+    /// lifecycle than the group (indicating a partial/incomplete state change).
+    async fn detect_incomplete_claim_groups(
+        &self,
+        report: &mut ReconciliationReport,
+    ) -> Result<(), CoreError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT DISTINCT g.group_id FROM resource_claim_groups g JOIN resource_claims rc ON rc.group_id = g.group_id WHERE g.lifecycle = 'active' AND rc.lifecycle != 'active'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        for (group_id,) in &rows {
+            report.anomalies.push(ClaimAnomaly::IncompleteClaimGroup {
+                group_id: group_id.clone(),
+            });
+            // Auto-fix: expire the inconsistent group.
+            self.expire_group(group_id).await?;
+            report.expired.push(group_id.clone());
+        }
+        Ok(())
+    }
+
+    /// Detect active groups whose repository_identity does not match
+    /// the linked worktree's repository_identity.
+    async fn detect_repository_identity_mismatch(
+        &self,
+        report: &mut ReconciliationReport,
+    ) -> Result<(), CoreError> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT g.group_id FROM resource_claim_groups g JOIN worktrees w ON g.worktree_id = w.id WHERE g.lifecycle = 'active' AND g.worktree_id IS NOT NULL AND g.repository_identity != '' AND w.repository_identity != '' AND g.repository_identity != w.repository_identity",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        for (group_id,) in &rows {
+            report
+                .anomalies
+                .push(ClaimAnomaly::RepositoryIdentityMismatch {
+                    group_id: group_id.clone(),
+                });
+            // Report only — do not auto-fix. This may be a legitimate
+            // reconfiguration and expiring claims prematurely could disrupt
+            // active tasks.
         }
         Ok(())
     }

@@ -5,6 +5,13 @@
 //! - Fencing token equals the current worktree epoch.
 //! - Claim `expires_at` never exceeds the lease `expires_at`.
 //! - Old/stale fencing tokens cannot acquire, renew, replace, or release.
+//!
+//! The service computes the bounded `expires_at` timestamp and passes it
+//! to the repo. The repo does not compute its own TTL — all expiry
+//! decisions are made here, bounded by the lease validator.
+//!
+//! `lease_token` is validated by the service but never passed to the repo
+//! (only the `fencing_token` and `lease_id` go to the database).
 
 use std::sync::Arc;
 
@@ -34,7 +41,6 @@ pub struct ResourceClaimService {
     repo: ResourceClaimRepo,
     validator: Box<dyn ResourceClaimLeaseValidator + Send + Sync>,
     clock: Arc<dyn Clock + Send + Sync>,
-    #[allow(dead_code)]
     default_claim_duration_secs: u32,
 }
 
@@ -58,20 +64,28 @@ impl ResourceClaimService {
     }
 
     /// Acquire a claim group with lease/fencing validation.
+    ///
+    /// The claim's `expires_at` is bounded by the minimum of the requested
+    /// duration and the remaining lease lifetime. The service computes the
+    /// final `expires_at` timestamp and passes it to the repo.
     pub async fn acquire_group(
         &self,
         spec: &ClaimGroupSpec,
         guard: &ClaimGuard,
         idempotency_key: &str,
     ) -> Result<AcquireOutcome, CoreError> {
-        // 1. Validate lease.
+        // 1. Validate lease + fencing.
         self.validate_guard(guard).await?;
 
-        // 2. Bound claim expiry by lease expiry.
-        // (The repo uses a default TTL; the service cannot exceed the lease.)
+        // 2. Compute claim expiry bounded by lease expiry.
+        let expires_at = self
+            .compute_claim_expires_at(guard, self.default_claim_duration_secs)
+            .await?;
 
-        // 3. Delegate to repo.
-        self.repo.acquire_group(spec, guard, idempotency_key).await
+        // 3. Delegate to repo with explicit bounded expires_at.
+        self.repo
+            .acquire_group(spec, guard, idempotency_key, &expires_at)
+            .await
     }
 
     /// Get a claim group by ID.
@@ -106,20 +120,23 @@ impl ResourceClaimService {
     }
 
     /// Renew a claim group with lease/fencing validation.
+    ///
+    /// The new expiry is bounded by the lease expiry. The service computes
+    /// the final `expires_at` and passes it to the repo.
     pub async fn renew_group(
         &self,
         group_id: &str,
         guard: &ClaimGuard,
         duration_secs: u32,
     ) -> Result<(), CoreError> {
-        // 1. Validate lease.
+        // 1. Validate lease + fencing.
         self.validate_guard(guard).await?;
 
-        // 2. Bound by lease expiry.
-        let bounded = self.bound_duration(duration_secs, guard).await?;
+        // 2. Compute claim expiry bounded by lease expiry.
+        let expires_at = self.compute_claim_expires_at(guard, duration_secs).await?;
 
         // 3. Delegate to repo.
-        self.repo.renew_group(group_id, guard, bounded).await
+        self.repo.renew_group(group_id, guard, &expires_at).await
     }
 
     /// Release a claim group with lease/fencing validation.
@@ -129,7 +146,7 @@ impl ResourceClaimService {
         guard: &ClaimGuard,
         reason: &str,
     ) -> Result<(), CoreError> {
-        // 1. Validate lease.
+        // 1. Validate lease + fencing.
         self.validate_guard(guard).await?;
 
         // 2. Delegate to repo.
@@ -143,6 +160,8 @@ impl ResourceClaimService {
     }
 
     /// Replace a claim group atomically with lease/fencing validation.
+    ///
+    /// The new claim's expiry is bounded by the lease expiry.
     pub async fn replace_group(
         &self,
         old_group_id: &str,
@@ -150,12 +169,17 @@ impl ResourceClaimService {
         guard: &ClaimGuard,
         idempotency_key: &str,
     ) -> Result<AcquireOutcome, CoreError> {
-        // 1. Validate lease.
+        // 1. Validate lease + fencing.
         self.validate_guard(guard).await?;
 
-        // 2. Delegate to repo.
+        // 2. Compute claim expiry bounded by lease expiry.
+        let expires_at = self
+            .compute_claim_expires_at(guard, self.default_claim_duration_secs)
+            .await?;
+
+        // 3. Delegate to repo.
         self.repo
-            .replace_group(old_group_id, new_spec, guard, idempotency_key)
+            .replace_group(old_group_id, new_spec, guard, idempotency_key, &expires_at)
             .await
     }
 
@@ -177,12 +201,16 @@ impl ResourceClaimService {
             })
     }
 
-    /// Bound a requested duration by the remaining lease lifetime.
-    async fn bound_duration(
+    /// Compute the claim's `expires_at` timestamp, bounded by the lease expiry.
+    ///
+    /// Returns a SQL datetime string representing the earlier of:
+    /// - `now + requested_secs`
+    /// - the lease's `expires_at`
+    async fn compute_claim_expires_at(
         &self,
-        requested_secs: u32,
         guard: &ClaimGuard,
-    ) -> Result<u32, CoreError> {
+        requested_secs: u32,
+    ) -> Result<String, CoreError> {
         let lease_expires = self
             .validator
             .get_lease_expires_at(&guard.lease_id)
@@ -195,7 +223,6 @@ impl ResourceClaimService {
                 )
             })?;
 
-        // Parse lease expiry.
         let lease_dt = parse_sql_dt(&lease_expires).ok_or_else(|| {
             CoreError::new(
                 ErrorCode::PersistenceError,
@@ -205,9 +232,9 @@ impl ResourceClaimService {
         })?;
 
         let now = self.clock.now();
-        let remaining = lease_dt.signed_duration_since(now).num_seconds().max(0) as u32;
+        let remaining_secs = lease_dt.signed_duration_since(now).num_seconds().max(0) as u32;
 
-        if remaining == 0 {
+        if remaining_secs == 0 {
             return Err(CoreError::new(
                 ErrorCode::WorkspaceLeaseExpired,
                 "lease already expired",
@@ -215,7 +242,9 @@ impl ResourceClaimService {
             ));
         }
 
-        Ok(requested_secs.min(remaining))
+        let bounded_secs = requested_secs.min(remaining_secs);
+        let expires_dt = now + chrono::Duration::seconds(bounded_secs as i64);
+        Ok(expires_dt.format("%Y-%m-%d %H:%M:%S").to_string())
     }
 }
 
