@@ -11,6 +11,7 @@ pub mod scheduler;
 pub mod task;
 pub mod task_envelope;
 pub mod task_result;
+pub mod verification;
 pub mod workspace;
 
 pub use agent_adapter::{

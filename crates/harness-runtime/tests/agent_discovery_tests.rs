@@ -854,10 +854,11 @@ async fn test_49_table_count_18_business_tables() {
     // After migration 009 (agent_discovery), we should have 18 tables:
     // After migration 010 (scheduler), we should have 21 tables
     // After migration 011 (resource_handoff), we should have 22 tables
+    // After migration 012 (verification), we should have 27 tables
     assert_eq!(
         names.len(),
-        22,
-        "Expected 22 business tables (001–011), got {}: {:?}",
+        27,
+        "Expected 27 business tables (001–012), got {}: {:?}",
         names.len(),
         names
     );
@@ -868,6 +869,9 @@ async fn test_49_table_count_18_business_tables() {
     assert!(names.contains(&"scheduler_reservations"));
     assert!(names.contains(&"scheduler_reconciliations"));
     assert!(names.contains(&"resource_handoffs"));
+    assert!(names.contains(&"verification_plans"));
+    assert!(names.contains(&"verification_runs"));
+    assert!(names.contains(&"verification_evidence"));
 }
 
 #[tokio::test]
