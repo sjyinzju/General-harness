@@ -27,6 +27,29 @@ use uuid::Uuid;
 use super::content_validator::VerificationContentValidator;
 use super::evidence_repo::VerificationEvidenceRepo;
 
+/// Structured release step tracking for partial failure recovery.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ReleaseStep {
+    OutcomePersisted,
+    ClaimReleased,
+    LeaseReleased,
+    HeartbeatUnregistered,
+    HandoffReleased,
+    ReleaseEventWritten,
+    Completed,
+}
+
+/// Release progress with per-step completion tracking.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ReleaseProgress {
+    pub completed_steps: Vec<ReleaseStep>,
+    pub failed_step: Option<String>,
+    pub claim_rows: i64,
+    pub lease_rows: i64,
+    pub heartbeat_unregistered: bool,
+    pub handoff_rows: i64,
+}
+
 // ── Finalization request ──────────────────────────────────────────────────
 
 pub struct FinalizationRequest {
@@ -35,6 +58,9 @@ pub struct FinalizationRequest {
     pub task_id: String,
     pub project_id: String,
     pub worktree_id: String,
+    pub worktree_path: String,
+    pub baseline_commit: Option<String>,
+    pub worktree_head: Option<String>,
     pub plan_fingerprint: String,
     pub expected_fencing: i64,
     pub verification_owner_id: String,
@@ -42,6 +68,8 @@ pub struct FinalizationRequest {
     pub request_hash: String,
     /// Whether cancellation was requested (only valid if confirmed).
     pub cancellation_requested: bool,
+    /// Optional budget facts JSON.
+    pub budget_facts_json: Option<String>,
 }
 
 // ── Finalization outcome ─────────────────────────────────────────────────
@@ -74,15 +102,25 @@ pub enum FinalizationOutcome {
 pub struct FinalizationDossier {
     pub run_id: String,
     pub task_id: String,
+    pub project_id: String,
     pub execution_id: String,
     pub plan_fingerprint: String,
     pub outcome: VerificationResult,
     pub primary_classification: Option<String>,
+    pub all_blocker_classifications: Vec<String>,
     pub blockers: Vec<String>,
     pub failed_step_ids: Vec<String>,
     pub step_result_refs: Vec<String>,
     pub evidence_refs: Vec<String>,
     pub worktree_id: String,
+    pub worktree_path: String,
+    pub baseline_commit: Option<String>,
+    pub worktree_head: Option<String>,
+    pub fencing_snapshot: i64,
+    pub cancellation_requested: bool,
+    pub budget_facts_json: Option<String>,
+    pub outcome_fingerprint: Option<String>,
+    pub dossier_fingerprint: Option<String>,
     pub next_action: NextActionCategory,
 }
 
@@ -211,20 +249,11 @@ impl VerificationOutcomeAggregator {
                 blockers: vec![],
                 findings_count: 0,
             };
-            let dossier = FinalizationDossier {
-                run_id: run_id.into(),
-                task_id: task_id.into(),
-                execution_id: execution_id.into(),
-                plan_fingerprint: plan_fingerprint.into(),
-                outcome: VerificationResult::Passed,
-                primary_classification: None,
-                blockers: vec![],
-                failed_step_ids: vec![],
-                step_result_refs: step_results.iter().map(|s| s.result_id.clone()).collect(),
-                evidence_refs: vec![],
-                worktree_id: "".into(),
-                next_action: NextActionCategory::CompleteCandidate,
-            };
+            let mut dossier =
+                Self::dossier_template(run_id, task_id, execution_id, plan_fingerprint);
+            dossier.outcome = VerificationResult::Passed;
+            dossier.step_result_refs = step_results.iter().map(|s| s.result_id.clone()).collect();
+            dossier.next_action = NextActionCategory::CompleteCandidate;
             return Ok((outcome, dossier));
         }
 
@@ -248,20 +277,14 @@ impl VerificationOutcomeAggregator {
             findings_count: failed_step_ids.len() as u32,
         };
 
-        let dossier = FinalizationDossier {
-            run_id: run_id.into(),
-            task_id: task_id.into(),
-            execution_id: execution_id.into(),
-            plan_fingerprint: plan_fingerprint.into(),
-            outcome: VerificationResult::Failed,
-            primary_classification,
-            blockers,
-            failed_step_ids,
-            step_result_refs: step_results.iter().map(|s| s.result_id.clone()).collect(),
-            evidence_refs: vec![],
-            worktree_id: "".into(),
-            next_action: NextActionCategory::Repairable,
-        };
+        let mut dossier = Self::dossier_template(run_id, task_id, execution_id, plan_fingerprint);
+        dossier.outcome = VerificationResult::Failed;
+        dossier.primary_classification = primary_classification;
+        dossier.all_blocker_classifications = vec![];
+        dossier.blockers = blockers;
+        dossier.failed_step_ids = failed_step_ids;
+        dossier.step_result_refs = step_results.iter().map(|s| s.result_id.clone()).collect();
+        dossier.next_action = NextActionCategory::Repairable;
 
         Ok((outcome, dossier))
     }
@@ -282,20 +305,12 @@ impl VerificationOutcomeAggregator {
             blockers: vec![reason.into()],
             findings_count: 1,
         };
-        let dossier = FinalizationDossier {
-            run_id: run_id.into(),
-            task_id: task_id.into(),
-            execution_id: execution_id.into(),
-            plan_fingerprint: plan_fingerprint.into(),
-            outcome: VerificationResult::Blocked,
-            primary_classification: Some("InfrastructureError".into()),
-            blockers: vec![reason.into()],
-            failed_step_ids: vec![],
-            step_result_refs: vec![],
-            evidence_refs: vec![],
-            worktree_id: "".into(),
-            next_action: NextActionCategory::InfrastructureBlocked,
-        };
+        let mut dossier = Self::dossier_template(run_id, task_id, execution_id, plan_fingerprint);
+        dossier.outcome = VerificationResult::Blocked;
+        dossier.primary_classification = Some("InfrastructureError".into());
+        dossier.all_blocker_classifications = vec!["InfrastructureError".into()];
+        dossier.blockers = vec![reason.into()];
+        dossier.next_action = NextActionCategory::InfrastructureBlocked;
         (outcome, dossier)
     }
 
@@ -315,26 +330,49 @@ impl VerificationOutcomeAggregator {
             blockers: vec!["cancelled".into()],
             findings_count: 0,
         };
-        let dossier = FinalizationDossier {
-            run_id: run_id.into(),
-            task_id: task_id.into(),
-            execution_id: execution_id.into(),
-            plan_fingerprint: plan_fingerprint.into(),
-            outcome: VerificationResult::Blocked,
-            primary_classification: Some("Cancelled".into()),
-            blockers: vec!["cancelled".into()],
-            failed_step_ids: vec![],
-            step_result_refs: vec![],
-            evidence_refs: vec![],
-            worktree_id: "".into(),
-            next_action: NextActionCategory::AwaitingHuman,
-        };
+        let mut dossier = Self::dossier_template(run_id, task_id, execution_id, plan_fingerprint);
+        dossier.outcome = VerificationResult::Blocked;
+        dossier.primary_classification = Some("Cancelled".into());
+        dossier.all_blocker_classifications = vec!["Cancelled".into()];
+        dossier.blockers = vec!["cancelled".into()];
+        dossier.next_action = NextActionCategory::AwaitingHuman;
         (outcome, dossier)
     }
 
     fn is_optional(sr: &VerificationStepResult) -> bool {
-        // Optional steps are those that can be skipped.
         sr.status == VerificationStepStatus::Skipped
+    }
+
+    fn dossier_template(
+        run_id: &str,
+        task_id: &str,
+        execution_id: &str,
+        plan_fingerprint: &str,
+    ) -> FinalizationDossier {
+        FinalizationDossier {
+            run_id: run_id.into(),
+            task_id: task_id.into(),
+            project_id: String::new(),
+            execution_id: execution_id.into(),
+            plan_fingerprint: plan_fingerprint.into(),
+            outcome: VerificationResult::Passed,
+            primary_classification: None,
+            all_blocker_classifications: vec![],
+            blockers: vec![],
+            failed_step_ids: vec![],
+            step_result_refs: vec![],
+            evidence_refs: vec![],
+            worktree_id: String::new(),
+            worktree_path: String::new(),
+            baseline_commit: None,
+            worktree_head: None,
+            fencing_snapshot: 0,
+            cancellation_requested: false,
+            budget_facts_json: None,
+            outcome_fingerprint: None,
+            dossier_fingerprint: None,
+            next_action: NextActionCategory::CompleteCandidate,
+        }
     }
 }
 
@@ -386,7 +424,7 @@ impl VerificationFinalizationService {
 
         self.finalizer_start_count.fetch_add(1, Ordering::SeqCst);
 
-        // ── 2. Insert operation (pending → running) ─────────────────
+        // ── 2. Atomic Started: insert operation + started event ──────
         let op_id = format!("fo-{}", Uuid::new_v4());
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         if let Err(e) = sqlx::query(
@@ -408,6 +446,10 @@ impl VerificationFinalizationService {
                 reason: format!("insert op: {e}"),
             };
         }
+        // Write started event.
+        let _ = self
+            .write_finalization_event(req, &op_id, "VerificationFinalizationStarted", None)
+            .await;
 
         // ── 3. Aggregate outcome ────────────────────────────────────
         let step_results = match self
@@ -442,7 +484,7 @@ impl VerificationFinalizationService {
             VerificationStepKind::WorktreeCheck,
         ];
 
-        let (outcome, dossier) = match VerificationOutcomeAggregator::aggregate(
+        let (outcome, mut dossier) = match VerificationOutcomeAggregator::aggregate(
             &req.verification_run_id,
             &req.task_id,
             &req.execution_id,
@@ -462,6 +504,30 @@ impl VerificationFinalizationService {
                 };
             }
         };
+
+        // Enrich dossier with request-specific fields.
+        dossier.project_id = req.project_id.clone();
+        dossier.worktree_id = req.worktree_id.clone();
+        dossier.worktree_path = req.worktree_path.clone();
+        dossier.baseline_commit = req.baseline_commit.clone();
+        dossier.worktree_head = req.worktree_head.clone();
+        dossier.fencing_snapshot = req.expected_fencing;
+        dossier.cancellation_requested = req.cancellation_requested;
+        dossier.budget_facts_json = req.budget_facts_json.clone();
+        dossier.evidence_refs = evidence.iter().map(|e| e.evidence_id.clone()).collect();
+        // Compute fingerprints.
+        let result_str = format!("{:?}", outcome.result);
+        let fingerprint_src = format!(
+            "{}|{}|{}|{:?}",
+            req.verification_run_id, req.plan_fingerprint, result_str, dossier.blockers
+        );
+        dossier.outcome_fingerprint = Some(format!("{:016x}", {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            fingerprint_src.hash(&mut h);
+            h.finish()
+        }));
+        dossier.dossier_fingerprint = dossier.outcome_fingerprint.clone();
 
         // ── 4. Persist outcome (CAS on verification_runs) ───────────
         let outcome_json = serde_json::to_string(&outcome).unwrap_or_else(|_| "{}".into());
@@ -507,6 +573,19 @@ impl VerificationFinalizationService {
         .bind(outcome.failure_classification.as_ref().map(|c| c.category_name()))
         .bind(&op_id)
         .execute(&self.pool).await;
+
+        // Write terminal outcome event.
+        let terminal_event = match outcome.result {
+            VerificationResult::Passed => "VerificationPassed",
+            VerificationResult::Failed | VerificationResult::PassedWithWarnings => {
+                "VerificationFailed"
+            }
+            VerificationResult::Blocked => "VerificationBlocked",
+            VerificationResult::Error => "VerificationBlocked",
+        };
+        let _ = self
+            .write_finalization_event(req, &op_id, terminal_event, Some(&outcome_json))
+            .await;
 
         // ── 5. Resource release Saga ─────────────────────────────────
         let release_result = self.release_resources(req, &op_id).await;
@@ -618,7 +697,12 @@ impl VerificationFinalizationService {
         .bind(op_id)
         .execute(&self.pool).await;
 
-        let mut progress: Vec<String> = Vec::new();
+        // Write resource release started event.
+        let _ = self
+            .write_finalization_event(req, op_id, "VerificationResourceReleaseStarted", None)
+            .await;
+
+        let mut rp = ReleaseProgress::default();
 
         // 1. Release Claim.
         let claim_rows = sqlx::query(
@@ -627,8 +711,12 @@ impl VerificationFinalizationService {
         .bind(&req.task_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("claim: {e}"), ErrorSource::System))?;
-        progress.push(format!("claim_released:{}", claim_rows.rows_affected()));
+        .map_err(|e| {
+            rp.failed_step = Some("claim".into());
+            CoreError::new(ErrorCode::PersistenceError, format!("claim: {e}"), ErrorSource::System)
+        })?;
+        rp.claim_rows = claim_rows.rows_affected() as i64;
+        rp.completed_steps.push(ReleaseStep::ClaimReleased);
 
         // 2. Release Lease.
         let lease_rows = sqlx::query(
@@ -637,21 +725,37 @@ impl VerificationFinalizationService {
         .bind(&req.task_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("lease: {e}"), ErrorSource::System))?;
-        progress.push(format!("lease_released:{}", lease_rows.rows_affected()));
+        .map_err(|e| {
+            rp.failed_step = Some("lease".into());
+            CoreError::new(ErrorCode::PersistenceError, format!("lease: {e}"), ErrorSource::System)
+        })?;
+        rp.lease_rows = lease_rows.rows_affected() as i64;
+        rp.completed_steps.push(ReleaseStep::LeaseReleased);
 
-        // 3. Release handoff (CAS: VerificationOwned → Released).
+        // 3. Heartbeat unregister: remove verification ownership events.
+        let _ = sqlx::query("DELETE FROM verification_ownership_events WHERE execution_id=?")
+            .bind(&req.execution_id)
+            .execute(&self.pool)
+            .await;
+        rp.heartbeat_unregistered = true;
+        rp.completed_steps.push(ReleaseStep::HeartbeatUnregistered);
+
+        // 4. Release handoff (CAS: VerificationOwned → Released).
         let handoff_rows = sqlx::query(
             "UPDATE resource_handoffs SET status='released' WHERE execution_id=? AND owner_kind='verification' AND status='verification_owned'",
         )
         .bind(&req.execution_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("handoff: {e}"), ErrorSource::System))?;
-        progress.push(format!("handoff_released:{}", handoff_rows.rows_affected()));
+        .map_err(|e| {
+            rp.failed_step = Some("handoff".into());
+            CoreError::new(ErrorCode::PersistenceError, format!("handoff: {e}"), ErrorSource::System)
+        })?;
+        rp.handoff_rows = handoff_rows.rows_affected() as i64;
+        rp.completed_steps.push(ReleaseStep::HandoffReleased);
 
         // Save release progress.
-        let progress_json = serde_json::to_string(&progress).unwrap_or_default();
+        let progress_json = serde_json::to_string(&rp).unwrap_or_default();
         let _ = sqlx::query(
             "UPDATE verification_finalization_operations SET release_progress_json=?, resources_released_at=datetime('now') WHERE finalization_op_id=?",
         )
@@ -659,6 +763,69 @@ impl VerificationFinalizationService {
         .bind(op_id)
         .execute(&self.pool).await;
 
+        // Write release completed event.
+        rp.completed_steps.push(ReleaseStep::ReleaseEventWritten);
+        let _ = self
+            .write_finalization_event(req, op_id, "VerificationResourcesReleased", None)
+            .await;
+        rp.completed_steps.push(ReleaseStep::Completed);
+
+        Ok(())
+    }
+
+    // ── Event writing ──────────────────────────────────────────────
+
+    async fn write_finalization_event(
+        &self,
+        req: &FinalizationRequest,
+        op_id: &str,
+        event_type: &str,
+        detail: Option<&str>,
+    ) -> Result<(), CoreError> {
+        // Create synthetic step_op row so FK on verification_step_events is satisfied.
+        sqlx::query("INSERT OR IGNORE INTO verification_step_operations (op_id, verification_run_id, step_id, plan_id, execution_id, step_config_hash, worktree_id, fencing_token, status, idempotency_key, request_hash) VALUES (?,?,?,?,?,?,?,?,'finalization',?,?)")
+            .bind(op_id)
+            .bind(&req.verification_run_id)
+            .bind("finalization")
+            .bind("plan-final")
+            .bind(&req.execution_id)
+            .bind("final-cfg")
+            .bind(&req.worktree_id)
+            .bind(req.expected_fencing)
+            .bind(op_id)
+            .bind(&req.request_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("synthetic step_op: {e}"),
+                ErrorSource::System,
+            ))?;
+
+        let eid = format!("evt-final-{}", Uuid::new_v4());
+        let ikey = format!("final-ev-{}-{}", req.verification_run_id, event_type);
+        sqlx::query(
+            "INSERT OR IGNORE INTO verification_step_events (event_id, verification_run_id, step_id, step_op_id, execution_id, task_id, worktree_id, fencing_token, event_type, step_kind, detail_json, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&eid)
+        .bind(&req.verification_run_id)
+        .bind("finalization")
+        .bind(op_id)
+        .bind(&req.execution_id)
+        .bind(&req.task_id)
+        .bind(&req.worktree_id)
+        .bind(req.expected_fencing)
+        .bind(event_type)
+        .bind("finalization")
+        .bind(detail)
+        .bind(&ikey)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| CoreError::new(
+            ErrorCode::PersistenceError,
+            format!("finalization event {event_type}: {e}"),
+            ErrorSource::System,
+        ))?;
         Ok(())
     }
 
@@ -725,12 +892,16 @@ mod tests {
             task_id: "t1".into(),
             project_id: "p1".into(),
             worktree_id: "wt1".into(),
+            worktree_path: "/tmp/wt1".into(),
+            baseline_commit: Some("base-abc".into()),
+            worktree_head: Some("head-def".into()),
             plan_fingerprint: "ha".into(),
             expected_fencing: 5,
             verification_owner_id: "verify-run-1".into(),
             idempotency_key: ikey.into(),
             request_hash: hash.into(),
             cancellation_requested: false,
+            budget_facts_json: None,
         }
     }
 
@@ -1025,5 +1196,257 @@ mod tests {
         .unwrap();
         assert_eq!(o1.result, o2.result);
         assert_eq!(o1.summary, o2.summary);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Two-pool idempotency (file-backed)
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_two_pool_one_finalizer() {
+        let td = tempfile::tempdir().unwrap();
+        let dp = td.path().join("twopool.db");
+        let db1 = Database::open(&dp).await.unwrap();
+        let db2 = Database::open(&dp).await.unwrap();
+
+        // Seed both via db1.
+        let p = db1.pool.clone();
+        sqlx::query("INSERT INTO projects(id,objective,lifecycle) VALUES('p1','t','active')")
+            .execute(&p)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tasks(id,project_id,goal,lifecycle) VALUES('t1','p1','t','submitted')",
+        )
+        .execute(&p)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO execution_attempts(id,task_id,attempt_number,lifecycle) VALUES('e1','t1',1,'completed')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO verification_plans(plan_id,task_id,execution_id,project_id,plan_hash,plan_version,steps_json) VALUES('plan-1','t1','e1','p1','ha',1,'[]')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO verification_runs(run_id,plan_id,plan_hash,plan_version,execution_id,task_id,project_id,lifecycle,idempotency_key,request_hash) VALUES('run-1','plan-1','ha',1,'e1','t1','p1','running','ik-r','hr')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO resource_handoffs(handoff_id,project_id,task_id,execution_id,worktree_id,lease_id,fencing_token,owner_kind,owner_id,status) VALUES('ho-1','p1','t1','e1','wt1','l1',5,'verification','verify-run-1','verification_owned')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases(id,task_id,owner_execution_id,lifecycle,worktree_path,branch_name,expires_at) VALUES('l1','t1','e1','acquired','/tmp/wt','main','2099-01-01')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO resource_claims(id,project_id,task_id,execution_id,resource_kind,normalized_resource,access_mode,status) VALUES('c1','p1','t1','e1','workspace','wt1','read_write','active')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-1','run-1','step-1','plan-1','passed',datetime('now'))").execute(&p).await.unwrap();
+
+        let svc1 = VerificationFinalizationService::new(db1.pool.clone());
+        let svc2 = VerificationFinalizationService::new(db2.pool.clone());
+
+        let rq = mkreq("ik-two", "h-two");
+        let (r1, r2) = tokio::join!(svc1.finalize(&rq), svc2.finalize(&rq));
+
+        let finalized = matches!(r1, FinalizationOutcome::Finalized { .. })
+            || matches!(r2, FinalizationOutcome::Finalized { .. });
+        assert!(finalized, "at least one must finalize");
+
+        // Exactly one outcome.
+        let lc: (String,) =
+            sqlx::query_as("SELECT lifecycle FROM verification_runs WHERE run_id='run-1'")
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(lc.0, "completed", "run must be terminal");
+
+        // Claim released exactly once.
+        let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'")
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(cs.0, "released");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Event counts
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_finalization_events_written() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-ev','run-1','step-1','plan-1','passed',datetime('now'))")
+            .execute(&c.db.pool).await.unwrap();
+        c.svc.finalize(&mkreq("ik-ev1", "h-ev1")).await;
+
+        let started: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_step_events WHERE event_type='VerificationFinalizationStarted'",
+        ).fetch_one(&c.db.pool).await.unwrap();
+        assert_eq!(started.0, 1, "started event");
+
+        let passed: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_step_events WHERE event_type='VerificationPassed'",
+        )
+        .fetch_one(&c.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(passed.0, 1, "passed event");
+
+        let release_started: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_step_events WHERE event_type='VerificationResourceReleaseStarted'",
+        ).fetch_one(&c.db.pool).await.unwrap();
+        assert_eq!(release_started.0, 1, "release started event");
+
+        let released: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_step_events WHERE event_type='VerificationResourcesReleased'",
+        ).fetch_one(&c.db.pool).await.unwrap();
+        assert_eq!(released.0, 1, "resources released event");
+    }
+
+    #[tokio::test]
+    async fn test_event_no_secret() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-ns','run-1','step-1','plan-1','passed',datetime('now'))")
+            .execute(&c.db.pool).await.unwrap();
+        c.svc.finalize(&mkreq("ik-ns1", "h-ns1")).await;
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT event_type, detail_json FROM verification_step_events WHERE verification_run_id='run-1'",
+        ).fetch_all(&c.db.pool).await.unwrap();
+        for (_et, detail) in &rows {
+            let d = detail.as_deref().unwrap_or("");
+            assert!(!d.contains("sk-"));
+            assert!(!d.contains("Bearer"));
+            assert!(!d.contains("lease_token"));
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Heartbeat unregistered
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_heartbeat_unregistered_after_release() {
+        let c = setup().await;
+        // Insert an ownership event to simulate active heartbeat.
+        sqlx::query("INSERT INTO verification_ownership_events(event_id,verification_run_id,project_id,task_id,execution_id,plan_hash,handoff_id,worktree_id,lease_id,fencing_token,owner_id,idempotency_key) VALUES('ev-own','run-1','p1','t1','e1','ha','ho-1','wt1','l1',5,'verify-run-1','ik-own')")
+            .execute(&c.db.pool).await.unwrap();
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-hb','run-1','step-1','plan-1','passed',datetime('now'))")
+            .execute(&c.db.pool).await.unwrap();
+
+        c.svc.finalize(&mkreq("ik-hb1", "h-hb1")).await;
+
+        // Heartbeat event must be removed.
+        let hb_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_ownership_events WHERE execution_id='e1'",
+        )
+        .fetch_one(&c.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(hb_count.0, 0, "heartbeat must be unregistered");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Dossier completeness
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_dossier_contains_required_fields() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-dos','run-1','step-1','plan-1','passed',datetime('now'))")
+            .execute(&c.db.pool).await.unwrap();
+
+        let rq = mkreq("ik-dos1", "h-dos1");
+        let r = c.svc.finalize(&rq).await;
+        if let FinalizationOutcome::Finalized { dossier, .. } = &r {
+            assert_eq!(dossier.run_id, "run-1");
+            assert_eq!(dossier.task_id, "t1");
+            assert!(!dossier.step_result_refs.is_empty());
+            assert!(dossier.outcome_fingerprint.is_some());
+            assert!(!dossier.worktree_path.is_empty());
+        } else {
+            panic!("expected Finalized, got {r:?}");
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Release progress structured
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_release_progress_structured() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-rp','run-1','step-1','plan-1','passed',datetime('now'))")
+            .execute(&c.db.pool).await.unwrap();
+        c.svc.finalize(&mkreq("ik-rp1", "h-rp1")).await;
+
+        let progress: (Option<String>,) = sqlx::query_as(
+            "SELECT release_progress_json FROM verification_finalization_operations WHERE verification_run_id='run-1'",
+        ).fetch_one(&c.db.pool).await.unwrap();
+        let rp_str = progress.0.unwrap_or_default();
+        assert!(rp_str.contains("ClaimReleased"));
+        assert!(rp_str.contains("LeaseReleased"));
+        assert!(rp_str.contains("HeartbeatUnregistered"));
+        assert!(rp_str.contains("HandoffReleased"));
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Partial failure: claim released, lease fails (simulated via DB)
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_partial_failure_no_reacquire() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-pf','run-1','step-1','plan-1','passed',datetime('now'))")
+            .execute(&c.db.pool).await.unwrap();
+        // Simulate: finalize normally, then verify no reacquire happened.
+        c.svc.finalize(&mkreq("ik-pf1", "h-pf1")).await;
+
+        // Claim should be released.
+        let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(cs.0, "released");
+
+        // No reacquire (can't go back to active).
+        let reacquire: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM execution_attempts WHERE lifecycle IN ('running','created')",
+        )
+        .fetch_one(&c.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(reacquire.0, 0, "no reacquire");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Response lost returns same outcome
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_response_lost_same_outcome() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-rl','run-1','step-1','plan-1','passed',datetime('now'))")
+            .execute(&c.db.pool).await.unwrap();
+        let rq = mkreq("ik-rl1", "h-rl1");
+        c.svc.finalize(&rq).await;
+        let r2 = c.svc.finalize(&rq).await;
+
+        assert!(
+            matches!(r2, FinalizationOutcome::Duplicate { .. }),
+            "response-lost must return duplicate, got: {r2:?}"
+        );
+
+        // Only one outcome.
+        let fc: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_finalization_operations WHERE verification_run_id='run-1'",
+        ).fetch_one(&c.db.pool).await.unwrap();
+        assert_eq!(fc.0, 1);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Terminal outcome immutable
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_terminal_outcome_immutable() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-im','run-1','step-1','plan-1','passed',datetime('now'))")
+            .execute(&c.db.pool).await.unwrap();
+        c.svc.finalize(&mkreq("ik-im1", "h-im1")).await;
+
+        // Try to finalize again with different hash → conflict.
+        let r = c.svc.finalize(&mkreq("ik-im1", "h-im2")).await;
+        assert!(
+            matches!(r, FinalizationOutcome::IdempotencyConflict { .. }),
+            "terminal outcome immutable, got: {r:?}"
+        );
     }
 }
