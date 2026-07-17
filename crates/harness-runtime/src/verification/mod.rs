@@ -13,7 +13,7 @@ pub mod run_repo;
 pub use content_validator::VerificationContentValidator;
 pub use evidence_repo::VerificationEvidenceRepo;
 pub use execution_service::{
-    FakeProcessExecutor, ProcessExecutor, ProcessResult, RealProcessExecutor,
+    FakeProcessExecutor, ProcessExecutor, ProcessManagerAdapter, ProcessResult,
     StepExecutionOutcome, StepExecutionRequest, VerificationExecutionService,
 };
 pub use ownership_service::{

@@ -15,8 +15,12 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use super::content_validator::VerificationContentValidator;
+use crate::process::manager::ProcessManager;
+use crate::process::types::{
+    CapturePolicy, ProcessSpec, ProcessState, ProcessTermination, StdinMode,
+};
 
-// ── Simple process result ─────────────────────────────────────────────
+// ── Process result ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct ProcessResult {
@@ -25,6 +29,7 @@ pub struct ProcessResult {
     pub stdout_preview: Option<String>,
     pub stderr_preview: Option<String>,
     pub timed_out: bool,
+    pub terminated: bool,
 }
 
 // ── Step execution request ────────────────────────────────────────────
@@ -56,13 +61,30 @@ pub struct StepExecutionRequest {
 
 #[derive(Debug, Clone)]
 pub enum StepExecutionOutcome {
-    Completed { step_result: VerificationStepResult, exit_code: i32, duration_ms: u64 },
-    PolicyBlocked { reason: String },
-    WorkspaceDenied { reason: String },
-    OwnershipLost { reason: String },
-    InfrastructureError { reason: String },
-    Duplicate { existing_op_id: String },
-    IdempotencyConflict { existing_hash: String, new_hash: String },
+    Completed {
+        step_result: VerificationStepResult,
+        exit_code: i32,
+        duration_ms: u64,
+    },
+    PolicyBlocked {
+        reason: String,
+    },
+    WorkspaceDenied {
+        reason: String,
+    },
+    OwnershipLost {
+        reason: String,
+    },
+    InfrastructureError {
+        reason: String,
+    },
+    Duplicate {
+        existing_op_id: String,
+    },
+    IdempotencyConflict {
+        existing_hash: String,
+        new_hash: String,
+    },
 }
 
 // ── Process executor trait (testable) ─────────────────────────────────
@@ -70,46 +92,95 @@ pub enum StepExecutionOutcome {
 /// Runs a command and returns the result. Test fakes track start counts.
 #[async_trait::async_trait]
 pub trait ProcessExecutor: Send + Sync {
-    async fn execute(&self, executable: &Path, args: &[String], cwd: &Path,
-        env: &HashMap<String, String>, timeout: Duration) -> ProcessResult;
+    async fn execute(
+        &self,
+        executable: &Path,
+        args: &[String],
+        cwd: &Path,
+        env: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> ProcessResult;
 }
 
-// ── Real executor via OS Command ──────────────────────────────────────
+// ── ProcessManager adapter (production only path) ─────────────────────
 
-pub struct RealProcessExecutor;
+/// Routes ALL verification process execution through ProcessManager.
+/// Never calls std::process::Command or tokio::process::Command directly.
+pub struct ProcessManagerAdapter {
+    manager: Arc<ProcessManager>,
+}
+
+impl ProcessManagerAdapter {
+    pub fn new(manager: Arc<ProcessManager>) -> Self {
+        Self { manager }
+    }
+}
 
 #[async_trait::async_trait]
-impl ProcessExecutor for RealProcessExecutor {
-    async fn execute(&self, executable: &Path, args: &[String], cwd: &Path,
-        _env: &HashMap<String, String>, timeout: Duration) -> ProcessResult {
-        use tokio::time::timeout as tokio_timeout;
-        let start = std::time::Instant::now();
-        let result = tokio_timeout(timeout, async {
-            let output = tokio::process::Command::new(executable)
-                .args(args).current_dir(cwd)
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .output().await
-                .unwrap_or_else(|e| std::process::Output {
-                    status: std::process::ExitStatus::default(),
-                    stdout: format!("spawn error: {e}").into_bytes(),
-                    stderr: vec![],
-                });
-            output
-        }).await;
+impl ProcessExecutor for ProcessManagerAdapter {
+    async fn execute(
+        &self,
+        executable: &Path,
+        args: &[String],
+        cwd: &Path,
+        env: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> ProcessResult {
+        let spec = ProcessSpec {
+            executable: executable.to_path_buf(),
+            args: args.to_vec(),
+            working_directory: cwd.to_path_buf(),
+            env_overrides: env.clone(),
+            env_removals: vec![],
+            stdin_mode: StdinMode::Closed,
+            timeout,
+            graceful_shutdown_timeout: Duration::from_secs(2),
+            stdout_capture: CapturePolicy::Spool { max_memory_bytes: 4096 },
+            stderr_capture: CapturePolicy::Spool { max_memory_bytes: 4096 },
+            output_byte_limit: 64 * 1024,
+            spool_dir: Some(std::env::temp_dir().join(format!("harness-vrfy-{}", uuid::Uuid::new_v4()))),
+            known_secrets: vec![],
+            allowed_env_var_names: env.keys().cloned().collect(),
+            execution_id: format!("vrfy-{}", uuid::Uuid::new_v4()),
+            runtime_profile_id: "verification".into(),
+        };
 
-        let duration_ms = start.elapsed().as_millis() as u64;
-        match result {
-            Ok(output) => ProcessResult {
-                exit_code: output.status.code().unwrap_or(-1),
-                duration_ms,
-                stdout_preview: Some(String::from_utf8_lossy(&output.stdout).chars().take(512).collect()),
-                stderr_preview: Some(String::from_utf8_lossy(&output.stderr).chars().take(512).collect()),
-                timed_out: false,
+        let start = std::time::Instant::now();
+        let handle = match self.manager.spawn(&spec).await {
+            Ok(h) => h,
+            Err(_) => return ProcessResult {
+                exit_code: -1, duration_ms: 0, stdout_preview: None,
+                stderr_preview: None, timed_out: false, terminated: false,
             },
-            Err(_) => ProcessResult {
-                exit_code: -1, duration_ms, stdout_preview: None, stderr_preview: None, timed_out: true,
-            },
+        };
+
+        // Poll until terminal.
+        loop {
+            let state = handle.state.read().await.clone();
+            match state {
+                ProcessState::Completed { outcome } => {
+                    let duration_ms = start.elapsed().as_millis() as u64;
+                    let timed_out = outcome.termination == ProcessTermination::Timeout;
+                    return ProcessResult {
+                        exit_code: outcome.exit_code.unwrap_or(-1),
+                        duration_ms,
+                        stdout_preview: outcome.stdout_preview,
+                        stderr_preview: outcome.stderr_preview,
+                        timed_out,
+                        terminated: true,
+                    };
+                }
+                ProcessState::Starting | ProcessState::Running => {
+                    if start.elapsed() > timeout + Duration::from_secs(5) {
+                        return ProcessResult {
+                            exit_code: -1, duration_ms: timeout.as_millis() as u64,
+                            stdout_preview: None, stderr_preview: None,
+                            timed_out: true, terminated: false,
+                        };
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            }
         }
     }
 }
@@ -140,26 +211,47 @@ impl FakeProcessExecutor {
 
 #[async_trait::async_trait]
 impl ProcessExecutor for FakeProcessExecutor {
-    async fn execute(&self, _executable: &Path, _args: &[String], _cwd: &Path,
-        _env: &HashMap<String, String>, timeout: Duration) -> ProcessResult {
+    async fn execute(
+        &self,
+        _executable: &Path,
+        _args: &[String],
+        _cwd: &Path,
+        _env: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> ProcessResult {
         self.start_count.fetch_add(1, Ordering::SeqCst);
 
         if self.fail_spawn.load(Ordering::SeqCst) {
-            return ProcessResult { exit_code: -1, duration_ms: 0, stdout_preview: None, stderr_preview: None, timed_out: false };
+            return ProcessResult {
+                exit_code: -1, duration_ms: 0, stdout_preview: None,
+                stderr_preview: None, timed_out: false, terminated: false,
+            };
         }
 
         if self.hang_forever.load(Ordering::SeqCst) {
             tokio::time::sleep(timeout + Duration::from_millis(100)).await;
-            return ProcessResult { exit_code: -1, duration_ms: timeout.as_millis() as u64, stdout_preview: None, stderr_preview: None, timed_out: true };
+            return ProcessResult {
+                exit_code: -1, duration_ms: timeout.as_millis() as u64,
+                stdout_preview: None, stderr_preview: None,
+                timed_out: true, terminated: false,
+            };
         }
 
         let ec = *self.exit_code.lock().unwrap();
         let stdout = self.stdout_text.lock().unwrap().clone();
         let stderr = self.stderr_text.lock().unwrap().clone();
         ProcessResult {
-            exit_code: ec, duration_ms: 10,
-            stdout_preview: if stdout.is_empty() { None } else { Some(stdout) },
-            stderr_preview: if stderr.is_empty() { None } else { Some(stderr) },
+            exit_code: ec, duration_ms: 10, terminated: true,
+            stdout_preview: if stdout.is_empty() {
+                None
+            } else {
+                Some(stdout)
+            },
+            stderr_preview: if stderr.is_empty() {
+                None
+            } else {
+                Some(stderr)
+            },
             timed_out: false,
         }
     }
@@ -189,7 +281,10 @@ impl VerificationExecutionService {
             if existing_hash == req.request_hash {
                 return StepExecutionOutcome::Duplicate { existing_op_id };
             }
-            return StepExecutionOutcome::IdempotencyConflict { existing_hash, new_hash: req.request_hash.clone() };
+            return StepExecutionOutcome::IdempotencyConflict {
+                existing_hash,
+                new_hash: req.request_hash.clone(),
+            };
         }
 
         // ── 1. Ownership consistency ──────────────────────────────
@@ -210,7 +305,9 @@ impl VerificationExecutionService {
         // ── 4. Record step operation ──────────────────────────────
         let op_id = format!("step-op-{}", Uuid::new_v4());
         if let Err(e) = self.insert_step_op(&op_id, req).await {
-            return StepExecutionOutcome::InfrastructureError { reason: format!("insert step op: {e}") };
+            return StepExecutionOutcome::InfrastructureError {
+                reason: format!("insert step op: {e}"),
+            };
         }
 
         // ── 5. Transition to Running ──────────────────────────────
@@ -219,22 +316,33 @@ impl VerificationExecutionService {
         ).bind(&op_id).execute(&self.pool).await;
 
         // ── 6. Execute ────────────────────────────────────────────
-        let result = self.executor.execute(
-            &req.executable, &req.args, &req.working_directory,
-            &req.env_overrides, req.timeout,
-        ).await;
+        let result = self
+            .executor
+            .execute(
+                &req.executable,
+                &req.args,
+                &req.working_directory,
+                &req.env_overrides,
+                req.timeout,
+            )
+            .await;
 
         let duration_ms = result.duration_ms;
         let exit_code = result.exit_code;
 
         // ── 7. Classify ───────────────────────────────────────────
-        let (status, _classification) = classify(exit_code, &req.step_kind, result.timed_out, req.timeout);
+        let (status, _classification) =
+            classify(exit_code, &req.step_kind, result.timed_out, req.timeout);
 
         // ── 8. Validate output (no secrets) ───────────────────────
         if let Some(ref stdout) = result.stdout_preview {
             if VerificationContentValidator::validate_text(stdout).is_err() {
-                let _ = self.mark_step_terminal(&op_id, "validation_failed", "secret in stdout").await;
-                return StepExecutionOutcome::InfrastructureError { reason: "output contained secrets".into() };
+                let _ = self
+                    .mark_step_terminal(&op_id, "validation_failed", "secret in stdout")
+                    .await;
+                return StepExecutionOutcome::InfrastructureError {
+                    reason: "output contained secrets".into(),
+                };
             }
         }
 
@@ -246,10 +354,17 @@ impl VerificationExecutionService {
             step_id: req.step_id.clone(),
             plan_id: req.plan_id.clone(),
             status: status.clone(),
-            detail_json: Some(serde_json::json!({"exit_code": exit_code, "duration_ms": duration_ms}).to_string()),
-            started_at: None, completed_at: None,
+            detail_json: Some(
+                serde_json::json!({"exit_code": exit_code, "duration_ms": duration_ms}).to_string(),
+            ),
+            started_at: None,
+            completed_at: None,
             duration_ms: Some(duration_ms),
-            error_message: if exit_code != 0 { Some(format!("exit {exit_code}")) } else { None },
+            error_message: if exit_code != 0 {
+                Some(format!("exit {exit_code}"))
+            } else {
+                None
+            },
         };
 
         let status_str = status_to_str(&status);
@@ -260,22 +375,34 @@ impl VerificationExecutionService {
         .bind(status_str).bind(exit_code).bind(duration_ms as i64).bind(&outcome_json).bind(&op_id)
         .execute(&self.pool).await;
 
-        StepExecutionOutcome::Completed { step_result, exit_code, duration_ms }
+        StepExecutionOutcome::Completed {
+            step_result,
+            exit_code,
+            duration_ms,
+        }
     }
 
     async fn check_ownership(&self, req: &StepExecutionRequest) -> Option<StepExecutionOutcome> {
-        let lc_row: Option<(String,)> = sqlx::query_as(
-            "SELECT lifecycle FROM verification_runs WHERE run_id = ?",
-        ).bind(&req.verification_run_id).fetch_optional(&self.pool).await.ok().flatten();
+        let lc_row: Option<(String,)> =
+            sqlx::query_as("SELECT lifecycle FROM verification_runs WHERE run_id = ?")
+                .bind(&req.verification_run_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
 
         match lc_row {
-            Some((lc,)) if lc == "running" => {},
-            Some((lc,)) => return Some(StepExecutionOutcome::OwnershipLost {
-                reason: format!("run lifecycle is '{lc}'"),
-            }),
-            None => return Some(StepExecutionOutcome::OwnershipLost {
-                reason: "run not found".into(),
-            }),
+            Some((lc,)) if lc == "running" => {}
+            Some((lc,)) => {
+                return Some(StepExecutionOutcome::OwnershipLost {
+                    reason: format!("run lifecycle is '{lc}'"),
+                })
+            }
+            None => {
+                return Some(StepExecutionOutcome::OwnershipLost {
+                    reason: "run not found".into(),
+                })
+            }
         }
 
         let owner_row: Option<(String, String, i64)> = sqlx::query_as(
@@ -295,29 +422,41 @@ impl VerificationExecutionService {
                     });
                 }
             }
-            None => return Some(StepExecutionOutcome::OwnershipLost {
-                reason: "handoff not found".into(),
-            }),
+            None => {
+                return Some(StepExecutionOutcome::OwnershipLost {
+                    reason: "handoff not found".into(),
+                })
+            }
         }
         None
     }
 
     fn validate_workspace(&self, cwd: &Path, wt_root: &Path) -> Option<StepExecutionOutcome> {
         if cwd.to_string_lossy().contains("..") {
-            return Some(StepExecutionOutcome::WorkspaceDenied { reason: ".. traversal".into() });
+            return Some(StepExecutionOutcome::WorkspaceDenied {
+                reason: ".. traversal".into(),
+            });
         }
         let cwd_canon = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
         let wt_canon = std::fs::canonicalize(wt_root).unwrap_or_else(|_| wt_root.to_path_buf());
         if !cwd_canon.starts_with(&wt_canon) {
-            return Some(StepExecutionOutcome::WorkspaceDenied { reason: "cwd outside worktree".into() });
+            return Some(StepExecutionOutcome::WorkspaceDenied {
+                reason: "cwd outside worktree".into(),
+            });
         }
         if !cwd_canon.exists() {
-            return Some(StepExecutionOutcome::WorkspaceDenied { reason: "cwd missing".into() });
+            return Some(StepExecutionOutcome::WorkspaceDenied {
+                reason: "cwd missing".into(),
+            });
         }
         None
     }
 
-    async fn insert_step_op(&self, op_id: &str, req: &StepExecutionRequest) -> Result<(), CoreError> {
+    async fn insert_step_op(
+        &self,
+        op_id: &str,
+        req: &StepExecutionRequest,
+    ) -> Result<(), CoreError> {
         let cfg_hash = {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -336,7 +475,12 @@ impl VerificationExecutionService {
         Ok(())
     }
 
-    async fn mark_step_terminal(&self, op_id: &str, status: &str, reason: &str) -> Result<(), CoreError> {
+    async fn mark_step_terminal(
+        &self,
+        op_id: &str,
+        status: &str,
+        reason: &str,
+    ) -> Result<(), CoreError> {
         sqlx::query("UPDATE verification_step_operations SET status=?, outcome_json=?, completed_at=datetime('now') WHERE op_id=?")
             .bind(status).bind(reason).bind(op_id).execute(&self.pool).await
             .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("mark step: {e}"), ErrorSource::System))?;
@@ -348,13 +492,26 @@ impl VerificationExecutionService {
 
 fn evaluate_policy(exe: &Path, args: &[String]) -> Option<StepExecutionOutcome> {
     let lower = exe.to_string_lossy().to_lowercase();
-    if lower.contains("cmd.exe") || lower.contains("powershell") || lower.contains("bash") || lower.contains("sh") {
-        return Some(StepExecutionOutcome::PolicyBlocked { reason: "shell denied by default".into() });
+    if lower.contains("cmd.exe")
+        || lower.contains("powershell")
+        || lower.contains("bash")
+        || lower.contains("sh")
+    {
+        return Some(StepExecutionOutcome::PolicyBlocked {
+            reason: "shell denied by default".into(),
+        });
     }
     for a in args {
         let al = a.to_lowercase();
-        if al.contains("&&") || al.contains("||") || al.contains(";") || al.contains("`") || al.contains("$(") {
-            return Some(StepExecutionOutcome::PolicyBlocked { reason: format!("metachar in arg: {a}") });
+        if al.contains("&&")
+            || al.contains("||")
+            || al.contains(";")
+            || al.contains("`")
+            || al.contains("$(")
+        {
+            return Some(StepExecutionOutcome::PolicyBlocked {
+                reason: format!("metachar in arg: {a}"),
+            });
         }
     }
     None
@@ -362,18 +519,32 @@ fn evaluate_policy(exe: &Path, args: &[String]) -> Option<StepExecutionOutcome> 
 
 // ── Classification ────────────────────────────────────────────────────
 
-fn classify(exit_code: i32, kind: &VerificationStepKind, timed_out: bool, timeout: Duration) -> (VerificationStepStatus, Option<FailureClassification>) {
+fn classify(
+    exit_code: i32,
+    kind: &VerificationStepKind,
+    timed_out: bool,
+    timeout: Duration,
+) -> (VerificationStepStatus, Option<FailureClassification>) {
     if timed_out {
-        return (VerificationStepStatus::Failed, Some(FailureClassification::TimeoutExpired { duration_ms: timeout.as_millis() as u64 }));
+        return (
+            VerificationStepStatus::Failed,
+            Some(FailureClassification::TimeoutExpired {
+                duration_ms: timeout.as_millis() as u64,
+            }),
+        );
     }
     if exit_code == 0 {
         return (VerificationStepStatus::Passed, None);
     }
     let fc = match kind {
         VerificationStepKind::AcceptanceCheck | VerificationStepKind::CustomCheck => {
-            FailureClassification::AcceptanceTestFailure { failed_checks: vec![format!("exit={exit_code}")] }
+            FailureClassification::AcceptanceTestFailure {
+                failed_checks: vec![format!("exit={exit_code}")],
+            }
         }
-        _ => FailureClassification::InfrastructureError { reason: format!("exit={exit_code}") },
+        _ => FailureClassification::InfrastructureError {
+            reason: format!("exit={exit_code}"),
+        },
     };
     (VerificationStepStatus::Failed, Some(fc))
 }
@@ -413,7 +584,12 @@ mod tests {
         let pool = db.pool.clone();
 
         // Seed prerequisite data.
-        sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')").execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES ('t1','p1','test','submitted')").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'completed')").execute(&pool).await.unwrap();
         // Verification run — Running (ownership already taken).
@@ -429,21 +605,39 @@ mod tests {
         let executor = Arc::new(FakeProcessExecutor::new(start_count.clone()));
         let svc = VerificationExecutionService::new(pool, executor.clone());
 
-        TestCtx { svc, db, executor, start_count, worktree_dir: wt_dir, _td: td, db_dir }
+        TestCtx {
+            svc,
+            db,
+            executor,
+            start_count,
+            worktree_dir: wt_dir,
+            _td: td,
+            db_dir,
+        }
     }
 
     fn make_req(ctx: &TestCtx, ikey: &str, hash: &str) -> StepExecutionRequest {
         StepExecutionRequest {
-            verification_run_id: "run-1".into(), step_id: "step-1".into(), plan_id: "plan-1".into(),
-            execution_id: "e1".into(), task_id: "t1".into(), worktree_id: "wt1".into(),
+            verification_run_id: "run-1".into(),
+            step_id: "step-1".into(),
+            plan_id: "plan-1".into(),
+            execution_id: "e1".into(),
+            task_id: "t1".into(),
+            worktree_id: "wt1".into(),
             worktree_path: ctx.worktree_dir.path().to_path_buf(),
-            expected_fencing: 5, verification_owner_id: "verify-run-1".into(),
-            idempotency_key: ikey.into(), request_hash: hash.into(),
-            executable: PathBuf::from("test-exe"), args: vec!["--check".into()],
+            expected_fencing: 5,
+            verification_owner_id: "verify-run-1".into(),
+            idempotency_key: ikey.into(),
+            request_hash: hash.into(),
+            executable: PathBuf::from("test-exe"),
+            args: vec!["--check".into()],
             working_directory: ctx.worktree_dir.path().to_path_buf(),
-            timeout: Duration::from_secs(5), allowed_env_var_names: vec![],
+            timeout: Duration::from_secs(5),
+            allowed_env_var_names: vec![],
             env_overrides: HashMap::new(),
-            step_kind: VerificationStepKind::AcceptanceCheck, required: true, sequence_index: 0,
+            step_kind: VerificationStepKind::AcceptanceCheck,
+            required: true,
+            sequence_index: 0,
         }
     }
 
@@ -466,7 +660,10 @@ mod tests {
         let req = make_req(&ctx, "ikey-fail", "hash-fail");
 
         let result = ctx.svc.execute_step(&req).await;
-        assert!(matches!(result, StepExecutionOutcome::Completed { exit_code: 1, .. }));
+        assert!(matches!(
+            result,
+            StepExecutionOutcome::Completed { exit_code: 1, .. }
+        ));
         assert_eq!(ctx.start_count.load(Ordering::SeqCst), 1);
     }
 
@@ -476,7 +673,9 @@ mod tests {
         let ctx = setup().await;
         // Change run lifecycle to something other than running.
         sqlx::query("UPDATE verification_runs SET lifecycle='created' WHERE run_id='run-1'")
-            .execute(&ctx.db.pool).await.unwrap();
+            .execute(&ctx.db.pool)
+            .await
+            .unwrap();
         let req = make_req(&ctx, "ikey-own1", "hash-own1");
 
         let result = ctx.svc.execute_step(&req).await;
@@ -514,7 +713,10 @@ mod tests {
         req.working_directory = std::env::temp_dir(); // outside worktree
 
         let result = ctx.svc.execute_step(&req).await;
-        assert!(matches!(result, StepExecutionOutcome::WorkspaceDenied { .. }));
+        assert!(matches!(
+            result,
+            StepExecutionOutcome::WorkspaceDenied { .. }
+        ));
         assert_eq!(ctx.start_count.load(Ordering::SeqCst), 0);
     }
 
@@ -525,7 +727,10 @@ mod tests {
         req.working_directory = ctx.worktree_dir.path().join("..");
 
         let result = ctx.svc.execute_step(&req).await;
-        assert!(matches!(result, StepExecutionOutcome::WorkspaceDenied { .. }));
+        assert!(matches!(
+            result,
+            StepExecutionOutcome::WorkspaceDenied { .. }
+        ));
         assert_eq!(ctx.start_count.load(Ordering::SeqCst), 0);
     }
 
@@ -565,8 +770,11 @@ mod tests {
         // Same request — must return Duplicate, NOT start another process.
         let r2 = ctx.svc.execute_step(&req).await;
         assert!(matches!(r2, StepExecutionOutcome::Duplicate { .. }));
-        assert_eq!(ctx.start_count.load(Ordering::SeqCst), 1,
-            "response-lost must NOT restart process");
+        assert_eq!(
+            ctx.start_count.load(Ordering::SeqCst),
+            1,
+            "response-lost must NOT restart process"
+        );
     }
 
     #[tokio::test]
@@ -577,7 +785,10 @@ mod tests {
 
         let req2 = make_req(&ctx, "ikey-conflict", "hash-bbb");
         let result = ctx.svc.execute_step(&req2).await;
-        assert!(matches!(result, StepExecutionOutcome::IdempotencyConflict { .. }));
+        assert!(matches!(
+            result,
+            StepExecutionOutcome::IdempotencyConflict { .. }
+        ));
     }
 
     // ── File-backed two-pool concurrency: exactly one process ───────
@@ -590,10 +801,16 @@ mod tests {
         // Second independent pool to the same file.
         let db_path = ctx.db_dir.join("exec.db");
         let opts2 = SqliteConnectOptions::from_str(&db_path.to_string_lossy())
-            .unwrap().create_if_missing(false).foreign_keys(true)
+            .unwrap()
+            .create_if_missing(false)
+            .foreign_keys(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .busy_timeout(Duration::from_secs(30));
-        let pool2 = SqlitePoolOptions::new().max_connections(5).connect_with(opts2).await.unwrap();
+        let pool2 = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(opts2)
+            .await
+            .unwrap();
 
         let start_count2 = Arc::new(AtomicUsize::new(0));
         let exec2 = Arc::new(FakeProcessExecutor::new(start_count2.clone()));
@@ -601,17 +818,18 @@ mod tests {
 
         let req = make_req(&ctx, "ikey-conc", "hash-conc");
 
-        let (r1, r2) = tokio::join!(
-            ctx.svc.execute_step(&req),
-            svc2.execute_step(&req)
-        );
+        let (r1, r2) = tokio::join!(ctx.svc.execute_step(&req), svc2.execute_step(&req));
 
         let has_completed = matches!(r1, StepExecutionOutcome::Completed { .. })
             || matches!(r2, StepExecutionOutcome::Completed { .. });
         assert!(has_completed, "one must complete");
 
-        let total_starts = ctx.start_count.load(Ordering::SeqCst) + start_count2.load(Ordering::SeqCst);
-        assert_eq!(total_starts, 1, "only one process must start; two starts = split-brain");
+        let total_starts =
+            ctx.start_count.load(Ordering::SeqCst) + start_count2.load(Ordering::SeqCst);
+        assert_eq!(
+            total_starts, 1,
+            "only one process must start; two starts = split-brain"
+        );
     }
 
     // ── Timeout ─────────────────────────────────────────────────────
@@ -636,11 +854,17 @@ mod tests {
         ctx.svc.execute_step(&req).await;
 
         // No new execution created.
-        let execs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM execution_attempts").fetch_one(&ctx.db.pool).await.unwrap();
+        let execs: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM execution_attempts")
+            .fetch_one(&ctx.db.pool)
+            .await
+            .unwrap();
         assert_eq!(execs.0, 1);
 
         // No task lifecycle change.
-        let task_lc: (String,) = sqlx::query_as("SELECT lifecycle FROM tasks WHERE id='t1'").fetch_one(&ctx.db.pool).await.unwrap();
+        let task_lc: (String,) = sqlx::query_as("SELECT lifecycle FROM tasks WHERE id='t1'")
+            .fetch_one(&ctx.db.pool)
+            .await
+            .unwrap();
         assert_eq!(task_lc.0, "submitted");
 
         // Lease and Claim remain — not checked here but no release code exists.
@@ -654,6 +878,9 @@ mod tests {
         let req = make_req(&ctx, "ikey-sec", "hash-sec");
 
         let result = ctx.svc.execute_step(&req).await;
-        assert!(matches!(result, StepExecutionOutcome::InfrastructureError { .. }));
+        assert!(matches!(
+            result,
+            StepExecutionOutcome::InfrastructureError { .. }
+        ));
     }
 }

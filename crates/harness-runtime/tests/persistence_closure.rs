@@ -72,7 +72,7 @@ async fn table_count_10_business_tables() {
     assert_eq!(
         names.len(),
         27,
-        "Expected 30 business tables (001–013), got: {names:?}"
+        "Expected 31 business tables (001–014), got: {names:?}"
     );
     assert_eq!(
         names,
@@ -102,6 +102,7 @@ async fn table_count_10_business_tables() {
             "verification_ownership_events",
             "verification_plans",
             "verification_runs",
+            "verification_step_events",
             "verification_step_operations",
             "verification_step_processes",
             "verification_step_results",
