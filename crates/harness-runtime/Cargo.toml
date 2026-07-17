@@ -20,6 +20,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 async-trait = "0.1"
 unicode-normalization = "0.1"
+regex = "1"
+log = "0.4"
 
 [target.'cfg(windows)'.dependencies]
 # Already in the dependency tree transitively (tokio/sqlx); direct use for the
