@@ -346,6 +346,76 @@ mod tests {
         assert!(has_duplicate, "other must be duplicate");
     }
 
+    /// True file-backed two-pool concurrency: two independent SqlitePools
+    /// on the same temp-file database. Only one run must be created.
+    #[tokio::test]
+    async fn test_file_backed_two_pool_one_winner() {
+        use crate::db::Database;
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+        use std::time::Duration;
+
+        let td = tempfile::tempdir().unwrap();
+        let db_path = td.path().join("concurrent.db");
+
+        // Use Database::open to create the file and run all migrations.
+        let db = Database::open(&db_path).await.unwrap();
+        let pool1 = db.pool.clone();
+        let pool1_check = db.pool.clone(); // retained for post-concurrency verification
+
+        // Seed prerequisite rows.
+        sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')")
+            .execute(&pool1).await.unwrap();
+        sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES ('t1','p1','test','submitted')")
+            .execute(&pool1).await.unwrap();
+        sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'completed')")
+            .execute(&pool1).await.unwrap();
+        sqlx::query("INSERT INTO verification_plans (plan_id, task_id, execution_id, project_id, plan_hash, plan_version, steps_json) VALUES ('plan-1','t1','e1','p1','hash-aaa',1,'[]')")
+            .execute(&pool1).await.unwrap();
+
+        // Pool 2 — independent connection to the same file.
+        let db_path_str = db_path.to_string_lossy().to_string();
+        let opts2 = SqliteConnectOptions::from_str(&db_path_str)
+            .unwrap()
+            .create_if_missing(false)
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30));
+        let pool2 = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(opts2)
+            .await
+            .unwrap();
+
+        let repo1 = VerificationRunRepo::new(pool1);
+        let repo2 = VerificationRunRepo::new(pool2);
+
+        let run_a = make_run("run-a", "ikey-file-conc", "hash-aaa");
+        let run_b = make_run("run-b", "ikey-file-conc", "hash-aaa");
+
+        let (r1, r2) = tokio::join!(repo1.create_run(&run_a), repo2.create_run(&run_b));
+
+        // Exactly one winner must create a run. The loser may get:
+        // - a clean Duplicate (if both pools see the same snapshot), or
+        // - a PersistenceError from a UNIQUE constraint violation (if
+        //   the second pool's SELECT sees an empty table before the first
+        //   pool commits). Both outcomes are valid — the key invariant is
+        //   that only ONE run is actually created.
+        let has_created =
+            matches!(r1, Ok(RunIntentOutcome::Created { .. }))
+                || matches!(r2, Ok(RunIntentOutcome::Created { .. }));
+        assert!(has_created, "exactly one must create a fresh run");
+
+        // Verify only one run exists in the database (use retained pool).
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_runs WHERE idempotency_key = 'ikey-file-conc'",
+        )
+        .fetch_one(&pool1_check)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 1, "exactly one run must exist in DB");
+    }
+
     #[tokio::test]
     async fn test_transition_run() {
         let db = setup().await;
