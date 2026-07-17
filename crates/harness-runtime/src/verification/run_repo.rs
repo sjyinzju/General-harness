@@ -12,6 +12,8 @@ use harness_core::contracts::verification::{
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 
+use super::content_validator::VerificationContentValidator;
+
 /// Outcome of an idempotent run insertion.
 #[derive(Debug, Clone)]
 pub enum RunIntentOutcome {
@@ -101,6 +103,11 @@ impl VerificationRunRepo {
             .as_ref()
             .map(|o| serde_json::to_string(o).unwrap_or_default());
 
+        // Validate outcome if present — fail-closed security boundary.
+        if let Some(ref oj) = outcome_json {
+            VerificationContentValidator::validate_detail_json(oj)?;
+        }
+
         sqlx::query(
             "INSERT INTO verification_runs (run_id, plan_id, plan_hash, plan_version, execution_id, task_id, project_id, lifecycle, idempotency_key, request_hash, outcome_json) VALUES (?,?,?,?,?,?,?,'created',?,?,?)",
         )
@@ -161,6 +168,12 @@ impl VerificationRunRepo {
         outcome: &VerificationOutcome,
         lifecycle: &VerificationRunLifecycle,
     ) -> Result<(), CoreError> {
+        // Validate summary before serialization — fail-closed security boundary.
+        VerificationContentValidator::validate_text(&outcome.summary)?;
+        for blocker in &outcome.blockers {
+            VerificationContentValidator::validate_text(blocker)?;
+        }
+
         let json = serde_json::to_string(outcome).map_err(|e| {
             CoreError::new(
                 ErrorCode::ConfigInvalid,
@@ -168,6 +181,8 @@ impl VerificationRunRepo {
                 ErrorSource::System,
             )
         })?;
+        VerificationContentValidator::validate_detail_json(&json)?;
+
         sqlx::query("UPDATE verification_runs SET outcome_json=?, lifecycle=?, completed_at=datetime('now'), updated_at=datetime('now') WHERE run_id=?")
             .bind(&json).bind(lifecycle_str(lifecycle)).bind(run_id)
             .execute(&self.pool).await
@@ -364,8 +379,12 @@ mod tests {
         let pool1_check = db.pool.clone(); // retained for post-concurrency verification
 
         // Seed prerequisite rows.
-        sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')")
-            .execute(&pool1).await.unwrap();
+        sqlx::query(
+            "INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')",
+        )
+        .execute(&pool1)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES ('t1','p1','test','submitted')")
             .execute(&pool1).await.unwrap();
         sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'completed')")
@@ -401,9 +420,8 @@ mod tests {
         //   the second pool's SELECT sees an empty table before the first
         //   pool commits). Both outcomes are valid — the key invariant is
         //   that only ONE run is actually created.
-        let has_created =
-            matches!(r1, Ok(RunIntentOutcome::Created { .. }))
-                || matches!(r2, Ok(RunIntentOutcome::Created { .. }));
+        let has_created = matches!(r1, Ok(RunIntentOutcome::Created { .. }))
+            || matches!(r2, Ok(RunIntentOutcome::Created { .. }));
         assert!(has_created, "exactly one must create a fresh run");
 
         // Verify only one run exists in the database (use retained pool).
@@ -463,5 +481,72 @@ mod tests {
         assert_eq!(loaded.lifecycle, VerificationRunLifecycle::Completed);
         assert!(loaded.outcome.is_some());
         assert_eq!(loaded.outcome.unwrap().result, VerificationResult::Passed);
+    }
+
+    // ── Repository-level validator enforcement tests ─────────────────
+
+    #[tokio::test]
+    async fn test_reject_secret_in_outcome_summary() {
+        let db = setup().await;
+        let repo = VerificationRunRepo::new(db.pool.clone());
+        let run = make_run("run-sec", "ikey-sec", "hash-sec");
+        repo.create_run(&run).await.unwrap();
+
+        let outcome = VerificationOutcome {
+            result: VerificationResult::Failed,
+            failure_classification: None,
+            summary: "API key sk-live-123 found in diff".into(),
+            blockers: vec![],
+            findings_count: 1,
+        };
+        let result = repo.set_outcome("run-sec", &outcome, &VerificationRunLifecycle::Failed).await;
+        assert!(result.is_err(), "secret in outcome summary must be rejected");
+
+        // Previous safe state preserved (still Created, no outcome).
+        let loaded = repo.load_run_by_id("run-sec").await.unwrap().unwrap();
+        assert_eq!(loaded.lifecycle, VerificationRunLifecycle::Created);
+        assert!(loaded.outcome.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_reject_secret_in_blocker_text() {
+        let db = setup().await;
+        let repo = VerificationRunRepo::new(db.pool.clone());
+        let run = make_run("run-blk", "ikey-blk", "hash-blk");
+        repo.create_run(&run).await.unwrap();
+
+        let outcome = VerificationOutcome {
+            result: VerificationResult::Failed,
+            failure_classification: None,
+            summary: "blocker found".into(),
+            blockers: vec!["Secret ghp_token_abc found in src/main.rs".into()],
+            findings_count: 1,
+        };
+        assert!(repo.set_outcome("run-blk", &outcome, &VerificationRunLifecycle::Failed).await.is_err());
+
+        // Previous state preserved.
+        let loaded = repo.load_run_by_id("run-blk").await.unwrap().unwrap();
+        assert_eq!(loaded.lifecycle, VerificationRunLifecycle::Created);
+    }
+
+    #[tokio::test]
+    async fn test_safe_outcome_write_succeeds() {
+        let db = setup().await;
+        let repo = VerificationRunRepo::new(db.pool.clone());
+        let run = make_run("run-safe", "ikey-safe", "hash-safe");
+        repo.create_run(&run).await.unwrap();
+
+        let outcome = VerificationOutcome {
+            result: VerificationResult::Passed,
+            failure_classification: None,
+            summary: "all checks passed".into(),
+            blockers: vec![],
+            findings_count: 0,
+        };
+        repo.set_outcome("run-safe", &outcome, &VerificationRunLifecycle::Completed).await.unwrap();
+
+        let loaded = repo.load_run_by_id("run-safe").await.unwrap().unwrap();
+        assert_eq!(loaded.lifecycle, VerificationRunLifecycle::Completed);
+        assert!(loaded.outcome.is_some());
     }
 }

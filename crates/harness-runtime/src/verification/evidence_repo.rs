@@ -10,6 +10,8 @@ use harness_core::contracts::verification::{
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 
+use super::content_validator::VerificationContentValidator;
+
 type StepResultRow = (
     String,         // result_id
     String,         // run_id
@@ -51,6 +53,14 @@ impl VerificationEvidenceRepo {
         &self,
         result: &VerificationStepResult,
     ) -> Result<(), CoreError> {
+        // Validate before any SQL — fail-closed security boundary.
+        if let Some(ref detail) = result.detail_json {
+            VerificationContentValidator::validate_detail_json(detail)?;
+        }
+        if let Some(ref err_msg) = result.error_message {
+            VerificationContentValidator::validate_text(err_msg)?;
+        }
+
         sqlx::query(
             "INSERT INTO verification_step_results (result_id, run_id, step_id, plan_id, status, detail_json, started_at, completed_at, duration_ms, error_message) VALUES (?,?,?,?,?,?,?,?,?,?)",
         )
@@ -113,6 +123,12 @@ impl VerificationEvidenceRepo {
     /// Persist a piece of verification evidence.
     /// Caller must ensure `detail_json` never contains raw secrets.
     pub async fn insert_evidence(&self, evidence: &VerificationEvidence) -> Result<(), CoreError> {
+        // Validate before any SQL — fail-closed security boundary.
+        VerificationContentValidator::validate_text(&evidence.summary)?;
+        if let Some(ref detail) = evidence.detail_json {
+            VerificationContentValidator::validate_detail_json(detail)?;
+        }
+
         sqlx::query(
             "INSERT INTO verification_evidence (evidence_id, run_id, step_id, evidence_kind, summary, detail_json, artifact_ref) VALUES (?,?,?,?,?,?,?)",
         )
@@ -155,6 +171,12 @@ impl VerificationEvidenceRepo {
 
     /// Persist a diagnostic entry.
     pub async fn insert_diagnostic(&self, diag: &VerificationDiagnostic) -> Result<(), CoreError> {
+        // Validate before any SQL — fail-closed security boundary.
+        VerificationContentValidator::validate_text(&diag.message)?;
+        if let Some(ref ctx) = diag.context_json {
+            VerificationContentValidator::validate_detail_json(ctx)?;
+        }
+
         sqlx::query(
             "INSERT INTO verification_diagnostics (diagnostic_id, run_id, level, message, context_json) VALUES (?,?,?,?,?)",
         )
@@ -359,5 +381,117 @@ mod tests {
         let diags = repo.get_diagnostics("run-1").await.unwrap();
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].level, VerificationDiagnosticLevel::Warning);
+    }
+
+    // ── Repository-level validator enforcement tests ─────────────────
+
+    #[tokio::test]
+    async fn test_reject_secret_in_evidence_detail() {
+        let db = setup().await;
+        let repo = VerificationEvidenceRepo::new(db.pool.clone());
+        let evidence = VerificationEvidence {
+            evidence_id: "ev-bad".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            evidence_kind: VerificationEvidenceKind::FileDiffSummary,
+            summary: "safe summary".into(),
+            detail_json: Some(r#"{"key": "sk-live-secret-12345"}"#.into()),
+            artifact_ref: None,
+            collected_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        let result = repo.insert_evidence(&evidence).await;
+        assert!(result.is_err(), "secret in detail must be rejected by repo");
+        let items = repo.get_evidence("run-1").await.unwrap();
+        assert!(!items.iter().any(|e| e.evidence_id == "ev-bad"), "rejected evidence must leave zero rows");
+    }
+
+    #[tokio::test]
+    async fn test_reject_secret_in_summary() {
+        let db = setup().await;
+        let repo = VerificationEvidenceRepo::new(db.pool.clone());
+        let evidence = VerificationEvidence {
+            evidence_id: "ev-sum".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            evidence_kind: VerificationEvidenceKind::FileDiffSummary,
+            summary: "Bearer eyJhbGciOiJIUzI1NiJ9.token found".into(),
+            detail_json: None, artifact_ref: None,
+            collected_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        assert!(repo.insert_evidence(&evidence).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_reject_private_key_in_diagnostic() {
+        let db = setup().await;
+        let repo = VerificationEvidenceRepo::new(db.pool.clone());
+        let diag = VerificationDiagnostic {
+            diagnostic_id: "d-bad".into(), run_id: "run-1".into(),
+            level: VerificationDiagnosticLevel::Error,
+            message: "-----BEGIN RSA PRIVATE KEY----- found".into(),
+            context_json: None,
+            created_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        assert!(repo.insert_diagnostic(&diag).await.is_err());
+        let diags = repo.get_diagnostics("run-1").await.unwrap();
+        assert!(!diags.iter().any(|d| d.diagnostic_id == "d-bad"));
+    }
+
+    #[tokio::test]
+    async fn test_reject_credential_in_step_result() {
+        let db = setup().await;
+        let repo = VerificationEvidenceRepo::new(db.pool.clone());
+        let result = VerificationStepResult {
+            result_id: "sr-bad".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            plan_id: "plan-1".into(), status: VerificationStepStatus::Failed,
+            detail_json: Some(r#"{"password": "super-secret"}"#.into()),
+            started_at: None, completed_at: None, duration_ms: None, error_message: None,
+        };
+        assert!(repo.insert_step_result(&result).await.is_err());
+        let results = repo.get_step_results("run-1").await.unwrap();
+        assert!(!results.iter().any(|sr| sr.result_id == "sr-bad"));
+    }
+
+    #[tokio::test]
+    async fn test_reject_oversized_evidence_detail() {
+        let db = setup().await;
+        let repo = VerificationEvidenceRepo::new(db.pool.clone());
+        let evidence = VerificationEvidence {
+            evidence_id: "ev-big".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            evidence_kind: VerificationEvidenceKind::FileDiffSummary,
+            summary: "safe".into(), detail_json: Some("x".repeat(300_000)),
+            artifact_ref: None,
+            collected_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        assert!(repo.insert_evidence(&evidence).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_safe_artifact_ref_accepted() {
+        let db = setup().await;
+        let repo = VerificationEvidenceRepo::new(db.pool.clone());
+        let evidence = VerificationEvidence {
+            evidence_id: "ev-art".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            evidence_kind: VerificationEvidenceKind::ArtifactRef,
+            summary: "artifact captured".into(),
+            detail_json: Some(r#"{"artifact_id":"art-abc"}"#.into()),
+            artifact_ref: Some("artifacts/art-abc.diff".into()),
+            collected_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        repo.insert_evidence(&evidence).await.unwrap();
+        assert!(repo.get_evidence("run-1").await.unwrap().iter().any(|e| e.evidence_id == "ev-art"));
+    }
+
+    #[tokio::test]
+    async fn test_error_does_not_contain_raw_secret() {
+        let db = setup().await;
+        let repo = VerificationEvidenceRepo::new(db.pool.clone());
+        let evidence = VerificationEvidence {
+            evidence_id: "ev-err".into(), run_id: "run-1".into(), step_id: "step-1".into(),
+            evidence_kind: VerificationEvidenceKind::FileDiffSummary,
+            summary: "safe".into(),
+            detail_json: Some(r#"{"token":"sk-abc-secret"}"#.into()),
+            artifact_ref: None,
+            collected_at: chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+        };
+        let err = repo.insert_evidence(&evidence).await.unwrap_err();
+        let err_str = format!("{:?}", err);
+        assert!(!err_str.contains("sk-abc-secret"), "error must not leak raw secret");
     }
 }

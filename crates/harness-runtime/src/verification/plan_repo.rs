@@ -9,6 +9,8 @@ use harness_core::contracts::verification::{
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 
+use super::content_validator::VerificationContentValidator;
+
 type PlanRow = (
     String, // plan_id
     String, // task_id
@@ -32,6 +34,14 @@ impl VerificationPlanRepo {
     /// Create a new verification plan. Returns an error if a plan already
     /// exists for this execution (UNIQUE constraint on execution_id).
     pub async fn create_plan(&self, plan: &VerificationPlan) -> Result<(), CoreError> {
+        // Validate each step before any SQL — fail-closed security boundary.
+        for step in &plan.steps {
+            if !step.config_json.is_empty() && step.config_json != "{}" {
+                VerificationContentValidator::validate_detail_json(&step.config_json)?;
+            }
+            VerificationContentValidator::validate_text(&step.description)?;
+        }
+
         let steps_json = serde_json::to_string(&plan.steps).map_err(|e| {
             CoreError::new(
                 ErrorCode::ConfigInvalid,
@@ -259,5 +269,41 @@ mod tests {
         repo.create_plan(&plan).await.unwrap();
 
         assert!(repo.plan_exists("e1").await.unwrap());
+    }
+
+    // ── Repository-level validator enforcement tests ─────────────────
+
+    #[tokio::test]
+    async fn test_reject_secret_in_step_config() {
+        let db = setup().await;
+        let repo = VerificationPlanRepo::new(db.pool.clone());
+        let mut plan = make_plan("plan-sec", "e2");
+        // Need unique execution_id since the setup already uses "e1".
+        sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e2','t1',2,'completed')")
+            .execute(&db.pool).await.unwrap();
+        plan.execution_id = "e2".to_string();
+        plan.fingerprint.execution_id = "e2".to_string();
+        plan.steps[0].config_json = r#"{"api_key":"sk-secret-in-config"}"#.to_string();
+
+        let result = repo.create_plan(&plan).await;
+        assert!(result.is_err(), "secret in step config must be rejected by repo");
+
+        // Zero rows persisted.
+        assert!(!repo.plan_exists("e2").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_reject_secret_in_step_description() {
+        let db = setup().await;
+        let repo = VerificationPlanRepo::new(db.pool.clone());
+        sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e3','t1',3,'completed')")
+            .execute(&db.pool).await.unwrap();
+        let mut plan = make_plan("plan-desc", "e3");
+        plan.execution_id = "e3".to_string();
+        plan.fingerprint.execution_id = "e3".to_string();
+        plan.steps[0].description = "check with token ghp_secret123".to_string();
+
+        assert!(repo.create_plan(&plan).await.is_err());
+        assert!(!repo.plan_exists("e3").await.unwrap());
     }
 }

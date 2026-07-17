@@ -101,8 +101,10 @@ impl VerificationContentValidator {
     /// Operates on lowercase input.
     fn contains_secret_patterns(lower: &str) -> bool {
         // API key prefixes.
-        if lower.contains("sk-") || lower.contains("sk_")
-            || lower.contains("api_key") || lower.contains("apikey")
+        if lower.contains("sk-")
+            || lower.contains("sk_")
+            || lower.contains("api_key")
+            || lower.contains("apikey")
             || lower.contains("api-key")
         {
             return true;
@@ -113,8 +115,10 @@ impl VerificationContentValidator {
             // Bearer token with JWT-like structure.
             return true;
         }
-        if lower.contains("access_token") || lower.contains("access-token")
-            || lower.contains("refresh_token") || lower.contains("refresh-token")
+        if lower.contains("access_token")
+            || lower.contains("access-token")
+            || lower.contains("refresh_token")
+            || lower.contains("refresh-token")
         {
             return true;
         }
@@ -130,22 +134,29 @@ impl VerificationContentValidator {
         }
 
         // AWS-style key patterns.
-        if lower.contains("akia") || lower.contains("aws_access_key")
+        if lower.contains("akia")
+            || lower.contains("aws_access_key")
             || lower.contains("aws_secret")
         {
             return true;
         }
 
         // GitHub tokens.
-        if lower.contains("ghp_") || lower.contains("gho_")
-            || lower.contains("ghu_") || lower.contains("ghs_")
+        if lower.contains("ghp_")
+            || lower.contains("gho_")
+            || lower.contains("ghu_")
+            || lower.contains("ghs_")
             || lower.contains("github_pat_")
         {
             return true;
         }
 
         // Private key headers.
-        if lower.contains("-----begin") && (lower.contains("private key") || lower.contains("rsa") || lower.contains("ec ") || lower.contains("dsa"))
+        if lower.contains("-----begin")
+            && (lower.contains("private key")
+                || lower.contains("rsa")
+                || lower.contains("ec ")
+                || lower.contains("dsa"))
         {
             return true;
         }
