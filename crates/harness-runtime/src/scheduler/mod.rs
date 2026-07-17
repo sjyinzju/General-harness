@@ -12,5 +12,8 @@ pub mod readiness;
 pub mod reconciler;
 
 pub use concurrency::ConcurrencyManager;
+pub use dispatch::SchedulerOrchestrator;
+pub use event_sink::SchedulerEventSink;
 pub use profile_selector::RuntimeProfileSelector;
 pub use readiness::TaskReadinessEvaluator;
+pub use reconciler::SchedulerReconciler;
