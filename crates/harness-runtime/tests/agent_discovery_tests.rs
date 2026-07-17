@@ -852,17 +852,20 @@ async fn test_49_table_count_18_business_tables() {
     let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
 
     // After migration 009 (agent_discovery), we should have 18 tables:
-    // Original 15 from 001-008 + 3 new (agent_definitions, discovery_evidence, agent_provider_hints)
+    // After migration 010 (scheduler), we should have 21 tables
     assert_eq!(
         names.len(),
-        18,
-        "Expected 18 business tables (001–009), got {}: {:?}",
+        21,
+        "Expected 21 business tables (001–010), got {}: {:?}",
         names.len(),
         names
     );
     assert!(names.contains(&"agent_definitions"));
     assert!(names.contains(&"discovery_evidence"));
     assert!(names.contains(&"agent_provider_hints"));
+    assert!(names.contains(&"dispatch_operations"));
+    assert!(names.contains(&"scheduler_reservations"));
+    assert!(names.contains(&"scheduler_reconciliations"));
 }
 
 #[tokio::test]

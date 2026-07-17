@@ -7,6 +7,7 @@ pub mod goal_contract;
 pub mod project;
 pub mod repository;
 pub mod runtime_profile;
+pub mod scheduler;
 pub mod task;
 pub mod task_envelope;
 pub mod task_result;

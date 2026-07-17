@@ -10,6 +10,7 @@ pub mod policy;
 pub mod process;
 pub mod repo;
 pub mod resource_claim;
+pub mod scheduler;
 pub mod transition;
 pub mod worktree;
 

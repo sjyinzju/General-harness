@@ -110,6 +110,7 @@ mod tests {
                 "agent_definitions",
                 "agent_provider_hints",
                 "discovery_evidence",
+                "dispatch_operations",
                 "event_log",
                 "execution_attempts",
                 "idempotency_records",
@@ -121,12 +122,14 @@ mod tests {
                 "resource_claim_groups",
                 "resource_claims",
                 "runtime_profiles",
+                "scheduler_reconciliations",
+                "scheduler_reservations",
                 "task_dependencies",
                 "tasks",
                 "workspace_leases",
                 "worktrees"
             ],
-            "18 business tables expected (001–009)"
+            "21 business tables expected (001–010)"
         );
     }
 
