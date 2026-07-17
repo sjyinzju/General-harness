@@ -1,5 +1,6 @@
 //! SchedulerEventSink — production AgentEvent persistence via AgentEventSink.
 //! Sequences events per execution, enforces ordering, handles large payloads.
+//! Applies structured secret redaction before serialization.
 
 use harness_core::contracts::agent_adapter::AgentEventSink;
 use harness_core::contracts::agent_event::AgentEvent;
@@ -11,7 +12,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
+use crate::process::redactor::ProcessEventRedactor;
+
 /// Persists AgentEvents to event_log with execution-scoped sequence numbers.
+/// Applies structured secret redaction before serialization and persistence.
 pub struct SchedulerEventSink {
     pool: SqlitePool,
     execution_id: String,
@@ -21,6 +25,8 @@ pub struct SchedulerEventSink {
     artifact_dir: Option<std::path::PathBuf>,
     /// Track last persisted sequence for crash recovery.
     last_persisted_seq: Arc<Mutex<u64>>,
+    /// Redacts known secret values from AgentEvent payloads before persistence.
+    redactor: Arc<ProcessEventRedactor>,
 }
 
 impl SchedulerEventSink {
@@ -36,6 +42,25 @@ impl SchedulerEventSink {
             closed: Arc::new(AtomicBool::new(false)),
             artifact_dir,
             last_persisted_seq: Arc::new(Mutex::new(0)),
+            redactor: Arc::new(ProcessEventRedactor::new()),
+        }
+    }
+
+    /// Create a sink with a pre-configured redactor containing known secrets.
+    pub fn with_redactor(
+        pool: SqlitePool,
+        execution_id: String,
+        artifact_dir: Option<std::path::PathBuf>,
+        redactor: ProcessEventRedactor,
+    ) -> Self {
+        Self {
+            pool,
+            execution_id,
+            sequence: Arc::new(AtomicU64::new(0)),
+            closed: Arc::new(AtomicBool::new(false)),
+            artifact_dir,
+            last_persisted_seq: Arc::new(Mutex::new(0)),
+            redactor: Arc::new(redactor),
         }
     }
 
@@ -50,6 +75,83 @@ impl SchedulerEventSink {
     /// Get the last persisted sequence number (for crash recovery).
     pub fn last_persisted(&self) -> u64 {
         *self.last_persisted_seq.lock().unwrap()
+    }
+
+    /// Redact an AgentEvent by removing secret values from its string fields.
+    fn redact_event(&self, event: &AgentEvent) -> AgentEvent {
+        if self.redactor.is_empty() {
+            return event.clone();
+        }
+        match event {
+            AgentEvent::Message {
+                content,
+                vendor_event_id,
+            } => AgentEvent::Message {
+                content: self.redactor.redact_str(content),
+                vendor_event_id: vendor_event_id.clone(),
+            },
+            AgentEvent::Progress { summary } => AgentEvent::Progress {
+                summary: self.redactor.redact_str(summary),
+            },
+            AgentEvent::ReasoningSummary { summary } => AgentEvent::ReasoningSummary {
+                summary: self.redactor.redact_str(summary),
+            },
+            AgentEvent::ToolCallStarted {
+                tool_name,
+                tool_use_id,
+                tool_input,
+                vendor_event_id,
+            } => AgentEvent::ToolCallStarted {
+                tool_name: tool_name.clone(),
+                tool_use_id: tool_use_id.clone(),
+                tool_input: self.redact_value(tool_input),
+                vendor_event_id: vendor_event_id.clone(),
+            },
+            AgentEvent::ToolCallCompleted {
+                tool_use_id,
+                is_error,
+                content_preview,
+            } => AgentEvent::ToolCallCompleted {
+                tool_use_id: tool_use_id.clone(),
+                is_error: *is_error,
+                content_preview: self.redactor.redact_str(content_preview),
+            },
+            AgentEvent::Result { content, is_error } => AgentEvent::Result {
+                content: self.redactor.redact_str(content),
+                is_error: *is_error,
+            },
+            AgentEvent::Error { message, code } => AgentEvent::Error {
+                message: self.redactor.redact_str(message),
+                code: code.clone(),
+            },
+            AgentEvent::RawVendorEvent { raw_type, payload } => AgentEvent::RawVendorEvent {
+                raw_type: raw_type.clone(),
+                payload: self.redact_value(payload),
+            },
+            // Events without sensitive text content pass through unchanged
+            AgentEvent::SessionStarted { .. }
+            | AgentEvent::ProcessExited { .. }
+            | AgentEvent::SessionEnded { .. } => event.clone(),
+        }
+    }
+
+    fn redact_value(&self, value: &serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::String(s) => serde_json::Value::String(self.redactor.redact_str(s)),
+            serde_json::Value::Object(map) => {
+                let redacted: serde_json::Map<String, serde_json::Value> = map
+                    .iter()
+                    .map(|(k, v)| (k.clone(), self.redact_value(v)))
+                    .collect();
+                serde_json::Value::Object(redacted)
+            }
+            serde_json::Value::Array(arr) => {
+                let redacted: Vec<serde_json::Value> =
+                    arr.iter().map(|v| self.redact_value(v)).collect();
+                serde_json::Value::Array(redacted)
+            }
+            other => other.clone(),
+        }
     }
 }
 
@@ -66,6 +168,9 @@ impl AgentEventSink for SchedulerEventSink {
             ))));
         }
 
+        // Redact secrets before serialization
+        let redacted_event = self.redact_event(&event);
+
         let seq = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         let exec_id = self.execution_id.clone();
         let pool = self.pool.clone();
@@ -74,7 +179,7 @@ impl AgentEventSink for SchedulerEventSink {
         let artifact_dir = self.artifact_dir.clone();
 
         Box::pin(async move {
-            let event_json = serde_json::to_string(&event).map_err(|e| {
+            let event_json = serde_json::to_string(&redacted_event).map_err(|e| {
                 CoreError::new(
                     ErrorCode::ProtocolError,
                     format!("serialize AgentEvent: {e}"),
@@ -107,7 +212,7 @@ impl AgentEventSink for SchedulerEventSink {
             };
 
             let event_id = Uuid::new_v4().to_string();
-            let event_type = event_type_str(&event);
+            let event_type = event_type_str(&redacted_event);
 
             let result = sqlx::query(
                 "INSERT INTO event_log (id, stream_id, stream_version, event_type, payload_json, schema_version, correlation_id, idempotency_key, source) VALUES (?,?,?,?,?,?,?,?,?)",
@@ -168,6 +273,7 @@ fn event_type_str(event: &AgentEvent) -> &'static str {
 mod tests {
     use super::*;
     use crate::db::Database;
+
     #[tokio::test]
     async fn test_event_sink_persists() {
         let db = Database::open_in_memory().await.unwrap();
@@ -250,5 +356,86 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count.0, 1);
+    }
+
+    #[tokio::test]
+    async fn test_sink_redacts_secrets_in_events() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mut redactor = ProcessEventRedactor::new();
+        redactor.register_secret("sk-ant-secret-key-12345");
+
+        let mut sink =
+            SchedulerEventSink::with_redactor(db.pool.clone(), "exec-5".into(), None, redactor);
+
+        // Message with a secret embedded in content
+        sink.send(AgentEvent::Message {
+            content: "Using API key: sk-ant-secret-key-12345 for auth".into(),
+            vendor_event_id: None,
+        })
+        .await
+        .unwrap();
+
+        // Check the persisted payload is redacted
+        let payload: (String,) = sqlx::query_as(
+            "SELECT payload_json FROM event_log WHERE stream_id = 'exec-5' ORDER BY stream_version DESC LIMIT 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!payload.0.contains("sk-ant-secret-key-12345"));
+        assert!(payload.0.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn test_sink_redacts_secrets_in_tool_result() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mut redactor = ProcessEventRedactor::new();
+        redactor.register_secret("my-token-value");
+
+        let mut sink =
+            SchedulerEventSink::with_redactor(db.pool.clone(), "exec-6".into(), None, redactor);
+
+        sink.send(AgentEvent::ToolCallCompleted {
+            tool_use_id: "tu-1".into(),
+            is_error: false,
+            content_preview: "token=my-token-value url=https://api.example.com".into(),
+        })
+        .await
+        .unwrap();
+
+        let payload: (String,) = sqlx::query_as(
+            "SELECT payload_json FROM event_log WHERE stream_id = 'exec-6' ORDER BY stream_version DESC LIMIT 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!payload.0.contains("my-token-value"));
+        assert!(payload.0.contains("[REDACTED]"));
+    }
+
+    #[tokio::test]
+    async fn test_sink_redacts_raw_vendor_event() {
+        let db = Database::open_in_memory().await.unwrap();
+        let mut redactor = ProcessEventRedactor::new();
+        redactor.register_secret("provider-secret-xyz");
+
+        let mut sink =
+            SchedulerEventSink::with_redactor(db.pool.clone(), "exec-7".into(), None, redactor);
+
+        sink.send(AgentEvent::RawVendorEvent {
+            raw_type: "auth.token".into(),
+            payload: serde_json::json!({"access_token": "provider-secret-xyz"}),
+        })
+        .await
+        .unwrap();
+
+        let payload: (String,) = sqlx::query_as(
+            "SELECT payload_json FROM event_log WHERE stream_id = 'exec-7' ORDER BY stream_version DESC LIMIT 1",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!payload.0.contains("provider-secret-xyz"));
+        assert!(payload.0.contains("[REDACTED]"));
     }
 }

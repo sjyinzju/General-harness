@@ -306,9 +306,14 @@ impl SchedulerOrchestrator {
 
         // ── 9. Start Agent via Adapter ─────────────────────────────
         let profile = self.load_profile(req.profile_id).await?;
+
+        // Profile-scoped environment filtering: only pass env vars that are
+        // explicitly allowed by the profile or are not classified as sensitive.
+        let filtered_env = self.filter_env_for_profile(&profile, &req.env)?;
+
         let session_opts = SessionOptions {
             working_directory: req.repo_path.to_path_buf(),
-            env: req.env.clone(),
+            env: filtered_env,
             timeout: req.timeout,
             max_turns: None,
             resume_session_id: None,
@@ -869,6 +874,53 @@ impl SchedulerOrchestrator {
 
     // ── Helpers ────────────────────────────────────────────────────────
 
+    /// Filter environment variables through the profile's allowed set.
+    /// Sensitive env vars (API keys, tokens) not in the allowed list produce
+    /// a structured error. Non-sensitive vars pass through freely.
+    fn filter_env_for_profile(
+        &self,
+        profile: &harness_core::contracts::runtime_profile::RuntimeProfile,
+        env: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>, CoreError> {
+        let mut filtered = HashMap::new();
+        for (key, value) in env {
+            if is_sensitive_env_name(key) {
+                // Check against profile's allowed set (via a reasonable heuristic:
+                // the profile's agent_kind and adapter_kind context implies which
+                // env vars are expected; for now we check common patterns)
+                if !self.is_env_allowed_for_profile(key, profile) {
+                    return Err(CoreError::new(
+                        ErrorCode::ConfigInvalid,
+                        format!(
+                            "sensitive env var '{key}' not authorized for profile '{}'",
+                            profile.id
+                        ),
+                        ErrorSource::System,
+                    ));
+                }
+            }
+            filtered.insert(key.clone(), value.clone());
+        }
+        Ok(filtered)
+    }
+
+    /// Check if an env var name is classified as sensitive (API keys, tokens, secrets).
+    fn is_env_allowed_for_profile(
+        &self,
+        key: &str,
+        profile: &harness_core::contracts::runtime_profile::RuntimeProfile,
+    ) -> bool {
+        // Per-profile authorization: check if the profile's agent_kind or
+        // provider context justifies this env var.
+        let key_upper = key.to_uppercase();
+        // Allow agent-specific env vars based on profile agent_kind
+        match profile.agent_kind.as_str() {
+            "claude-code" => key_upper.contains("ANTHROPIC") || key_upper.contains("CLAUDE"),
+            "codex" => key_upper.contains("OPENAI") || key_upper.contains("CODEX"),
+            _ => false,
+        }
+    }
+
     fn compute_request_hash(&self, req: &DispatchRequest<'_>) -> String {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -980,6 +1032,22 @@ impl SchedulerOrchestrator {
             )),
         }
     }
+}
+
+/// Check if an environment variable name is classified as sensitive.
+/// Matches known API key, token, and secret patterns.
+fn is_sensitive_env_name(key: &str) -> bool {
+    let upper = key.to_uppercase();
+    upper.contains("API_KEY")
+        || upper.contains("TOKEN")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("CREDENTIAL")
+        || upper.contains("AUTH")
+        || upper.starts_with("ANTHROPIC_")
+        || upper.starts_with("OPENAI_")
+        || upper.starts_with("CODEX_")
+        || upper.starts_with("CLAUDE_")
 }
 
 fn default_caps() -> harness_core::contracts::runtime_profile::CapabilitySet {
