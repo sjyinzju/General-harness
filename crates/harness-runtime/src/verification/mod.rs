@@ -5,12 +5,17 @@
 
 pub mod content_validator;
 pub mod evidence_repo;
+pub mod execution_service;
 pub mod ownership_service;
 pub mod plan_repo;
 pub mod run_repo;
 
 pub use content_validator::VerificationContentValidator;
 pub use evidence_repo::VerificationEvidenceRepo;
+pub use execution_service::{
+    FakeProcessExecutor, ProcessExecutor, ProcessResult, RealProcessExecutor,
+    StepExecutionOutcome, StepExecutionRequest, VerificationExecutionService,
+};
 pub use ownership_service::{
     OwnershipTakeoverResult, TakeoverRequest, VerificationOwnershipService,
 };
