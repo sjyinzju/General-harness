@@ -743,8 +743,8 @@ async fn concurrent_dispatch_two_pools_one_winner() {
         o1.status == DispatchStatus::AgentCompleted || o2.status == DispatchStatus::AgentCompleted;
     assert!(
         one_completed,
-        "at least one should complete: {:?} / {:?}",
-        o1.status, o2.status
+        "at least one should complete: {:?} / {:?} (outcomes: {:?} / {:?})",
+        o1.status, o2.status, o1.terminal_outcome, o2.terminal_outcome
     );
 
     // Strict winner: FakeAdapter must be started exactly once.
