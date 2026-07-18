@@ -71,6 +71,11 @@ pub struct FaultPlan {
 }
 
 impl FaultPlan {
+    /// Create an empty fault plan with no faults injected (production default).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     /// Inject a fault that triggers on the nth call (1-indexed).
     /// FailNthCall requires the count; other kinds use count=1.
     pub fn inject(&self, boundary: FaultBoundary, kind: FaultKind, nth: u64) {

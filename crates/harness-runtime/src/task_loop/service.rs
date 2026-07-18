@@ -13,6 +13,7 @@ use std::sync::Arc;
 use sqlx::SqlitePool;
 
 use super::events::TaskLoopEventWriter;
+use super::faults::FaultPlan;
 use super::gateway::{CreateExecutionRequest, DispatchResult, ExecutionCreated, I4Gateway};
 use super::progress::BudgetPolicy;
 use super::repo::{LoopUsageSummary, TaskLoopRepo};
@@ -27,6 +28,7 @@ pub struct TaskEngineeringLoopService {
     i4_gateway: Option<Arc<dyn I4Gateway>>,
     profile_policy: LoopProfilePolicy,
     budget_policy: BudgetPolicy,
+    pub fault_plan: Option<Arc<FaultPlan>>,
     pub loop_create_count: Arc<AtomicUsize>,
     pub attempt_create_count: Arc<AtomicUsize>,
     pub execution_create_count: Arc<AtomicUsize>,
@@ -45,6 +47,7 @@ impl TaskEngineeringLoopService {
             i4_gateway: None,
             profile_policy: LoopProfilePolicy::default(),
             budget_policy: BudgetPolicy::default(),
+            fault_plan: None,
             loop_create_count: Arc::new(AtomicUsize::new(0)),
             attempt_create_count: Arc::new(AtomicUsize::new(0)),
             execution_create_count: Arc::new(AtomicUsize::new(0)),
@@ -101,6 +104,12 @@ impl TaskEngineeringLoopService {
 
     pub fn with_budget_reserve_count(mut self, c: Arc<AtomicUsize>) -> Self {
         self.budget_reserve_count = c;
+        self
+    }
+
+    /// Wire a FaultPlan for fault injection testing.
+    pub fn with_fault_plan(mut self, fp: Arc<FaultPlan>) -> Self {
+        self.fault_plan = Some(fp);
         self
     }
 
