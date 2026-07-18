@@ -214,52 +214,105 @@ impl VerificationPolicyEvidenceService {
     /// Atomic phases: Started (op + event) → execute → Terminal (result +
     /// evidence + event + op completion).
     pub async fn execute_policy_step(&self, req: &PolicyStepRequest) -> PolicyStepOutcome {
-        // ── 0. Idempotency via formal operation table ────────────────
-        let existing: Option<(
-            String,
-            String,
-            Option<String>,
-        )> = sqlx::query_as(
-            "SELECT policy_op_id, request_hash, result_id FROM verification_policy_operations WHERE idempotency_key=?",
-        )
-        .bind(&req.idempotency_key)
-        .fetch_optional(&self.pool)
-        .await
-        .unwrap_or(None);
+        // ── 0. Atomic idempotency: INSERT with ON CONFLICT ──────────
+        // Eliminates the fetch-then-CAS race by using an atomic INSERT
+        // that claims the idempotency_key before any side effects.
+        let policy_op_id = format!("pop-{}", Uuid::new_v4());
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
 
-        if let Some((op_id, eh, existing_result)) = existing {
-            if eh == req.request_hash {
-                // Verify evidence freshness before reusing.
-                if let Some(ref rid) = existing_result {
-                    if let Some(mismatch) = self.check_evidence_freshness_for_result(rid, req).await
-                    {
-                        return PolicyStepOutcome::StaleEvidence {
-                            existing_evidence_id: rid.clone(),
-                            mismatched_field: mismatch,
+        let insert_result = sqlx::query(
+            "INSERT INTO verification_policy_operations \
+             (policy_op_id, verification_run_id, step_id, step_kind, sequence_index, \
+              idempotency_key, request_hash, worktree_id, fencing_token, \
+              plan_fingerprint, policy_version, validator_version, lifecycle, started_at) \
+             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'running',?) \
+             ON CONFLICT(idempotency_key) DO NOTHING",
+        )
+        .bind(&policy_op_id)
+        .bind(&req.verification_run_id)
+        .bind(&req.step_id)
+        .bind(step_kind_key(&req.step_kind))
+        .bind(req.sequence_index as i64)
+        .bind(&req.idempotency_key)
+        .bind(&req.request_hash)
+        .bind(&req.worktree_id)
+        .bind(req.expected_fencing)
+        .bind("plan-v1")
+        .bind(1i64)
+        .bind("1.0")
+        .bind(&now)
+        .execute(&self.pool)
+        .await;
+
+        match insert_result {
+            Ok(r) if r.rows_affected() == 0 => {
+                // Key already exists — read the existing row to determine outcome.
+                let existing: Option<(String, String, Option<String>)> = sqlx::query_as(
+                    "SELECT policy_op_id, request_hash, result_id FROM verification_policy_operations WHERE idempotency_key=?",
+                )
+                .bind(&req.idempotency_key)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or(None);
+
+                if let Some((op_id, eh, existing_result)) = existing {
+                    if eh == req.request_hash {
+                        if let Some(ref rid) = existing_result {
+                            if let Some(mismatch) =
+                                self.check_evidence_freshness_for_result(rid, req).await
+                            {
+                                return PolicyStepOutcome::StaleEvidence {
+                                    existing_evidence_id: rid.clone(),
+                                    mismatched_field: mismatch,
+                                };
+                            }
+                        }
+                        return PolicyStepOutcome::Duplicate {
+                            existing_step_result_id: existing_result.unwrap_or(op_id),
                         };
                     }
+                    return PolicyStepOutcome::IdempotencyConflict {
+                        existing_hash: eh,
+                        new_hash: req.request_hash.clone(),
+                    };
                 }
-                return PolicyStepOutcome::Duplicate {
-                    existing_step_result_id: existing_result.unwrap_or(op_id),
+                return PolicyStepOutcome::InfrastructureError {
+                    reason: "idempotency insert conflict but row missing".into(),
                 };
             }
-            return PolicyStepOutcome::IdempotencyConflict {
-                existing_hash: eh,
-                new_hash: req.request_hash.clone(),
-            };
+            Err(e) => {
+                return PolicyStepOutcome::InfrastructureError {
+                    reason: format!("idempotency insert: {e}"),
+                };
+            }
+            Ok(_) => { /* claimed — proceed */ }
         }
 
         // ── 1. Full ownership + resource pre-checks ──────────────────
         if let Some(o) = self.check_full_ownership(req).await {
+            // Rollback: mark the operation we claimed as failed.
+            let _ = sqlx::query(
+                "UPDATE verification_policy_operations SET lifecycle='failed', terminal_at=? WHERE policy_op_id=?",
+            )
+            .bind(&now)
+            .bind(&policy_op_id)
+            .execute(&self.pool)
+            .await;
             return o;
         }
 
-        // ── 2. Atomic Started: insert operation + started event ──────
-        let policy_op_id = format!("pop-{}", Uuid::new_v4());
+        // ── 2. Atomic Started: insert synthetic step_op + started event ──
         if let Err(e) = self
             .insert_operation_and_start_event(req, &policy_op_id)
             .await
         {
+            let _ = sqlx::query(
+                "UPDATE verification_policy_operations SET lifecycle='failed', terminal_at=? WHERE policy_op_id=?",
+            )
+            .bind(&now)
+            .bind(&policy_op_id)
+            .execute(&self.pool)
+            .await;
             return PolicyStepOutcome::InfrastructureError {
                 reason: format!("started phase: {e}"),
             };
@@ -779,7 +832,6 @@ impl VerificationPolicyEvidenceService {
         req: &PolicyStepRequest,
         policy_op_id: &str,
     ) -> Result<(), CoreError> {
-        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
         let cfg_hash = format!("{:016x}", {
             use std::hash::{Hash, Hasher};
             let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -809,32 +861,9 @@ impl VerificationPolicyEvidenceService {
                 )
             })?;
 
-        // 2. Insert the formal policy operation row.
-        sqlx::query(
-            "INSERT INTO verification_policy_operations (policy_op_id, verification_run_id, step_id, step_kind, sequence_index, idempotency_key, request_hash, worktree_id, fencing_token, plan_fingerprint, policy_version, validator_version, lifecycle, started_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'running',?)",
-        )
-        .bind(policy_op_id)
-        .bind(&req.verification_run_id)
-        .bind(&req.step_id)
-        .bind(step_kind_key(&req.step_kind))
-        .bind(req.sequence_index as i64)
-        .bind(&req.idempotency_key)
-        .bind(&req.request_hash)
-        .bind(&req.worktree_id)
-        .bind(req.expected_fencing)
-        .bind("plan-v1")
-        .bind(1i64)
-        .bind("1.0")
-        .bind(&now)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            CoreError::new(
-                ErrorCode::PersistenceError,
-                format!("insert policy op: {e}"),
-                ErrorSource::System,
-            )
-        })?;
+        // 2. Policy operation row was already inserted atomically in
+        //    execute_policy_step (ON CONFLICT for idempotency safety).
+        //    No second insert here.
 
         // 3. Write started event (policy_op_id matches step_op FK).
         let eid = format!("evt-policy-started-{}", Uuid::new_v4());
