@@ -11,6 +11,7 @@
 
 pub mod decision;
 pub mod events;
+pub mod faults;
 pub mod gateway;
 pub mod progress;
 pub mod reconciler;
