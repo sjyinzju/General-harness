@@ -886,13 +886,28 @@ impl VerificationFinalizationService {
     }
 
     async fn read_durable_version(&self, op_id: &str) -> Result<i64, CoreError> {
-        let row: (i64,) = sqlx::query_as("SELECT version FROM verification_finalization_operations WHERE finalization_op_id=?")
-            .bind(op_id).fetch_one(&self.pool).await
-            .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("read version: {e}"), ErrorSource::System))?;
+        let row: (i64,) = sqlx::query_as(
+            "SELECT version FROM verification_finalization_operations WHERE finalization_op_id=?",
+        )
+        .bind(op_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("read version: {e}"),
+                ErrorSource::System,
+            )
+        })?;
         Ok(row.0)
     }
 
-    async fn cas_save_progress(&self, op_id: &str, rp: &ReleaseProgress, expected_version: i64) -> ProgressCasResult {
+    async fn cas_save_progress(
+        &self,
+        op_id: &str,
+        rp: &ReleaseProgress,
+        expected_version: i64,
+    ) -> ProgressCasResult {
         let progress_json = serde_json::to_string(rp).unwrap_or_default();
         match sqlx::query("UPDATE verification_finalization_operations SET release_progress_json=?, resources_released_at=datetime('now'), version=version+1 WHERE finalization_op_id=? AND version=?")
             .bind(&progress_json).bind(op_id).bind(expected_version).execute(&self.pool).await {
@@ -901,7 +916,11 @@ impl VerificationFinalizationService {
         }
     }
 
-    async fn save_release_progress(&self, op_id: &str, rp: &ReleaseProgress) -> Result<(), CoreError> {
+    async fn save_release_progress(
+        &self,
+        op_id: &str,
+        rp: &ReleaseProgress,
+    ) -> Result<(), CoreError> {
         const MAX_RETRIES: u32 = 3;
         let mut attempt = 0u32;
         let mut expected = self.read_durable_version(op_id).await.unwrap_or(1);
@@ -911,9 +930,18 @@ impl VerificationFinalizationService {
                 ProgressCasResult::Conflict { .. } => {
                     attempt += 1;
                     if attempt >= MAX_RETRIES {
-                        return Err(CoreError::new(ErrorCode::ResourceConflict { resource: "finalization_op".into() }, format!("CAS conflict after {MAX_RETRIES} retries"), ErrorSource::System));
+                        return Err(CoreError::new(
+                            ErrorCode::ResourceConflict {
+                                resource: "finalization_op".into(),
+                            },
+                            format!("CAS conflict after {MAX_RETRIES} retries"),
+                            ErrorSource::System,
+                        ));
                     }
-                    expected = self.read_durable_version(op_id).await.unwrap_or(expected + 1);
+                    expected = self
+                        .read_durable_version(op_id)
+                        .await
+                        .unwrap_or(expected + 1);
                 }
             }
         }
@@ -1839,7 +1867,10 @@ mod tests {
         let op_id: (String,) = sqlx::query_as("SELECT finalization_op_id FROM verification_finalization_operations WHERE verification_run_id='run-1'")
             .fetch_one(&c.db.pool).await.unwrap();
         // Use impossible version → conflict.
-        let result = c.svc.cas_save_progress(&op_id.0, &ReleaseProgress::default(), 99999).await;
+        let result = c
+            .svc
+            .cas_save_progress(&op_id.0, &ReleaseProgress::default(), 99999)
+            .await;
         assert!(matches!(result, ProgressCasResult::Conflict { .. }));
     }
 
@@ -1856,7 +1887,12 @@ mod tests {
         c.svc.finalize(&rq).await;
         // Response lost: retry.
         c.svc.finalize(&rq).await;
-        let claim_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM resource_claims WHERE status='released' AND id='c1'").fetch_one(&c.db.pool).await.unwrap();
+        let claim_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM resource_claims WHERE status='released' AND id='c1'",
+        )
+        .fetch_one(&c.db.pool)
+        .await
+        .unwrap();
         assert_eq!(claim_count.0, 1, "claim released exactly once");
     }
 
@@ -1868,7 +1904,12 @@ mod tests {
         let rq = mkreq("ik-rll", "h-rll");
         c.svc.finalize(&rq).await;
         c.svc.finalize(&rq).await;
-        let lease_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM workspace_leases WHERE lifecycle='released' AND id='l1'").fetch_one(&c.db.pool).await.unwrap();
+        let lease_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM workspace_leases WHERE lifecycle='released' AND id='l1'",
+        )
+        .fetch_one(&c.db.pool)
+        .await
+        .unwrap();
         assert_eq!(lease_count.0, 1);
     }
 
@@ -1879,7 +1920,10 @@ mod tests {
             .execute(&c.db.pool).await.unwrap();
         // Delete claim to simulate claim release returning 0 rows, which is not an error per se,
         // but finalize still completes. The test verifies no crash and proper state.
-        sqlx::query("DELETE FROM resource_claims WHERE id='c1'").execute(&c.db.pool).await.unwrap();
+        sqlx::query("DELETE FROM resource_claims WHERE id='c1'")
+            .execute(&c.db.pool)
+            .await
+            .unwrap();
         let r = c.svc.finalize(&mkreq("ik-fic", "h-fic")).await;
         // Should complete (claim release with 0 rows is not an error).
         assert!(matches!(r, FinalizationOutcome::Finalized { .. }));
@@ -1895,7 +1939,10 @@ mod tests {
         let r = c.svc.finalize(&mkreq("ik-oc", "h-oc")).await;
         assert!(matches!(r, FinalizationOutcome::OwnershipLost { .. }));
         // Claim must remain active (not released by wrong owner).
-        let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'").fetch_one(&c.db.pool).await.unwrap();
+        let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
         assert_eq!(cs.0, "active", "claim not released by wrong owner");
     }
 
