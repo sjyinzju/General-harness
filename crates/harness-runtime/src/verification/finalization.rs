@@ -9,8 +9,10 @@
 //! - Invokes LLMs
 //! - Starts Batch 6 reconciliation
 //!
-//! Resource release follows a Saga: outcome MUST be persisted before any
-//! resource (Claim, Lease, heartbeat, handoff) is released. Partial failures
+//! Resource release: outcome MUST be persisted before any resource (Claim,
+//! Lease, heartbeat, handoff) is released, and every release step is
+//! CAS-claimed pending→in_progress in `verification_release_steps` BEFORE
+//! its side effect executes (see super::release_steps). Partial failures
 //! mark reconciliation_required for Batch 6.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,37 +28,13 @@ use uuid::Uuid;
 
 use super::content_validator::VerificationContentValidator;
 use super::evidence_repo::VerificationEvidenceRepo;
+use super::release_steps::{
+    write_finalization_event, FaultPlan, ReleaseContext, ReleaseCounters, ReleaseEngine,
+    ReleaseRunOutcome, StepGate,
+};
 use crate::scheduler::heartbeat_registry::HeartbeatRegistry;
 
-/// Structured release step tracking for partial failure recovery.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum ReleaseStep {
-    OutcomePersisted,
-    ClaimReleased,
-    LeaseReleased,
-    HeartbeatUnregistered,
-    HandoffReleased,
-    ReleaseEventWritten,
-    Completed,
-}
-
-/// Release progress with per-step completion tracking.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct ReleaseProgress {
-    pub completed_steps: Vec<ReleaseStep>,
-    pub failed_step: Option<String>,
-    pub claim_rows: i64,
-    pub lease_rows: i64,
-    pub heartbeat_unregistered: bool,
-    pub handoff_rows: i64,
-}
-
-/// Result of a CAS progress save.
-#[derive(Debug, Clone)]
-pub enum ProgressCasResult {
-    Applied { new_version: i64 },
-    Conflict { durable_version: i64 },
-}
+pub use super::release_steps::ReleaseProgress;
 
 // ── Finalization request ──────────────────────────────────────────────────
 
@@ -449,6 +427,11 @@ pub struct VerificationFinalizationService {
     evidence_repo: VerificationEvidenceRepo,
     heartbeat_registry: Arc<HeartbeatRegistry>,
     pub finalizer_start_count: Arc<AtomicUsize>,
+    /// Shared observable side-effect counters (see ReleaseCounters).
+    pub release_counters: ReleaseCounters,
+    faults: FaultPlan,
+    gate: Option<StepGate>,
+    worker_id: String,
 }
 
 impl VerificationFinalizationService {
@@ -458,6 +441,59 @@ impl VerificationFinalizationService {
             pool,
             heartbeat_registry,
             finalizer_start_count: Arc::new(AtomicUsize::new(0)),
+            release_counters: ReleaseCounters::default(),
+            faults: FaultPlan::default(),
+            gate: None,
+            worker_id: format!("finalizer-{}", Uuid::new_v4()),
+        }
+    }
+
+    /// Share observable side-effect counters across services (two-pool tests).
+    pub fn with_counters(mut self, counters: ReleaseCounters) -> Self {
+        self.release_counters = counters;
+        self
+    }
+
+    /// Share a start counter across services (two-pool tests).
+    pub fn with_start_count(mut self, count: Arc<AtomicUsize>) -> Self {
+        self.finalizer_start_count = count;
+        self
+    }
+
+    /// Install an injected fault plan (integration tests; inert by default).
+    pub fn with_faults(mut self, faults: FaultPlan) -> Self {
+        self.faults = faults;
+        self
+    }
+
+    /// Install a step gate barrier (integration tests; inert by default).
+    pub fn with_gate(mut self, gate: StepGate) -> Self {
+        self.gate = Some(gate);
+        self
+    }
+
+    fn release_engine(&self) -> ReleaseEngine {
+        ReleaseEngine::new(
+            self.pool.clone(),
+            self.heartbeat_registry.clone(),
+            self.release_counters.clone(),
+            self.faults.clone(),
+            self.gate.clone(),
+            self.worker_id.clone(),
+        )
+    }
+
+    fn release_context(&self, req: &FinalizationRequest, op_id: &str) -> ReleaseContext {
+        ReleaseContext {
+            finalization_op_id: op_id.to_string(),
+            verification_run_id: req.verification_run_id.clone(),
+            execution_id: req.execution_id.clone(),
+            task_id: req.task_id.clone(),
+            project_id: req.project_id.clone(),
+            worktree_id: req.worktree_id.clone(),
+            expected_fencing: req.expected_fencing,
+            verification_owner_id: req.verification_owner_id.clone(),
+            request_hash: req.request_hash.clone(),
         }
     }
 
@@ -662,21 +698,37 @@ impl VerificationFinalizationService {
             .write_finalization_event(req, &op_id, terminal_event, Some(&outcome_json))
             .await;
 
-        // ── 5. Resource release Saga ─────────────────────────────────
-        let release_result = self.release_resources(req, &op_id).await;
-
-        // ── 6. Complete or mark reconciliation ──────────────────────
-        match release_result {
-            Ok(()) => {
-                let _ = sqlx::query(
-                    "UPDATE verification_finalization_operations SET lifecycle='completed', terminal_at=datetime('now') WHERE finalization_op_id=?",
-                )
-                .bind(&op_id)
-                .execute(&self.pool).await;
+        // ── 5. Resource release Saga (durable claim-before-side-effect) ──
+        // Every step is CAS-claimed pending→in_progress BEFORE its side
+        // effect; ownership is re-verified before every effect; operation
+        // completion is itself the final durable step.
+        let _ = self
+            .write_finalization_event(req, &op_id, "VerificationResourceReleaseStarted", None)
+            .await;
+        let engine = self.release_engine();
+        let ctx = self.release_context(req, &op_id);
+        match engine.run_release(&ctx).await {
+            ReleaseRunOutcome::Completed { .. } => {}
+            ReleaseRunOutcome::HeldByOther { .. } => {
+                // Another worker holds the saga — it will drive it to
+                // completion. Zero side effects were executed past that step.
             }
-            Err(e) => {
+            ReleaseRunOutcome::ReconciliationRequired { step, reason }
+            | ReleaseRunOutcome::OwnershipLost { step, reason } => {
                 let _ = self
-                    .mark_reconciliation(&op_id, &format!("release: {e}"))
+                    .mark_reconciliation(&op_id, &format!("release {} : {}", step.as_str(), reason))
+                    .await;
+            }
+            ReleaseRunOutcome::Crashed { step } => {
+                // Simulated crash (fault injection): durable state is left
+                // exactly as the crash point produced it.
+                return FinalizationOutcome::InfrastructureError {
+                    reason: format!("crash injected at {}", step.as_str()),
+                };
+            }
+            ReleaseRunOutcome::InfrastructureError { reason } => {
+                let _ = self
+                    .mark_reconciliation(&op_id, &format!("release: {reason}"))
                     .await;
             }
         }
@@ -758,196 +810,12 @@ impl VerificationFinalizationService {
         None
     }
 
-    // ── Resource release Saga (per-step persistence) ───────────────
+    // ── Resource release: implemented by super::release_steps::ReleaseEngine.
+    // The legacy in-place release functions (side effect first, progress CAS
+    // after) were removed: execution authority now lives in
+    // verification_release_steps rows, claimed BEFORE each side effect.
 
-    async fn release_resources(
-        &self,
-        req: &FinalizationRequest,
-        op_id: &str,
-    ) -> Result<(), CoreError> {
-        let _ = sqlx::query(
-            "UPDATE verification_finalization_operations SET lifecycle='releasing_resources' WHERE finalization_op_id=?",
-        ).bind(op_id).execute(&self.pool).await;
-        let _ = self
-            .write_finalization_event(req, op_id, "VerificationResourceReleaseStarted", None)
-            .await;
-
-        let mut rp = ReleaseProgress::default();
-        rp = self.release_claim(req, op_id, rp).await?;
-        rp = self.release_lease(req, op_id, rp).await?;
-        rp = self.unregister_heartbeat(req, op_id, rp).await?;
-        rp = self.release_handoff(req, op_id, rp).await?;
-
-        let _ = self
-            .write_finalization_event(req, op_id, "VerificationResourcesReleased", None)
-            .await;
-        rp.completed_steps.push(ReleaseStep::ReleaseEventWritten);
-        self.save_release_progress(op_id, &rp).await?;
-        rp.completed_steps.push(ReleaseStep::Completed);
-        self.save_release_progress(op_id, &rp).await?;
-        Ok(())
-    }
-
-    async fn release_claim(
-        &self,
-        req: &FinalizationRequest,
-        op_id: &str,
-        mut rp: ReleaseProgress,
-    ) -> Result<ReleaseProgress, CoreError> {
-        let rows = match sqlx::query("UPDATE resource_claims SET status='released', released_at=datetime('now') WHERE task_id=? AND status='active'")
-            .bind(&req.task_id).execute(&self.pool).await {
-            Ok(r) => r,
-            Err(e) => {
-                let _ = self.write_finalization_event(req, op_id, "VerificationResourceReleaseFailed", Some("claim")).await;
-                return Err(CoreError::new(ErrorCode::PersistenceError, format!("claim: {e}"), ErrorSource::System));
-            }
-        };
-        rp.claim_rows = rows.rows_affected() as i64;
-        rp.completed_steps.push(ReleaseStep::ClaimReleased);
-        self.save_release_progress(op_id, &rp).await?;
-        Ok(rp)
-    }
-
-    async fn release_lease(
-        &self,
-        req: &FinalizationRequest,
-        op_id: &str,
-        mut rp: ReleaseProgress,
-    ) -> Result<ReleaseProgress, CoreError> {
-        let rows = match sqlx::query("UPDATE workspace_leases SET lifecycle='released', released_at=datetime('now') WHERE task_id=? AND lifecycle='acquired'")
-            .bind(&req.task_id).execute(&self.pool).await {
-            Ok(r) => r,
-            Err(e) => {
-                rp.failed_step = Some("lease".into()); let _ = self.save_release_progress(op_id, &rp).await;
-                let _ = self.write_finalization_event(req, op_id, "VerificationResourceReleaseFailed", Some("lease")).await;
-                return Err(CoreError::new(ErrorCode::PersistenceError, format!("lease: {e}"), ErrorSource::System));
-            }
-        };
-        rp.lease_rows = rows.rows_affected() as i64;
-        rp.completed_steps.push(ReleaseStep::LeaseReleased);
-        self.save_release_progress(op_id, &rp).await?;
-        Ok(rp)
-    }
-
-    async fn unregister_heartbeat(
-        &self,
-        req: &FinalizationRequest,
-        op_id: &str,
-        mut rp: ReleaseProgress,
-    ) -> Result<ReleaseProgress, CoreError> {
-        self.heartbeat_registry
-            .remove_after_finalization(&req.execution_id)
-            .await;
-        if self.heartbeat_registry.exists(&req.execution_id).await {
-            rp.failed_step = Some("heartbeat".into());
-            rp.heartbeat_unregistered = false;
-            let _ = self.save_release_progress(op_id, &rp).await;
-            let _ = self
-                .write_finalization_event(
-                    req,
-                    op_id,
-                    "VerificationResourceReleaseFailed",
-                    Some("heartbeat"),
-                )
-                .await;
-            return Err(CoreError::new(
-                ErrorCode::ResourceConflict {
-                    resource: "heartbeat".into(),
-                },
-                "heartbeat still exists after unregister",
-                ErrorSource::System,
-            ));
-        }
-        rp.heartbeat_unregistered = true;
-        rp.completed_steps.push(ReleaseStep::HeartbeatUnregistered);
-        self.save_release_progress(op_id, &rp).await?;
-        Ok(rp)
-    }
-
-    async fn release_handoff(
-        &self,
-        req: &FinalizationRequest,
-        op_id: &str,
-        mut rp: ReleaseProgress,
-    ) -> Result<ReleaseProgress, CoreError> {
-        let rows = match sqlx::query("UPDATE resource_handoffs SET status='released' WHERE execution_id=? AND owner_kind='verification' AND status='verification_owned'")
-            .bind(&req.execution_id).execute(&self.pool).await {
-            Ok(r) => r,
-            Err(e) => {
-                rp.failed_step = Some("handoff".into()); let _ = self.save_release_progress(op_id, &rp).await;
-                let _ = self.write_finalization_event(req, op_id, "VerificationResourceReleaseFailed", Some("handoff")).await;
-                return Err(CoreError::new(ErrorCode::PersistenceError, format!("handoff: {e}"), ErrorSource::System));
-            }
-        };
-        rp.handoff_rows = rows.rows_affected() as i64;
-        rp.completed_steps.push(ReleaseStep::HandoffReleased);
-        self.save_release_progress(op_id, &rp).await?;
-        Ok(rp)
-    }
-
-    async fn read_durable_version(&self, op_id: &str) -> Result<i64, CoreError> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT version FROM verification_finalization_operations WHERE finalization_op_id=?",
-        )
-        .bind(op_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| {
-            CoreError::new(
-                ErrorCode::PersistenceError,
-                format!("read version: {e}"),
-                ErrorSource::System,
-            )
-        })?;
-        Ok(row.0)
-    }
-
-    async fn cas_save_progress(
-        &self,
-        op_id: &str,
-        rp: &ReleaseProgress,
-        expected_version: i64,
-    ) -> ProgressCasResult {
-        let progress_json = serde_json::to_string(rp).unwrap_or_default();
-        match sqlx::query("UPDATE verification_finalization_operations SET release_progress_json=?, resources_released_at=datetime('now'), version=version+1 WHERE finalization_op_id=? AND version=?")
-            .bind(&progress_json).bind(op_id).bind(expected_version).execute(&self.pool).await {
-            Ok(r) if r.rows_affected() == 1 => ProgressCasResult::Applied { new_version: expected_version + 1 },
-            _ => ProgressCasResult::Conflict { durable_version: expected_version },
-        }
-    }
-
-    async fn save_release_progress(
-        &self,
-        op_id: &str,
-        rp: &ReleaseProgress,
-    ) -> Result<(), CoreError> {
-        const MAX_RETRIES: u32 = 3;
-        let mut attempt = 0u32;
-        let mut expected = self.read_durable_version(op_id).await.unwrap_or(1);
-        loop {
-            match self.cas_save_progress(op_id, rp, expected).await {
-                ProgressCasResult::Applied { .. } => return Ok(()),
-                ProgressCasResult::Conflict { .. } => {
-                    attempt += 1;
-                    if attempt >= MAX_RETRIES {
-                        return Err(CoreError::new(
-                            ErrorCode::ResourceConflict {
-                                resource: "finalization_op".into(),
-                            },
-                            format!("CAS conflict after {MAX_RETRIES} retries"),
-                            ErrorSource::System,
-                        ));
-                    }
-                    expected = self
-                        .read_durable_version(op_id)
-                        .await
-                        .unwrap_or(expected + 1);
-                }
-            }
-        }
-    }
-
-    // ── Event writing ──────────────────────────────────────────────
+    // ── Event writing (delegates to the shared exactly-once writer) ─
 
     async fn write_finalization_event(
         &self,
@@ -956,51 +824,11 @@ impl VerificationFinalizationService {
         event_type: &str,
         detail: Option<&str>,
     ) -> Result<(), CoreError> {
-        // Create synthetic step_op row so FK on verification_step_events is satisfied.
-        sqlx::query("INSERT OR IGNORE INTO verification_step_operations (op_id, verification_run_id, step_id, plan_id, execution_id, step_config_hash, worktree_id, fencing_token, status, idempotency_key, request_hash) VALUES (?,?,?,?,?,?,?,?,'finalization',?,?)")
-            .bind(op_id)
-            .bind(&req.verification_run_id)
-            .bind("finalization")
-            .bind("plan-final")
-            .bind(&req.execution_id)
-            .bind("final-cfg")
-            .bind(&req.worktree_id)
-            .bind(req.expected_fencing)
-            .bind(op_id)
-            .bind(&req.request_hash)
-            .execute(&self.pool)
+        let ctx = self.release_context(req, op_id);
+        write_finalization_event(&self.pool, &ctx, event_type, detail)
             .await
-            .map_err(|e| CoreError::new(
-                ErrorCode::PersistenceError,
-                format!("synthetic step_op: {e}"),
-                ErrorSource::System,
-            ))?;
-
-        let eid = format!("evt-final-{}", Uuid::new_v4());
-        let ikey = format!("final-ev-{}-{}", req.verification_run_id, event_type);
-        sqlx::query(
-            "INSERT OR IGNORE INTO verification_step_events (event_id, verification_run_id, step_id, step_op_id, execution_id, task_id, worktree_id, fencing_token, event_type, step_kind, detail_json, idempotency_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-        )
-        .bind(&eid)
-        .bind(&req.verification_run_id)
-        .bind("finalization")
-        .bind(op_id)
-        .bind(&req.execution_id)
-        .bind(&req.task_id)
-        .bind(&req.worktree_id)
-        .bind(req.expected_fencing)
-        .bind(event_type)
-        .bind("finalization")
-        .bind(detail)
-        .bind(&ikey)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| CoreError::new(
-            ErrorCode::PersistenceError,
-            format!("finalization event {event_type}: {e}"),
-            ErrorSource::System,
-        ))?;
-        Ok(())
+            .map(|_| ())
+            .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e, ErrorSource::System))
     }
 
     async fn mark_reconciliation(&self, op_id: &str, reason: &str) -> Result<(), CoreError> {
@@ -1839,42 +1667,6 @@ mod tests {
     }
 
     // ══════════════════════════════════════════════════════════════════
-    // CAS progress: real AND version=? predicate
-    // ══════════════════════════════════════════════════════════════════
-
-    #[tokio::test]
-    async fn test_cas_save_applies_on_version_match() {
-        let c = setup().await;
-        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-cas','run-1','step-1','plan-1','passed',datetime('now'))")
-            .execute(&c.db.pool).await.unwrap();
-        // First finalization creates the operation row with version=1.
-        c.svc.finalize(&mkreq("ik-cas1", "h-cas1")).await;
-        // Read existing operation's version.
-        let op_id: (String,) = sqlx::query_as("SELECT finalization_op_id FROM verification_finalization_operations WHERE verification_run_id='run-1'")
-            .fetch_one(&c.db.pool).await.unwrap();
-        let v1 = c.svc.read_durable_version(&op_id.0).await.unwrap();
-        let rp = ReleaseProgress::default();
-        let result = c.svc.cas_save_progress(&op_id.0, &rp, v1).await;
-        assert!(matches!(result, ProgressCasResult::Applied { .. }));
-    }
-
-    #[tokio::test]
-    async fn test_cas_conflict_on_version_mismatch() {
-        let c = setup().await;
-        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-cas2','run-1','step-1','plan-1','passed',datetime('now'))")
-            .execute(&c.db.pool).await.unwrap();
-        c.svc.finalize(&mkreq("ik-cas2", "h-cas2")).await;
-        let op_id: (String,) = sqlx::query_as("SELECT finalization_op_id FROM verification_finalization_operations WHERE verification_run_id='run-1'")
-            .fetch_one(&c.db.pool).await.unwrap();
-        // Use impossible version → conflict.
-        let result = c
-            .svc
-            .cas_save_progress(&op_id.0, &ReleaseProgress::default(), 99999)
-            .await;
-        assert!(matches!(result, ProgressCasResult::Conflict { .. }));
-    }
-
-    // ══════════════════════════════════════════════════════════════════
     // Response-lost per step: no duplicate side effects
     // ══════════════════════════════════════════════════════════════════
 
@@ -1947,14 +1739,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cas_retry_limited() {
+    async fn test_release_steps_durable_and_completed() {
         let c = setup().await;
-        // save_release_progress with max 3 retries will succeed on valid op_id.
+        // The durable step rows are the execution authority: after a full
+        // finalization all six must be 'completed'.
         sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-cr','run-1','step-1','plan-1','passed',datetime('now'))")
             .execute(&c.db.pool).await.unwrap();
         c.svc.finalize(&mkreq("ik-cr", "h-cr")).await;
-        // The release progress was saved with CAS — verify operation completed.
+        let done: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_release_steps rs \
+             JOIN verification_finalization_operations fo ON fo.finalization_op_id = rs.finalization_op_id \
+             WHERE fo.verification_run_id='run-1' AND rs.state='completed'",
+        )
+        .fetch_one(&c.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(done.0, 6, "all six release steps durably completed");
         let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM verification_finalization_operations WHERE verification_run_id='run-1'").fetch_one(&c.db.pool).await.unwrap();
-        assert!(lc.0 == "completed" || lc.0.contains("reconciliation"));
+        assert_eq!(lc.0, "completed");
     }
 }

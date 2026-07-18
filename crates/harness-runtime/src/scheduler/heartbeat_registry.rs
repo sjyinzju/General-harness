@@ -104,6 +104,21 @@ pub struct InspectResult {
     pub last_error: Option<String>,
 }
 
+/// Result of a fenced heartbeat removal (release protocol).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeartbeatRemoveOutcome {
+    /// Entry existed with matching owner + fencing and was removed.
+    Removed,
+    /// No entry registered for this execution.
+    NotFound,
+    /// Entry exists but belongs to a different owner or fencing epoch —
+    /// it was NOT removed.
+    IdentityMismatch {
+        owner_id: String,
+        fencing_token: i64,
+    },
+}
+
 /// Result of a takeover operation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TakeoverResult {
@@ -318,6 +333,31 @@ impl HeartbeatRegistry {
         let mut lease_idx = self.lease_index.write().await;
         if let Some(entry) = entries.remove(execution_id) {
             lease_idx.remove(&entry.lease_id);
+        }
+    }
+
+    /// Fenced removal for the release protocol: the entry is removed ONLY if
+    /// its owner_id and fencing_token exactly match. A mismatch means the
+    /// entry belongs to another owner (or epoch) and MUST NOT be touched.
+    pub async fn remove_if_matches(
+        &self,
+        execution_id: &str,
+        owner_id: &str,
+        fencing_token: i64,
+    ) -> HeartbeatRemoveOutcome {
+        let mut entries = self.entries.write().await;
+        let mut lease_idx = self.lease_index.write().await;
+        match entries.get(execution_id) {
+            None => HeartbeatRemoveOutcome::NotFound,
+            Some(entry) if entry.owner_id == owner_id && entry.fencing_token == fencing_token => {
+                let entry = entries.remove(execution_id).expect("checked above");
+                lease_idx.remove(&entry.lease_id);
+                HeartbeatRemoveOutcome::Removed
+            }
+            Some(entry) => HeartbeatRemoveOutcome::IdentityMismatch {
+                owner_id: entry.owner_id.clone(),
+                fencing_token: entry.fencing_token,
+            },
         }
     }
 

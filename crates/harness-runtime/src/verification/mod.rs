@@ -12,6 +12,7 @@ pub mod ownership_service;
 pub mod plan_repo;
 pub mod policy_evidence;
 pub mod reconciler;
+pub mod release_steps;
 pub mod run_repo;
 
 pub use content_validator::VerificationContentValidator;
@@ -30,5 +31,9 @@ pub use ownership_service::{
 pub use plan_repo::VerificationPlanRepo;
 pub use policy_evidence::{
     PolicyScanner, PolicyStepOutcome, PolicyStepRequest, VerificationPolicyEvidenceService,
+};
+pub use release_steps::{
+    FaultMode, FaultPlan, ReleaseContext, ReleaseCounters, ReleaseEngine, ReleaseRunOutcome,
+    ReleaseStepKind, ReleaseStepState, StepClaimResult, StepGate,
 };
 pub use run_repo::VerificationRunRepo;
