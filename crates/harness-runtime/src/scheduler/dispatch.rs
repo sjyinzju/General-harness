@@ -578,7 +578,11 @@ impl SchedulerOrchestrator {
         };
 
         let harness_root = std::env::temp_dir().join("harness-worktrees");
-        let wt_path = harness_root.join(format!("wt-{}", &exec_id[..8]));
+        // Full execution id: the previous 8-char prefix ("exec-" + 3 hex
+        // chars) had 4096 possible leaves in a shared, never-pruned root —
+        // stale directories from prior runs collided with new dispatches
+        // and made `git worktree add` fail.
+        let wt_path = harness_root.join(format!("wt-{exec_id}"));
         let wt_spec = WorktreeSpec {
             project_id: req.project_id.to_string(),
             task_id: req.task_id.to_string(),
