@@ -195,18 +195,46 @@ async fn test_one_repair_then_pass() {
     assert_eq!(di.classify(), DecisionClassification::ContinueRepair);
 
     // Mark first attempt as terminal so the active-attempt guard passes.
-    let a1_row = TaskLoopRepo::new(db.pool.clone()).load_attempt(&a1_id).await.unwrap().unwrap();
+    let a1_row = TaskLoopRepo::new(db.pool.clone())
+        .load_attempt(&a1_id)
+        .await
+        .unwrap()
+        .unwrap();
     let _ = TaskLoopRepo::new(db.pool.clone())
-        .terminal_attempt(&a1_id, a1_row.version, "vr1", "failed", "ofp1", "dfp1", "dec1")
+        .terminal_attempt(
+            &a1_id,
+            a1_row.version,
+            "vr1",
+            "failed",
+            "ofp1",
+            "dfp1",
+            "dec1",
+        )
         .await
         .unwrap();
     // Transition loop to Evaluating so we can create the next attempt.
-    let l2 = TaskLoopRepo::new(db.pool.clone()).load_loop(&loop_id).await.unwrap().unwrap();
+    let l2 = TaskLoopRepo::new(db.pool.clone())
+        .load_loop(&loop_id)
+        .await
+        .unwrap()
+        .unwrap();
     let _ = TaskLoopRepo::new(db.pool.clone())
-        .transition_loop(&loop_id, l2.version, l2.fencing_token, "owner1", LoopLifecycle::Evaluating, None)
-        .await.unwrap();
+        .transition_loop(
+            &loop_id,
+            l2.version,
+            l2.fencing_token,
+            "owner1",
+            LoopLifecycle::Evaluating,
+            None,
+        )
+        .await
+        .unwrap();
 
-    let l3 = TaskLoopRepo::new(db.pool.clone()).load_loop(&loop_id).await.unwrap().unwrap();
+    let l3 = TaskLoopRepo::new(db.pool.clone())
+        .load_loop(&loop_id)
+        .await
+        .unwrap()
+        .unwrap();
     let r2 = s
         .prepare_next_attempt(
             &loop_id,
