@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 use super::content_validator::VerificationContentValidator;
 use super::evidence_repo::VerificationEvidenceRepo;
+use crate::scheduler::heartbeat_registry::HeartbeatRegistry;
 
 /// Structured release step tracking for partial failure recovery.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -98,7 +99,7 @@ pub enum FinalizationOutcome {
 
 // ── Finalization dossier ─────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FinalizationDossier {
     pub run_id: String,
     pub task_id: String,
@@ -124,7 +125,7 @@ pub struct FinalizationDossier {
     pub next_action: NextActionCategory,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum NextActionCategory {
     CompleteCandidate,
     Repairable,
@@ -381,14 +382,16 @@ impl VerificationOutcomeAggregator {
 pub struct VerificationFinalizationService {
     pool: SqlitePool,
     evidence_repo: VerificationEvidenceRepo,
+    heartbeat_registry: Arc<HeartbeatRegistry>,
     pub finalizer_start_count: Arc<AtomicUsize>,
 }
 
 impl VerificationFinalizationService {
-    pub fn new(pool: SqlitePool) -> Self {
+    pub fn new(pool: SqlitePool, heartbeat_registry: Arc<HeartbeatRegistry>) -> Self {
         Self {
             evidence_repo: VerificationEvidenceRepo::new(pool.clone()),
             pool,
+            heartbeat_registry,
             finalizer_start_count: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -565,23 +568,30 @@ impl VerificationFinalizationService {
             }
         }
 
-        // Mark outcome persisted.
+        // Persist dossier to DB.
+        let dossier_json = serde_json::to_string(&dossier).unwrap_or_default();
+        // Mark outcome persisted with dossier.
         let _ = sqlx::query(
-            "UPDATE verification_finalization_operations SET lifecycle='outcome_persisted', outcome_summary=?, outcome_classification=?, outcome_persisted_at=datetime('now') WHERE finalization_op_id=?",
+            "UPDATE verification_finalization_operations SET lifecycle='outcome_persisted', outcome_summary=?, outcome_classification=?, dossier_json=?, outcome_persisted_at=datetime('now') WHERE finalization_op_id=?",
         )
         .bind(&outcome.summary)
         .bind(outcome.failure_classification.as_ref().map(|c| c.category_name()))
+        .bind(&dossier_json)
         .bind(&op_id)
         .execute(&self.pool).await;
 
         // Write terminal outcome event.
-        let terminal_event = match outcome.result {
-            VerificationResult::Passed => "VerificationPassed",
-            VerificationResult::Failed | VerificationResult::PassedWithWarnings => {
-                "VerificationFailed"
+        let terminal_event = if req.cancellation_requested {
+            "VerificationCancelled"
+        } else {
+            match outcome.result {
+                VerificationResult::Passed => "VerificationPassed",
+                VerificationResult::Failed | VerificationResult::PassedWithWarnings => {
+                    "VerificationFailed"
+                }
+                VerificationResult::Blocked => "VerificationBlocked",
+                VerificationResult::Error => "VerificationBlocked",
             }
-            VerificationResult::Blocked => "VerificationBlocked",
-            VerificationResult::Error => "VerificationBlocked",
         };
         let _ = self
             .write_finalization_event(req, &op_id, terminal_event, Some(&outcome_json))
@@ -683,93 +693,142 @@ impl VerificationFinalizationService {
         None
     }
 
-    // ── Resource release Saga ──────────────────────────────────────
+    // ── Resource release Saga (per-step persistence) ───────────────
 
     async fn release_resources(
         &self,
         req: &FinalizationRequest,
         op_id: &str,
     ) -> Result<(), CoreError> {
-        // Mark releasing_resources.
         let _ = sqlx::query(
             "UPDATE verification_finalization_operations SET lifecycle='releasing_resources' WHERE finalization_op_id=?",
-        )
-        .bind(op_id)
-        .execute(&self.pool).await;
-
-        // Write resource release started event.
+        ).bind(op_id).execute(&self.pool).await;
         let _ = self
             .write_finalization_event(req, op_id, "VerificationResourceReleaseStarted", None)
             .await;
 
         let mut rp = ReleaseProgress::default();
+        rp = self.release_claim(req, op_id, rp).await?;
+        rp = self.release_lease(req, op_id, rp).await?;
+        rp = self.unregister_heartbeat(req, op_id, rp).await?;
+        rp = self.release_handoff(req, op_id, rp).await?;
 
-        // 1. Release Claim.
-        let claim_rows = sqlx::query(
-            "UPDATE resource_claims SET status='released', released_at=datetime('now') WHERE task_id=? AND status='active'",
-        )
-        .bind(&req.task_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            rp.failed_step = Some("claim".into());
-            CoreError::new(ErrorCode::PersistenceError, format!("claim: {e}"), ErrorSource::System)
-        })?;
-        rp.claim_rows = claim_rows.rows_affected() as i64;
-        rp.completed_steps.push(ReleaseStep::ClaimReleased);
-
-        // 2. Release Lease.
-        let lease_rows = sqlx::query(
-            "UPDATE workspace_leases SET lifecycle='released', released_at=datetime('now') WHERE task_id=? AND lifecycle='acquired'",
-        )
-        .bind(&req.task_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            rp.failed_step = Some("lease".into());
-            CoreError::new(ErrorCode::PersistenceError, format!("lease: {e}"), ErrorSource::System)
-        })?;
-        rp.lease_rows = lease_rows.rows_affected() as i64;
-        rp.completed_steps.push(ReleaseStep::LeaseReleased);
-
-        // 3. Heartbeat unregister: remove verification ownership events.
-        let _ = sqlx::query("DELETE FROM verification_ownership_events WHERE execution_id=?")
-            .bind(&req.execution_id)
-            .execute(&self.pool)
-            .await;
-        rp.heartbeat_unregistered = true;
-        rp.completed_steps.push(ReleaseStep::HeartbeatUnregistered);
-
-        // 4. Release handoff (CAS: VerificationOwned → Released).
-        let handoff_rows = sqlx::query(
-            "UPDATE resource_handoffs SET status='released' WHERE execution_id=? AND owner_kind='verification' AND status='verification_owned'",
-        )
-        .bind(&req.execution_id)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| {
-            rp.failed_step = Some("handoff".into());
-            CoreError::new(ErrorCode::PersistenceError, format!("handoff: {e}"), ErrorSource::System)
-        })?;
-        rp.handoff_rows = handoff_rows.rows_affected() as i64;
-        rp.completed_steps.push(ReleaseStep::HandoffReleased);
-
-        // Save release progress.
-        let progress_json = serde_json::to_string(&rp).unwrap_or_default();
-        let _ = sqlx::query(
-            "UPDATE verification_finalization_operations SET release_progress_json=?, resources_released_at=datetime('now') WHERE finalization_op_id=?",
-        )
-        .bind(&progress_json)
-        .bind(op_id)
-        .execute(&self.pool).await;
-
-        // Write release completed event.
-        rp.completed_steps.push(ReleaseStep::ReleaseEventWritten);
         let _ = self
             .write_finalization_event(req, op_id, "VerificationResourcesReleased", None)
             .await;
+        rp.completed_steps.push(ReleaseStep::ReleaseEventWritten);
+        self.save_release_progress(op_id, &rp).await?;
         rp.completed_steps.push(ReleaseStep::Completed);
+        self.save_release_progress(op_id, &rp).await?;
+        Ok(())
+    }
 
+    async fn release_claim(
+        &self,
+        req: &FinalizationRequest,
+        op_id: &str,
+        mut rp: ReleaseProgress,
+    ) -> Result<ReleaseProgress, CoreError> {
+        let rows = match sqlx::query("UPDATE resource_claims SET status='released', released_at=datetime('now') WHERE task_id=? AND status='active'")
+            .bind(&req.task_id).execute(&self.pool).await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self.write_finalization_event(req, op_id, "VerificationResourceReleaseFailed", Some("claim")).await;
+                return Err(CoreError::new(ErrorCode::PersistenceError, format!("claim: {e}"), ErrorSource::System));
+            }
+        };
+        rp.claim_rows = rows.rows_affected() as i64;
+        rp.completed_steps.push(ReleaseStep::ClaimReleased);
+        self.save_release_progress(op_id, &rp).await?;
+        Ok(rp)
+    }
+
+    async fn release_lease(
+        &self,
+        req: &FinalizationRequest,
+        op_id: &str,
+        mut rp: ReleaseProgress,
+    ) -> Result<ReleaseProgress, CoreError> {
+        let rows = match sqlx::query("UPDATE workspace_leases SET lifecycle='released', released_at=datetime('now') WHERE task_id=? AND lifecycle='acquired'")
+            .bind(&req.task_id).execute(&self.pool).await {
+            Ok(r) => r,
+            Err(e) => {
+                rp.failed_step = Some("lease".into()); let _ = self.save_release_progress(op_id, &rp).await;
+                let _ = self.write_finalization_event(req, op_id, "VerificationResourceReleaseFailed", Some("lease")).await;
+                return Err(CoreError::new(ErrorCode::PersistenceError, format!("lease: {e}"), ErrorSource::System));
+            }
+        };
+        rp.lease_rows = rows.rows_affected() as i64;
+        rp.completed_steps.push(ReleaseStep::LeaseReleased);
+        self.save_release_progress(op_id, &rp).await?;
+        Ok(rp)
+    }
+
+    async fn unregister_heartbeat(
+        &self,
+        req: &FinalizationRequest,
+        op_id: &str,
+        mut rp: ReleaseProgress,
+    ) -> Result<ReleaseProgress, CoreError> {
+        self.heartbeat_registry
+            .remove_after_finalization(&req.execution_id)
+            .await;
+        if self.heartbeat_registry.exists(&req.execution_id).await {
+            rp.failed_step = Some("heartbeat".into());
+            rp.heartbeat_unregistered = false;
+            let _ = self.save_release_progress(op_id, &rp).await;
+            let _ = self
+                .write_finalization_event(
+                    req,
+                    op_id,
+                    "VerificationResourceReleaseFailed",
+                    Some("heartbeat"),
+                )
+                .await;
+            return Err(CoreError::new(
+                ErrorCode::ResourceConflict {
+                    resource: "heartbeat".into(),
+                },
+                "heartbeat still exists after unregister",
+                ErrorSource::System,
+            ));
+        }
+        rp.heartbeat_unregistered = true;
+        rp.completed_steps.push(ReleaseStep::HeartbeatUnregistered);
+        self.save_release_progress(op_id, &rp).await?;
+        Ok(rp)
+    }
+
+    async fn release_handoff(
+        &self,
+        req: &FinalizationRequest,
+        op_id: &str,
+        mut rp: ReleaseProgress,
+    ) -> Result<ReleaseProgress, CoreError> {
+        let rows = match sqlx::query("UPDATE resource_handoffs SET status='released' WHERE execution_id=? AND owner_kind='verification' AND status='verification_owned'")
+            .bind(&req.execution_id).execute(&self.pool).await {
+            Ok(r) => r,
+            Err(e) => {
+                rp.failed_step = Some("handoff".into()); let _ = self.save_release_progress(op_id, &rp).await;
+                let _ = self.write_finalization_event(req, op_id, "VerificationResourceReleaseFailed", Some("handoff")).await;
+                return Err(CoreError::new(ErrorCode::PersistenceError, format!("handoff: {e}"), ErrorSource::System));
+            }
+        };
+        rp.handoff_rows = rows.rows_affected() as i64;
+        rp.completed_steps.push(ReleaseStep::HandoffReleased);
+        self.save_release_progress(op_id, &rp).await?;
+        Ok(rp)
+    }
+
+    async fn save_release_progress(
+        &self,
+        op_id: &str,
+        rp: &ReleaseProgress,
+    ) -> Result<(), CoreError> {
+        let progress_json = serde_json::to_string(rp).unwrap_or_default();
+        sqlx::query("UPDATE verification_finalization_operations SET release_progress_json=?, resources_released_at=datetime('now') WHERE finalization_op_id=?")
+            .bind(&progress_json).bind(op_id).execute(&self.pool).await
+            .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("save progress: {e}"), ErrorSource::System))?;
         Ok(())
     }
 
@@ -852,6 +911,7 @@ mod tests {
     struct Ctx {
         svc: VerificationFinalizationService,
         db: Database,
+        hb: Arc<HeartbeatRegistry>,
     }
 
     async fn setup() -> Ctx {
@@ -881,8 +941,9 @@ mod tests {
             .execute(&p).await.unwrap();
         sqlx::query("INSERT INTO resource_claims(id,project_id,task_id,execution_id,resource_kind,normalized_resource,access_mode,status) VALUES('c1','p1','t1','e1','workspace','wt1','read_write','active')")
             .execute(&p).await.unwrap();
-        let svc = VerificationFinalizationService::new(p);
-        Ctx { svc, db }
+        let hb = Arc::new(HeartbeatRegistry::new());
+        let svc = VerificationFinalizationService::new(p, hb.clone());
+        Ctx { svc, db, hb }
     }
 
     fn mkreq(ikey: &str, hash: &str) -> FinalizationRequest {
@@ -1229,8 +1290,9 @@ mod tests {
         sqlx::query("INSERT INTO resource_claims(id,project_id,task_id,execution_id,resource_kind,normalized_resource,access_mode,status) VALUES('c1','p1','t1','e1','workspace','wt1','read_write','active')").execute(&p).await.unwrap();
         sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-1','run-1','step-1','plan-1','passed',datetime('now'))").execute(&p).await.unwrap();
 
-        let svc1 = VerificationFinalizationService::new(db1.pool.clone());
-        let svc2 = VerificationFinalizationService::new(db2.pool.clone());
+        let hb_shared = Arc::new(HeartbeatRegistry::new());
+        let svc1 = VerificationFinalizationService::new(db1.pool.clone(), hb_shared.clone());
+        let svc2 = VerificationFinalizationService::new(db2.pool.clone(), hb_shared.clone());
 
         let rq = mkreq("ik-two", "h-two");
         let (r1, r2) = tokio::join!(svc1.finalize(&rq), svc2.finalize(&rq));
@@ -1315,22 +1377,15 @@ mod tests {
     #[tokio::test]
     async fn test_heartbeat_unregistered_after_release() {
         let c = setup().await;
-        // Insert an ownership event to simulate active heartbeat.
-        sqlx::query("INSERT INTO verification_ownership_events(event_id,verification_run_id,project_id,task_id,execution_id,plan_hash,handoff_id,worktree_id,lease_id,fencing_token,owner_id,idempotency_key) VALUES('ev-own','run-1','p1','t1','e1','ha','ho-1','wt1','l1',5,'verify-run-1','ik-own')")
-            .execute(&c.db.pool).await.unwrap();
+        // Heartbeat is tested via HeartbeatRegistry, not DB event deletion.
         sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-hb','run-1','step-1','plan-1','passed',datetime('now'))")
             .execute(&c.db.pool).await.unwrap();
-
         c.svc.finalize(&mkreq("ik-hb1", "h-hb1")).await;
-
-        // Heartbeat event must be removed.
-        let hb_count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM verification_ownership_events WHERE execution_id='e1'",
-        )
-        .fetch_one(&c.db.pool)
-        .await
-        .unwrap();
-        assert_eq!(hb_count.0, 0, "heartbeat must be unregistered");
+        let exists = c.hb.exists("e1").await;
+        assert!(
+            !exists,
+            "heartbeat must not exist in HeartbeatRegistry after release"
+        );
     }
 
     // ══════════════════════════════════════════════════════════════════
