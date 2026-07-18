@@ -16,6 +16,10 @@ pub enum ClaimStatus {
 /// Try to claim an idempotency key for execution.
 /// Returns Ok(Some(token)) if claimed, Ok(None) if already completed,
 /// Err if request_hash mismatches or lease is held by another owner.
+///
+/// Stale-lease takeover uses version-CAS: exactly one concurrent caller
+/// wins; losers re-read the durable row and return Ok(None) (never return
+/// a claim token after losing the CAS).
 pub async fn try_claim(
     pool: &SqlitePool,
     key: &str,
@@ -26,16 +30,17 @@ pub async fn try_claim(
     let now = now_sql();
     let expires = expires_sql(lease_secs);
 
-    // Check if already completed
-    let existing: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT status, request_hash, owner_token FROM idempotency_records WHERE key = ?",
+    // Check if already completed or pending with active lease.
+    let existing: Option<(String, String, String, i64, i64)> = sqlx::query_as(
+        "SELECT status, request_hash, owner_token, version, fencing_token \
+         FROM idempotency_records WHERE key = ?",
     )
     .bind(key)
     .fetch_optional(pool)
     .await
     .map_err(db_err)?;
 
-    if let Some((status, existing_hash, _owner)) = existing {
+    if let Some((status, existing_hash, _owner, existing_version, _existing_fencing)) = existing {
         match status.as_str() {
             "completed" | "failed_final" => return Ok(None), // Already terminal
             "failed_retryable" if existing_hash != request_hash => {
@@ -54,36 +59,81 @@ pub async fn try_claim(
                         ErrorSource::System,
                     ));
                 }
-                // Check if lease expired → takeover
-                let lease_exp: Option<(String,)> = sqlx::query_as(
-                    "SELECT lease_expires_at FROM idempotency_records WHERE key = ? AND lease_expires_at < datetime('now')"
-                ).bind(key).fetch_optional(pool).await.map_err(db_err)?;
-                if lease_exp.is_none() {
-                    return Err(CoreError::new(
-                        ErrorCode::PersistenceError,
-                        "idempotency_in_progress",
-                        ErrorSource::System,
-                    ));
+                // Check if lease expired → takeover via version-CAS.
+                // Two concurrent callers CANNOT both win: version bounds the UPDATE
+                // so exactly one gets rows_affected==1.
+                let r = sqlx::query(
+                    "UPDATE idempotency_records \
+                     SET status='pending', owner_token=?, lease_expires_at=?,\
+                         attempt_count=attempt_count+1, request_hash=?, \
+                         updated_at=?, version=version+1, \
+                         fencing_token=fencing_token+1 \
+                     WHERE key=? AND lease_expires_at < datetime('now') \
+                       AND version=?",
+                )
+                .bind(&token)
+                .bind(&expires)
+                .bind(request_hash)
+                .bind(&now)
+                .bind(key)
+                .bind(existing_version)
+                .execute(pool)
+                .await
+                .map_err(db_err)?;
+                if r.rows_affected() == 1 {
+                    return Ok(Some(token));
                 }
-                // Lease expired — takeover allowed (fall through to INSERT OR REPLACE)
-                // We use UPDATE instead
-                sqlx::query("UPDATE idempotency_records SET status='pending', owner_token=?, lease_expires_at=?, attempt_count=attempt_count+1, request_hash=?, updated_at=? WHERE key=? AND lease_expires_at < datetime('now')")
-                    .bind(&token).bind(&expires).bind(request_hash).bind(&now).bind(key)
-                    .execute(pool).await.map_err(db_err)?;
-                return Ok(Some(token));
+                // CAS lost: another caller took over. Re-read and return None
+                // — the loser MUST NOT return a claim token.
+                let new_owner: Option<(String,)> =
+                    sqlx::query_as("SELECT owner_token FROM idempotency_records WHERE key=?")
+                        .bind(key)
+                        .fetch_optional(pool)
+                        .await
+                        .map_err(db_err)?;
+                if new_owner.is_some() {
+                    return Ok(None); // Held by another owner
+                }
+                // Row vanished — act as if it was completed.
+                return Ok(None);
             }
             _ => {}
         }
     }
 
-    // Insert or take over expired/completed claim
-    let result = sqlx::query("INSERT INTO idempotency_records (key, request_hash, status, owner_token, lease_expires_at, created_at, updated_at) VALUES (?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET status='pending', owner_token=?, lease_expires_at=?, attempt_count=idempotency_records.attempt_count+1, request_hash=?, updated_at=? WHERE idempotency_records.lease_expires_at < datetime('now') OR idempotency_records.status IN ('completed','failed_retryable','failed_final')")
-        .bind(key).bind(request_hash).bind("pending").bind(&token).bind(&expires).bind(&now).bind(&now)
-        .bind(&token).bind(&expires).bind(request_hash).bind(&now)
-        .execute(pool).await.map_err(db_err)?;
+    // Insert or take over expired/completed claim. The ON CONFLICT DO UPDATE
+    // uses a version guard so a concurrent writer cannot silently overwrite.
+    let result = sqlx::query(
+        "INSERT INTO idempotency_records \
+         (key, request_hash, status, owner_token, lease_expires_at, \
+          created_at, updated_at, version, fencing_token) \
+         VALUES (?,?,?,?,?,?,?,1,1) \
+         ON CONFLICT(key) DO UPDATE \
+         SET status='pending', owner_token=?, lease_expires_at=?,\
+             attempt_count=idempotency_records.attempt_count+1, \
+             request_hash=?, updated_at=?, \
+             version=idempotency_records.version+1, \
+             fencing_token=idempotency_records.fencing_token+1 \
+         WHERE idempotency_records.lease_expires_at < datetime('now') \
+            OR idempotency_records.status IN ('completed','failed_retryable','failed_final')",
+    )
+    .bind(key)
+    .bind(request_hash)
+    .bind("pending")
+    .bind(&token)
+    .bind(&expires)
+    .bind(&now)
+    .bind(&now)
+    .bind(&token)
+    .bind(&expires)
+    .bind(request_hash)
+    .bind(&now)
+    .execute(pool)
+    .await
+    .map_err(db_err)?;
 
     if result.rows_affected() == 0 {
-        return Ok(None); // Someone else holds the lease
+        return Ok(None); // Someone else holds the lease — or version CAS lost
     }
     Ok(Some(token))
 }
