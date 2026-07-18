@@ -9,10 +9,23 @@
 //! NEVER: modifies I4 outcomes, calls Agent/LLM directly, commits/merges,
 //! deletes Worktrees, or creates Tasks.
 
+pub mod decision;
 pub mod events;
+pub mod progress;
+pub mod reconciler;
 pub mod repo;
+pub mod service;
 pub mod types;
 
+pub use decision::DecisionInput;
 pub use events::TaskLoopEventWriter;
+pub use progress::{
+    classify_progress, detect_cycle, AttemptProgressFingerprint, BudgetCheckResult, BudgetPolicy,
+};
+pub use reconciler::{ReconcileOutcome, TaskLoopReconciler};
 pub use repo::TaskLoopRepo;
+pub use service::{
+    CancelLoopOutcome, LoopInspection, LoopStartOutcome, ObserveOutcome, PrepareAttemptOutcome,
+    TaskEngineeringLoopService,
+};
 pub use types::*;

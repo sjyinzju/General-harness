@@ -7,6 +7,7 @@
 //!
 //! Queries with >16 columns use `sqlx::Row::get` instead of `query_as`
 //! because sqlx FromRow is capped at 16-element tuples.
+//!
 
 use sqlx::{Row, SqlitePool};
 
@@ -88,6 +89,7 @@ pub struct TaskLoopRepo {
     pool: SqlitePool,
 }
 
+#[allow(clippy::too_many_arguments)]
 impl TaskLoopRepo {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -186,7 +188,7 @@ impl TaskLoopRepo {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| format!("load loop: {e}"))?;
-        Ok(row.as_ref().map(|r| row_to_loop(r)))
+        Ok(row.as_ref().map(row_to_loop))
     }
 
     /// Load the active loop for a task.
@@ -202,7 +204,7 @@ impl TaskLoopRepo {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| format!("load active loop: {e}"))?;
-        Ok(row.as_ref().map(|r| row_to_loop(r)))
+        Ok(row.as_ref().map(row_to_loop))
     }
 
     // ── Loop ownership ────────────────────────────────────────────
@@ -384,7 +386,7 @@ impl TaskLoopRepo {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| format!("load attempt: {e}"))?;
-        Ok(row.as_ref().map(|r| row_to_attempt(r)))
+        Ok(row.as_ref().map(row_to_attempt))
     }
 
     /// Load the active (non-terminal) attempt for a loop.
@@ -401,7 +403,7 @@ impl TaskLoopRepo {
             .fetch_optional(&self.pool)
             .await
             .map_err(|e| format!("load active attempt: {e}"))?;
-        Ok(row.as_ref().map(|r| row_to_attempt(r)))
+        Ok(row.as_ref().map(row_to_attempt))
     }
 
     pub async fn bind_execution(

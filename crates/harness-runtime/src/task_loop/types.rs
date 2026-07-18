@@ -272,11 +272,12 @@ impl LoopOperationKind {
 
 // ── Budget policy ───────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BudgetMode {
     Hard,
     Advisory,
     ObserveOnly,
+    #[default]
     Unset,
 }
 
@@ -301,9 +302,10 @@ impl BudgetMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum UnknownUsagePolicy {
     BlockUnknown,
+    #[default]
     AllowWithWarning,
     AwaitHuman,
 }
@@ -520,7 +522,7 @@ pub struct PrepareAttemptRequest {
     pub request_hash: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AttemptWorkspaceSource {
     InitialTaskWorkspace {
         repository_path: String,
@@ -535,7 +537,7 @@ pub enum AttemptWorkspaceSource {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextPackSpec {
     pub task_id: String,
     pub task_goal: String,
