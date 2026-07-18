@@ -20,10 +20,12 @@ async fn setup() -> Database {
         .execute(&db.pool)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO tasks(id,project_id,goal,lifecycle) VALUES('t1','p1','test goal','submitted')")
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO tasks(id,project_id,goal,lifecycle) VALUES('t1','p1','test goal','submitted')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
     db
 }
 
@@ -102,7 +104,9 @@ async fn test_start_loop_acquires_ownership() {
         owner_id: "owner1".into(),
         lease_secs: 60,
     };
-    let CreateLoopOutcome::Created { loop_id } = s.create_loop(&req).await.unwrap() else { panic!("expected Created") };
+    let CreateLoopOutcome::Created { loop_id } = s.create_loop(&req).await.unwrap() else {
+        panic!("expected Created")
+    };
 
     let r = s
         .start_or_resume_loop(&loop_id, "owner1", 60)
@@ -115,20 +119,14 @@ async fn test_start_loop_acquires_ownership() {
         .start_or_resume_loop(&loop_id, "owner1", 60)
         .await
         .unwrap();
-    assert!(
-        matches!(r2, LoopStartOutcome::Resumed { .. }),
-        "{r2:?}"
-    );
+    assert!(matches!(r2, LoopStartOutcome::Resumed { .. }), "{r2:?}");
 
-    // Different owner can also acquire with correct version.
+    // Different owner cannot renew — HeldByOther.
     let r3 = s
         .start_or_resume_loop(&loop_id, "owner2", 60)
         .await
         .unwrap();
-    assert!(
-        matches!(r3, LoopStartOutcome::Resumed { .. }),
-        "{r3:?}"
-    );
+    assert!(matches!(r3, LoopStartOutcome::HeldByOther { .. }), "{r3:?}");
 }
 
 #[tokio::test]
@@ -145,8 +143,16 @@ async fn test_prepare_attempt_creates_new_ordinal() {
         owner_id: "owner1".into(),
         lease_secs: 60,
     };
-    let CreateLoopOutcome::Created { loop_id } = s.create_loop(&req).await.unwrap() else { panic!("expected Created") };
-    let LoopStartOutcome::Started { version } = s.start_or_resume_loop(&loop_id, "owner1", 60).await.unwrap() else { panic!("not started") };
+    let CreateLoopOutcome::Created { loop_id } = s.create_loop(&req).await.unwrap() else {
+        panic!("expected Created")
+    };
+    let LoopStartOutcome::Started { version } = s
+        .start_or_resume_loop(&loop_id, "owner1", 60)
+        .await
+        .unwrap()
+    else {
+        panic!("not started")
+    };
     let v = version.unwrap();
 
     let l = TaskLoopRepo::new(db.pool.clone())
@@ -210,8 +216,16 @@ async fn test_cancel_loop_terminal() {
         owner_id: "owner1".into(),
         lease_secs: 60,
     };
-    let CreateLoopOutcome::Created { loop_id } = s.create_loop(&req).await.unwrap() else { panic!("expected Created") };
-    let LoopStartOutcome::Started { version } = s.start_or_resume_loop(&loop_id, "owner1", 60).await.unwrap() else { panic!("not started") };
+    let CreateLoopOutcome::Created { loop_id } = s.create_loop(&req).await.unwrap() else {
+        panic!("expected Created")
+    };
+    let LoopStartOutcome::Started { version } = s
+        .start_or_resume_loop(&loop_id, "owner1", 60)
+        .await
+        .unwrap()
+    else {
+        panic!("not started")
+    };
 
     let l = TaskLoopRepo::new(db.pool.clone())
         .load_loop(&loop_id)
@@ -223,10 +237,7 @@ async fn test_cancel_loop_terminal() {
         .cancel_loop(&loop_id, "owner1", version.unwrap(), l.fencing_token)
         .await
         .unwrap();
-    assert!(
-        matches!(r, CancelLoopOutcome::Cancelled),
-        "{r:?}"
-    );
+    assert!(matches!(r, CancelLoopOutcome::Cancelled), "{r:?}");
 
     // Verify terminal.
     let l2 = TaskLoopRepo::new(db.pool.clone())
@@ -244,10 +255,8 @@ async fn test_cancel_loop_terminal() {
 async fn test_two_pool_create_loop_one_winner() {
     let db = setup().await;
     let count = Arc::new(AtomicUsize::new(0));
-    let s1 = TaskEngineeringLoopService::new(db.pool.clone())
-        .with_loop_create_count(count.clone());
-    let s2 = TaskEngineeringLoopService::new(db.pool.clone())
-        .with_loop_create_count(count.clone());
+    let s1 = TaskEngineeringLoopService::new(db.pool.clone()).with_loop_create_count(count.clone());
+    let s2 = TaskEngineeringLoopService::new(db.pool.clone()).with_loop_create_count(count.clone());
 
     let req = CreateLoopRequest {
         project_id: "p1".into(),
@@ -261,10 +270,7 @@ async fn test_two_pool_create_loop_one_winner() {
     };
     let req2 = req.clone();
 
-    let (r1, r2) = tokio::join!(
-        s1.create_loop(&req),
-        s2.create_loop(&req2),
-    );
+    let (r1, r2) = tokio::join!(s1.create_loop(&req), s2.create_loop(&req2),);
 
     let created = matches!(r1.unwrap(), CreateLoopOutcome::Created { .. }) as u8
         + matches!(r2.unwrap(), CreateLoopOutcome::Created { .. }) as u8;
@@ -314,10 +320,7 @@ async fn test_decision_complete_candidate() {
         worktree_identity_ok: true,
         ..Default::default()
     };
-    assert_eq!(
-        input.classify(),
-        DecisionClassification::CompleteCandidate
-    );
+    assert_eq!(input.classify(), DecisionClassification::CompleteCandidate);
 }
 
 #[tokio::test]
@@ -347,10 +350,7 @@ async fn test_decision_security_blocker_awaits_human() {
         next_action: Some("Repairable".into()),
         ..Default::default()
     };
-    assert_eq!(
-        input.classify(),
-        DecisionClassification::AwaitingHuman
-    );
+    assert_eq!(input.classify(), DecisionClassification::AwaitingHuman);
 }
 
 #[tokio::test]
@@ -376,10 +376,7 @@ async fn test_decision_non_retryable() {
         next_action: Some("NonRetryable".into()),
         ..Default::default()
     };
-    assert_eq!(
-        input.classify(),
-        DecisionClassification::NonRetryable
-    );
+    assert_eq!(input.classify(), DecisionClassification::NonRetryable);
 }
 
 // ── Progress detection ──────────────────────────────────────────
@@ -448,24 +445,50 @@ async fn test_no_cycle_with_two() {
 #[tokio::test]
 async fn test_budget_hard_attempt_limit() {
     let policy = BudgetPolicy::default();
-    let r = policy.check_can_attempt(10, 0, 0, 0, Some(100), Some(1000), true);
+    let r = policy.check_can_attempt(
+        10,
+        0,
+        0,
+        0,
+        Some(100),
+        Some(200),
+        Some(300),
+        None,
+        Some(1000),
+        None,
+        true,
+    );
     assert!(matches!(r, BudgetCheckResult::Exhausted { .. }), "{r:?}");
 }
 
 #[tokio::test]
 async fn test_budget_ok_within_limits() {
     let policy = BudgetPolicy::default();
-    let r = policy.check_can_attempt(3, 0, 0, 0, Some(100), Some(1000), true);
+    let r = policy.check_can_attempt(
+        3,
+        0,
+        0,
+        0,
+        Some(100),
+        Some(200),
+        Some(300),
+        None,
+        Some(1000),
+        None,
+        true,
+    );
     assert!(matches!(r, BudgetCheckResult::Ok), "{r:?}");
 }
 
 #[tokio::test]
 async fn test_budget_unknown_tokens_with_hard_mode() {
-    let mut policy = BudgetPolicy::default();
-    policy.max_total_tokens = Some(1000);
-    policy.max_total_tokens_mode = BudgetMode::Hard;
-    policy.unknown_usage_policy = UnknownUsagePolicy::BlockUnknown;
-    let r = policy.check_can_attempt(1, 0, 0, 0, None, Some(1000), false);
+    let policy = BudgetPolicy {
+        max_total_tokens: Some(1000),
+        max_total_tokens_mode: BudgetMode::Hard,
+        unknown_usage_policy: UnknownUsagePolicy::BlockUnknown,
+        ..Default::default()
+    };
+    let r = policy.check_can_attempt(1, 0, 0, 0, None, None, None, None, Some(1000), None, false);
     assert!(matches!(r, BudgetCheckResult::Unknown { .. }), "{r:?}");
 }
 
@@ -494,7 +517,9 @@ async fn test_reconciler_advances_created_loop() {
         owner_id: "o".into(),
         lease_secs: 60,
     };
-    let CreateLoopOutcome::Created { loop_id } = s.create_loop(&req).await.unwrap() else { panic!("expected Created") };
+    let CreateLoopOutcome::Created { loop_id } = s.create_loop(&req).await.unwrap() else {
+        panic!("expected Created")
+    };
 
     let r = TaskLoopReconciler::new(db.pool.clone());
     let outcome = r.reconcile_one(&loop_id).await.unwrap();

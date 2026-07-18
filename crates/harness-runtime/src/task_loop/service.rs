@@ -93,10 +93,10 @@ impl TaskEngineeringLoopService {
             });
         }
 
-        // Acquire ownership with version CAS.
+        // Acquire ownership with version + fencing CAS.
         let new_version = match self
             .repo
-            .acquire_ownership(loop_id, l.version, owner_id, lease_secs)
+            .acquire_ownership(loop_id, l.version, l.fencing_token, owner_id, lease_secs)
             .await?
         {
             Some(v) => v,
@@ -127,7 +127,7 @@ impl TaskEngineeringLoopService {
                 .transition_loop(
                     loop_id,
                     new_version,
-                    l.fencing_token + 1,
+                    l.fencing_token,
                     owner_id,
                     LoopLifecycle::Ready,
                     None,

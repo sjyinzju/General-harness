@@ -209,10 +209,13 @@ impl TaskLoopRepo {
 
     // ── Loop ownership ────────────────────────────────────────────
 
+    /// Acquire or renew ownership. Only current owner with matching fencing
+    /// may renew. Stale-lease takeover uses `takeover_ownership`.
     pub async fn acquire_ownership(
         &self,
         loop_id: &str,
         expected_version: i64,
+        expected_fencing: i64,
         owner_id: &str,
         lease_secs: u32,
     ) -> Result<Option<i64>, String> {
@@ -222,18 +225,59 @@ impl TaskLoopRepo {
             .to_string();
         let r = sqlx::query(
             "UPDATE task_engineering_loops \
-             SET owner_id=?, lease_expires_at=?, fencing_token=fencing_token+1,\
-                 version=version+1, updated_at=? \
-             WHERE loop_id=? AND version=?",
+             SET lease_expires_at=?, version=version+1, updated_at=? \
+             WHERE loop_id=? AND version=? AND owner_id=? AND fencing_token=? \
+               AND lifecycle NOT IN (\
+                'complete_candidate','budget_exhausted','no_progress',\
+                'non_retryable','escalated','cancelled','failed')",
         )
+        .bind(&expires)
+        .bind(&now)
+        .bind(loop_id)
+        .bind(expected_version)
         .bind(owner_id)
+        .bind(expected_fencing)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| format!("acquire ownership: {e}"))?;
+        if r.rows_affected() == 1 {
+            Ok(Some(expected_version + 1))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Take over a loop whose lease has expired. Version-CAS ensures exactly
+    /// one winner; fencing monotonically increases so old owner writes fail.
+    pub async fn takeover_ownership(
+        &self,
+        loop_id: &str,
+        expected_version: i64,
+        new_owner_id: &str,
+        lease_secs: u32,
+    ) -> Result<Option<i64>, String> {
+        let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        let expires = (chrono::Utc::now() + chrono::Duration::seconds(lease_secs as i64))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        let r = sqlx::query(
+            "UPDATE task_engineering_loops \
+             SET owner_id=?, fencing_token=fencing_token+1, \
+                 lease_expires_at=?, version=version+1, updated_at=? \
+             WHERE loop_id=? AND version=? \
+               AND lease_expires_at < datetime('now') \
+               AND lifecycle NOT IN (\
+                'complete_candidate','budget_exhausted','no_progress',\
+                'non_retryable','escalated','cancelled','failed')",
+        )
+        .bind(new_owner_id)
         .bind(&expires)
         .bind(&now)
         .bind(loop_id)
         .bind(expected_version)
         .execute(&self.pool)
         .await
-        .map_err(|e| format!("acquire ownership: {e}"))?;
+        .map_err(|e| format!("takeover ownership: {e}"))?;
         if r.rows_affected() == 1 {
             Ok(Some(expected_version + 1))
         } else {
@@ -574,6 +618,11 @@ impl TaskLoopRepo {
 
     // ── Context pack persistence ──────────────────────────────────
 
+    /// Insert an immutable context pack. Idempotent: the same
+    /// (loop_id, target_attempt_ordinal) or the same context_fingerprint
+    /// will hit a UNIQUE constraint and DO NOTHING, returning Ok(false)
+    /// so callers can re-read the existing row. Never returns a bare
+    /// UNIQUE error.
     pub async fn insert_context_pack(
         &self,
         context_pack_id: &str,
@@ -591,7 +640,8 @@ impl TaskLoopRepo {
              (context_pack_id,loop_id,source_attempt_id,target_attempt_ordinal,\
               payload_json,source_fingerprints_json,context_fingerprint,\
               estimated_input_tokens,validation_status) \
-             VALUES (?,?,?,?,?,?,?,?,?)",
+             VALUES (?,?,?,?,?,?,?,?,?) \
+             ON CONFLICT DO NOTHING",
         )
         .bind(context_pack_id)
         .bind(loop_id)
@@ -606,6 +656,39 @@ impl TaskLoopRepo {
         .await
         .map_err(|e| format!("insert context pack: {e}"))?;
         Ok(r.rows_affected() == 1)
+    }
+
+    /// Load a Context Pack by idempotent (loop, ordinal) key.
+    pub async fn load_context_pack_by_ordinal(
+        &self,
+        loop_id: &str,
+        ordinal: i64,
+    ) -> Result<Option<ContextPackRow>, String> {
+        let row = sqlx::query(
+            "SELECT context_pack_id,loop_id,source_attempt_id,target_attempt_ordinal,\
+                    schema_version,payload_json,source_fingerprints_json,\
+                    context_fingerprint,estimated_input_tokens,validation_status,\
+                    created_at \
+             FROM task_context_packs WHERE loop_id=? AND target_attempt_ordinal=?",
+        )
+        .bind(loop_id)
+        .bind(ordinal)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("load cp by ordinal: {e}"))?;
+        Ok(row.map(|r| ContextPackRow {
+            context_pack_id: r.get("context_pack_id"),
+            loop_id: r.get("loop_id"),
+            source_attempt_id: r.get("source_attempt_id"),
+            target_attempt_ordinal: r.get("target_attempt_ordinal"),
+            schema_version: r.get("schema_version"),
+            payload_json: r.get("payload_json"),
+            source_fingerprints_json: r.get("source_fingerprints_json"),
+            context_fingerprint: r.get("context_fingerprint"),
+            estimated_input_tokens: r.get("estimated_input_tokens"),
+            validation_status: r.get("validation_status"),
+            created_at: r.get("created_at"),
+        }))
     }
 
     pub async fn load_context_pack(

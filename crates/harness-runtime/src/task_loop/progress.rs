@@ -114,15 +114,24 @@ pub fn detect_cycle(history: &[AttemptProgressFingerprint]) -> bool {
 pub struct BudgetPolicy {
     pub max_attempts: Option<u32>,
     pub max_attempts_mode: BudgetMode,
-    pub max_total_tokens: Option<u64>,
-    pub max_total_tokens_mode: BudgetMode,
     pub max_wall_time_ms: Option<u64>,
     pub max_wall_time_mode: BudgetMode,
+    pub max_tool_calls: Option<u64>,
+    pub max_tool_calls_mode: BudgetMode,
+    pub max_input_tokens: Option<u64>,
+    pub max_input_tokens_mode: BudgetMode,
+    pub max_output_tokens: Option<u64>,
+    pub max_output_tokens_mode: BudgetMode,
+    pub max_total_tokens: Option<u64>,
+    pub max_total_tokens_mode: BudgetMode,
+    pub max_estimated_cost_micros: Option<u64>,
+    pub max_estimated_cost_micros_mode: BudgetMode,
     pub max_no_progress_streak: Option<u32>,
     pub max_no_progress_mode: BudgetMode,
     pub max_same_failure_streak: Option<u32>,
     pub max_same_failure_mode: BudgetMode,
     pub max_profile_switches: Option<u32>,
+    pub max_profile_switches_mode: BudgetMode,
     pub unknown_usage_policy: UnknownUsagePolicy,
 }
 
@@ -149,10 +158,34 @@ impl BudgetPolicy {
         no_progress_streak: i64,
         same_failure_streak: i64,
         profile_switch_count: i64,
+        total_input_tokens: Option<i64>,
+        total_output_tokens: Option<i64>,
         total_tokens: Option<i64>,
+        total_tool_calls: Option<i64>,
         total_wall_time_ms: Option<i64>,
+        total_cost_micros: Option<i64>,
         usage_known: bool,
     ) -> BudgetCheckResult {
+        let check_hard =
+            |val: Option<i64>, max_val: Option<u64>, mode: BudgetMode, name: &'static str| {
+                if mode != BudgetMode::Hard {
+                    return None;
+                }
+                let max = max_val?;
+                match val {
+                    Some(v) if v >= max as i64 => Some(BudgetCheckResult::Exhausted {
+                        limit_name: name,
+                        current: v,
+                        max: max as i64,
+                    }),
+                    None if !usage_known => Some(BudgetCheckResult::Unknown {
+                        limit_name: name,
+                        policy: self.unknown_usage_policy,
+                    }),
+                    _ => None,
+                }
+            };
+
         // Hard attempt limit.
         if let Some(max) = self.max_attempts {
             if self.max_attempts_mode == BudgetMode::Hard && attempt_count >= max as i64 {
@@ -188,7 +221,9 @@ impl BudgetPolicy {
 
         // Hard profile switch limit.
         if let Some(max) = self.max_profile_switches {
-            if profile_switch_count >= max as i64 {
+            if self.max_profile_switches_mode == BudgetMode::Hard
+                && profile_switch_count >= max as i64
+            {
                 return BudgetCheckResult::Exhausted {
                     limit_name: "max_profile_switches",
                     current: profile_switch_count,
@@ -197,48 +232,54 @@ impl BudgetPolicy {
             }
         }
 
-        // Token budget.
-        if let Some(max_tokens) = self.max_total_tokens {
-            if self.max_total_tokens_mode == BudgetMode::Hard {
-                match total_tokens {
-                    Some(t) if t >= max_tokens as i64 => {
-                        return BudgetCheckResult::Exhausted {
-                            limit_name: "max_total_tokens",
-                            current: t,
-                            max: max_tokens as i64,
-                        };
-                    }
-                    None if !usage_known => {
-                        return BudgetCheckResult::Unknown {
-                            limit_name: "max_total_tokens",
-                            policy: self.unknown_usage_policy,
-                        };
-                    }
-                    _ => {}
-                }
-            }
+        // Per-dimension hard limits.
+        if let Some(r) = check_hard(
+            total_input_tokens,
+            self.max_input_tokens,
+            self.max_input_tokens_mode,
+            "max_input_tokens",
+        ) {
+            return r;
         }
-
-        // Wall time budget.
-        if let Some(max_ms) = self.max_wall_time_ms {
-            if self.max_wall_time_mode == BudgetMode::Hard {
-                match total_wall_time_ms {
-                    Some(t) if t >= max_ms as i64 => {
-                        return BudgetCheckResult::Exhausted {
-                            limit_name: "max_wall_time",
-                            current: t,
-                            max: max_ms as i64,
-                        };
-                    }
-                    None if !usage_known => {
-                        return BudgetCheckResult::Unknown {
-                            limit_name: "max_wall_time",
-                            policy: self.unknown_usage_policy,
-                        };
-                    }
-                    _ => {}
-                }
-            }
+        if let Some(r) = check_hard(
+            total_output_tokens,
+            self.max_output_tokens,
+            self.max_output_tokens_mode,
+            "max_output_tokens",
+        ) {
+            return r;
+        }
+        if let Some(r) = check_hard(
+            total_tokens,
+            self.max_total_tokens,
+            self.max_total_tokens_mode,
+            "max_total_tokens",
+        ) {
+            return r;
+        }
+        if let Some(r) = check_hard(
+            total_tool_calls,
+            self.max_tool_calls,
+            self.max_tool_calls_mode,
+            "max_tool_calls",
+        ) {
+            return r;
+        }
+        if let Some(r) = check_hard(
+            total_cost_micros,
+            self.max_estimated_cost_micros,
+            self.max_estimated_cost_micros_mode,
+            "max_estimated_cost_micros",
+        ) {
+            return r;
+        }
+        if let Some(r) = check_hard(
+            total_wall_time_ms,
+            self.max_wall_time_ms,
+            self.max_wall_time_mode,
+            "max_wall_time",
+        ) {
+            return r;
         }
 
         BudgetCheckResult::Ok
@@ -250,15 +291,24 @@ impl Default for BudgetPolicy {
         Self {
             max_attempts: Some(10),
             max_attempts_mode: BudgetMode::Hard,
+            max_wall_time_ms: Some(3_600_000),
+            max_wall_time_mode: BudgetMode::Hard,
+            max_tool_calls: None,
+            max_tool_calls_mode: BudgetMode::ObserveOnly,
+            max_input_tokens: None,
+            max_input_tokens_mode: BudgetMode::ObserveOnly,
+            max_output_tokens: None,
+            max_output_tokens_mode: BudgetMode::ObserveOnly,
             max_total_tokens: None,
             max_total_tokens_mode: BudgetMode::ObserveOnly,
-            max_wall_time_ms: Some(3_600_000), // 1 hour hard
-            max_wall_time_mode: BudgetMode::Hard,
+            max_estimated_cost_micros: None,
+            max_estimated_cost_micros_mode: BudgetMode::ObserveOnly,
             max_no_progress_streak: Some(3),
             max_no_progress_mode: BudgetMode::Hard,
             max_same_failure_streak: Some(5),
             max_same_failure_mode: BudgetMode::Hard,
             max_profile_switches: Some(2),
+            max_profile_switches_mode: BudgetMode::Hard,
             unknown_usage_policy: UnknownUsagePolicy::AllowWithWarning,
         }
     }
