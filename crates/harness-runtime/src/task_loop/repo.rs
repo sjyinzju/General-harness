@@ -564,9 +564,7 @@ impl TaskLoopRepo {
         request_hash: &str,
     ) -> Result<bool, String> {
         // Fault: DecisionInsert before effect
-        if let Some(FaultKind::FailBeforeEffect) =
-            self.check_fault(FaultBoundary::DecisionInsert)
-        {
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::DecisionInsert) {
             return Err("fault: DecisionInsert before effect".into());
         }
         let r = sqlx::query(
@@ -793,9 +791,7 @@ impl TaskLoopRepo {
         idempotency_key: &str,
     ) -> Result<bool, String> {
         // Fault: UsageWrite before effect
-        if let Some(FaultKind::FailBeforeEffect) =
-            self.check_fault(FaultBoundary::UsageWrite)
-        {
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::UsageWrite) {
             return Err("fault: UsageWrite before effect".into());
         }
         let r = sqlx::query(

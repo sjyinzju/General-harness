@@ -131,7 +131,10 @@ impl TaskEngineeringLoopService {
 
     /// Share the fault call counters between service and repo (for tests
     /// that call repo methods directly through the same service instance).
-    pub fn with_fault_call_counts(mut self, counts: Arc<Mutex<HashMap<FaultBoundary, u64>>>) -> Self {
+    pub fn with_fault_call_counts(
+        mut self,
+        counts: Arc<Mutex<HashMap<FaultBoundary, u64>>>,
+    ) -> Self {
         self.fault_call_counts = counts;
         self
     }
@@ -282,8 +285,7 @@ impl TaskEngineeringLoopService {
 
         // Guard: profile must be allowed by policy.
         // Fault: ProfileSelection before effect
-        if let Some(FaultKind::FailBeforeEffect) =
-            self.check_fault(FaultBoundary::ProfileSelection)
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::ProfileSelection)
         {
             return Err("fault: ProfileSelection before effect".into());
         }
@@ -438,9 +440,7 @@ impl TaskEngineeringLoopService {
         };
 
         // Fault: AttemptInsert before effect
-        if let Some(FaultKind::FailBeforeEffect) =
-            self.check_fault(FaultBoundary::AttemptInsert)
-        {
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::AttemptInsert) {
             return Err("fault: AttemptInsert before effect".into());
         }
 
@@ -555,9 +555,7 @@ impl TaskEngineeringLoopService {
         execution_id: &str,
     ) -> Result<bool, String> {
         // Fault: ExecutionBind before effect
-        if let Some(FaultKind::FailBeforeEffect) =
-            self.check_fault(FaultBoundary::ExecutionBind)
-        {
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::ExecutionBind) {
             return Err("fault: ExecutionBind before effect".into());
         }
         let a = self
@@ -624,8 +622,7 @@ impl TaskEngineeringLoopService {
         };
 
         // Fault: ExecutionCreate before effect
-        if let Some(FaultKind::FailBeforeEffect) =
-            self.check_fault(FaultBoundary::ExecutionCreate)
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::ExecutionCreate)
         {
             return Err("fault: ExecutionCreate before effect".into());
         }
@@ -691,15 +688,12 @@ impl TaskEngineeringLoopService {
         };
 
         // Fault: Dispatch before effect
-        if let Some(FaultKind::FailBeforeEffect) =
-            self.check_fault(FaultBoundary::Dispatch)
-        {
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::Dispatch) {
             return Err("fault: Dispatch before effect".into());
         }
         let result = gateway.dispatch_execution(&req, adapter).await?;
         // Fault: Dispatch response lost (after durable dispatch)
-        if let Some(FaultKind::ResponseLostAfterSuccess) =
-            self.check_fault(FaultBoundary::Dispatch)
+        if let Some(FaultKind::ResponseLostAfterSuccess) = self.check_fault(FaultBoundary::Dispatch)
         {
             self.execution_create_count.fetch_add(1, Ordering::SeqCst);
             return Err("fault: Dispatch response lost".into());
@@ -720,9 +714,7 @@ impl TaskEngineeringLoopService {
         execution_id: &str,
     ) -> Result<crate::task_loop::gateway::ExecutionObservation, String> {
         // Fault: OutcomeObserve before effect
-        if let Some(FaultKind::FailBeforeEffect) =
-            self.check_fault(FaultBoundary::OutcomeObserve)
-        {
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::OutcomeObserve) {
             return Err("fault: OutcomeObserve before effect".into());
         }
         let gateway = self.i4_gateway.as_ref().ok_or("no I4 gateway configured")?;
