@@ -369,7 +369,12 @@ async fn golden_path_success_retains_resources() {
         .await
         .unwrap();
 
-    assert_eq!(outcome.status, DispatchStatus::AgentCompleted);
+    assert_eq!(
+        outcome.status,
+        DispatchStatus::AgentCompleted,
+        "dispatch failed: {:?}",
+        outcome.terminal_outcome
+    );
     let exec_id = outcome.execution_id.as_ref().unwrap();
     // Strict: agent started exactly once.
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
@@ -498,7 +503,12 @@ async fn response_lost_no_duplicate_agent() {
     };
 
     let o1 = orch.dispatch(&req).await.unwrap();
-    assert_eq!(o1.status, DispatchStatus::AgentCompleted);
+    assert_eq!(
+        o1.status,
+        DispatchStatus::AgentCompleted,
+        "dispatch failed: {:?}",
+        o1.terminal_outcome
+    );
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
 
     let o2 = orch.dispatch(&req).await.unwrap();

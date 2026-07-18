@@ -24,7 +24,10 @@ impl Database {
             .foreign_keys(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
-            .busy_timeout(std::time::Duration::from_secs(5));
+            // Two-pool writers on one file must WAIT for the WAL write lock
+            // rather than surface SQLITE_BUSY under IO pressure. 30s matches
+            // the two-pool concurrency tests' own secondary pools.
+            .busy_timeout(std::time::Duration::from_secs(30));
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5) // WAL mode allows concurrent reads, one writer
