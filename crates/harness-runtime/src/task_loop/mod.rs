@@ -22,8 +22,8 @@ pub mod types;
 pub use decision::DecisionInput;
 pub use events::TaskLoopEventWriter;
 pub use gateway::{
-    CreateExecutionRequest, ExecutionCreated, ExecutionObservation, FixtureI4Gateway, I4Gateway,
-    ProductionI4Gateway,
+    CreateExecutionRequest, DispatchResult, ExecutionCreated, ExecutionObservation,
+    FixtureI4Gateway, I4Gateway, ProductionI4Gateway, RealI4OrchestrationGateway,
 };
 pub use progress::{
     classify_progress, detect_cycle, AttemptProgressFingerprint, BudgetCheckResult, BudgetPolicy,

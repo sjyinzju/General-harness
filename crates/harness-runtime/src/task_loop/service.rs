@@ -13,7 +13,7 @@ use std::sync::Arc;
 use sqlx::SqlitePool;
 
 use super::events::TaskLoopEventWriter;
-use super::gateway::{CreateExecutionRequest, ExecutionCreated, I4Gateway};
+use super::gateway::{CreateExecutionRequest, DispatchResult, ExecutionCreated, I4Gateway};
 use super::progress::BudgetPolicy;
 use super::repo::{LoopUsageSummary, TaskLoopRepo};
 use super::types::*;
@@ -473,9 +473,67 @@ impl TaskEngineeringLoopService {
             worktree_path: worktree_path.map(|s| s.to_string()),
             idempotency_key: idempotency_key.to_string(),
             request_hash: request_hash.to_string(),
+            project_id: None,
+            task_goal: None,
+            repo_path: None,
+            timeout_secs: None,
         };
 
         let result = gateway.create_execution(&req).await?;
+        self.execution_create_count.fetch_add(1, Ordering::SeqCst);
+
+        // Bind the Execution to the Attempt.
+        let _ = self
+            .bind_execution(attempt_id, &result.execution_id)
+            .await?;
+
+        Ok(result)
+    }
+
+    /// Full I4 dispatch: routes through the certified I4 SchedulerOrchestrator
+    /// for complete execution (worktree → lease → claims → agent → events).
+    /// Only effective when the gateway supports dispatch_execution (i.e.,
+    /// RealI4OrchestrationGateway). Falls back to create_execution otherwise.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn dispatch_attempt_full(
+        &self,
+        attempt_id: &str,
+        task_id: &str,
+        project_id: &str,
+        runtime_profile_id: &str,
+        worktree_id: Option<&str>,
+        worktree_path: Option<&str>,
+        repo_path: &str,
+        task_goal: &str,
+        timeout_secs: u64,
+        idempotency_key: &str,
+        request_hash: &str,
+        adapter: &(dyn harness_core::contracts::agent_adapter::AgentAdapter + Send + Sync),
+    ) -> Result<DispatchResult, String> {
+        let gateway = self.i4_gateway.as_ref().ok_or("no I4 gateway configured")?;
+
+        let a = self
+            .repo
+            .load_attempt(attempt_id)
+            .await?
+            .ok_or("attempt not found")?;
+
+        let req = CreateExecutionRequest {
+            task_id: task_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            attempt_ordinal: a.ordinal,
+            runtime_profile_id: runtime_profile_id.to_string(),
+            worktree_id: worktree_id.map(|s| s.to_string()),
+            worktree_path: worktree_path.map(|s| s.to_string()),
+            idempotency_key: idempotency_key.to_string(),
+            request_hash: request_hash.to_string(),
+            project_id: Some(project_id.to_string()),
+            task_goal: Some(task_goal.to_string()),
+            repo_path: Some(repo_path.to_string()),
+            timeout_secs: Some(timeout_secs),
+        };
+
+        let result = gateway.dispatch_execution(&req, adapter).await?;
         self.execution_create_count.fetch_add(1, Ordering::SeqCst);
 
         // Bind the Execution to the Attempt.
