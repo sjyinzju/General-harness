@@ -302,10 +302,7 @@ impl RealI4OrchestrationGateway {
         orchestrator: Arc<crate::scheduler::SchedulerOrchestrator>,
         pool: SqlitePool,
     ) -> Self {
-        Self {
-            orchestrator,
-            pool,
-        }
+        Self { orchestrator, pool }
     }
 }
 
@@ -402,9 +399,7 @@ impl I4Gateway for RealI4OrchestrationGateway {
             dispatch_op_id: Some(outcome.dispatch_op_id),
             session_id: None,
             worktree_id: None,
-            terminal_outcome: outcome
-                .terminal_outcome
-                .map(|t| format!("{:?}", t)),
+            terminal_outcome: outcome.terminal_outcome.map(|t| format!("{:?}", t)),
         })
     }
 
@@ -439,13 +434,12 @@ impl I4Gateway for RealI4OrchestrationGateway {
         .flatten();
 
         // Query worktree for this execution.
-        let wt: Option<(String,)> =
-            sqlx::query_as("SELECT id FROM worktrees WHERE execution_id=?")
-                .bind(execution_id)
-                .fetch_optional(&self.pool)
-                .await
-                .ok()
-                .flatten();
+        let wt: Option<(String,)> = sqlx::query_as("SELECT id FROM worktrees WHERE execution_id=?")
+            .bind(execution_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
 
         Ok(ExecutionObservation {
             execution_id: execution_id.to_string(),

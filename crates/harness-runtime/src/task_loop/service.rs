@@ -679,9 +679,7 @@ impl TaskEngineeringLoopService {
     /// Validate workspace continuation: verify that the source worktree
     /// exists on disk, HEAD matches expected, and no active process owns it.
     /// Returns Ok(()) if validation passes, or Err(reason) if it fails.
-    pub fn validate_workspace_continuation(
-        source: &AttemptWorkspaceSource,
-    ) -> Result<(), String> {
+    pub fn validate_workspace_continuation(source: &AttemptWorkspaceSource) -> Result<(), String> {
         match source {
             AttemptWorkspaceSource::InitialTaskWorkspace { .. } => Ok(()),
             AttemptWorkspaceSource::ContinueFromAttempt {
@@ -699,22 +697,19 @@ impl TaskEngineeringLoopService {
                 {
                     return Err("workspace continuation: missing source identifiers".into());
                 }
-                if expected_baseline_commit.is_empty()
-                    || expected_head.is_empty()
-                {
-                    return Err(
-                        "workspace continuation: missing expected commit references".into()
-                    );
+                if expected_baseline_commit.is_empty() || expected_head.is_empty() {
+                    return Err("workspace continuation: missing expected commit references".into());
                 }
                 if expected_diff_fingerprint.is_empty() {
-                    return Err(
-                        "workspace continuation: missing diff fingerprint".into()
-                    );
+                    return Err("workspace continuation: missing diff fingerprint".into());
                 }
 
                 // Verify the worktree path exists on disk.
                 let wt_path = std::path::Path::new(source_worktree_id);
-                if !wt_path.exists() && !source_worktree_id.contains('/') && !source_worktree_id.contains('\\') {
+                if !wt_path.exists()
+                    && !source_worktree_id.contains('/')
+                    && !source_worktree_id.contains('\\')
+                {
                     // If worktree_id is just an ID (not a path), skip FS check
                     // — the DB-level verification is sufficient.
                 }
@@ -734,15 +729,11 @@ impl TaskEngineeringLoopService {
                         let head_bytes = std::fs::read(&head_path).map_err(|e| {
                             format!("workspace continuation: cannot read HEAD: {e}")
                         })?;
-                        let head_str = String::from_utf8_lossy(&head_bytes)
-                            .trim()
-                            .to_string();
+                        let head_str = String::from_utf8_lossy(&head_bytes).trim().to_string();
                         // HEAD is a ref: resolve it.
                         let actual_head = if head_str.starts_with("ref:") {
                             // Read the resolved ref hash.
-                            let ref_path = head_str
-                                .strip_prefix("ref: ")
-                                .unwrap_or(&head_str);
+                            let ref_path = head_str.strip_prefix("ref: ").unwrap_or(&head_str);
                             let resolved = canonical.join(".git").join(ref_path);
                             if resolved.exists() {
                                 String::from_utf8_lossy(

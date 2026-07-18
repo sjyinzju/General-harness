@@ -249,8 +249,7 @@ pub async fn validate_completion_eligibility(
             .await
             .map_err(|e| format!("eligibility query: {e}"))?;
     if let Some((lc,)) = exec_row {
-        eligibility.execution_terminal =
-            lc == "completed" || lc == "failed" || lc == "cancelled";
+        eligibility.execution_terminal = lc == "completed" || lc == "failed" || lc == "cancelled";
     }
 
     // 2. Verification must be terminal with passed outcome.
@@ -321,12 +320,11 @@ pub async fn validate_completion_eligibility(
     eligibility.reconciliation_clear = rec_count.0 == 0;
 
     // 5. Workspace / worktree must exist and be valid.
-    let wt_row: Option<(String,)> =
-        sqlx::query_as("SELECT id FROM worktrees WHERE execution_id=?")
-            .bind(execution_id)
-            .fetch_optional(pool)
-            .await
-            .map_err(|e| format!("eligibility wt query: {e}"))?;
+    let wt_row: Option<(String,)> = sqlx::query_as("SELECT id FROM worktrees WHERE execution_id=?")
+        .bind(execution_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("eligibility wt query: {e}"))?;
     eligibility.workspace_valid = wt_row.is_some();
 
     // 6. Ownership / handoff must be valid.

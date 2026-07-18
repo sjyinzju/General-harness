@@ -714,13 +714,16 @@ async fn test_completion_eligibility_all_gates_pass() {
         .execute(&db.pool).await.unwrap();
 
     let eligibility =
-        harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-c1")
-            .await;
+        harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-c1").await;
     let eligibility = match eligibility {
         Ok(e) => e,
         Err(e) => panic!("eligibility query failed: {e}"),
     };
-    assert!(eligibility.all_passed(), "all gates must pass: {:?}", eligibility.failed_gates());
+    assert!(
+        eligibility.all_passed(),
+        "all gates must pass: {:?}",
+        eligibility.failed_gates()
+    );
 }
 
 #[tokio::test]
@@ -734,10 +737,19 @@ async fn test_completion_eligibility_rejects_fabricated_passed() {
         harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-fab")
             .await
             .unwrap();
-    assert!(!eligibility.all_passed(), "fabricated passed must be rejected");
+    assert!(
+        !eligibility.all_passed(),
+        "fabricated passed must be rejected"
+    );
     assert!(!eligibility.outcome_passed, "outcome must not be passed");
-    assert!(!eligibility.verification_terminal, "verification must not be terminal");
-    assert!(!eligibility.execution_terminal, "execution must not be terminal");
+    assert!(
+        !eligibility.verification_terminal,
+        "verification must not be terminal"
+    );
+    assert!(
+        !eligibility.execution_terminal,
+        "execution must not be terminal"
+    );
 }
 
 #[tokio::test]
@@ -760,9 +772,15 @@ async fn test_completion_eligibility_rejects_failed_outcome() {
         harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-fail")
             .await
             .unwrap();
-    assert!(!eligibility.all_passed(), "failed outcome must reject completion");
+    assert!(
+        !eligibility.all_passed(),
+        "failed outcome must reject completion"
+    );
     assert!(!eligibility.outcome_passed, "outcome must not be passed");
-    assert!(eligibility.execution_terminal, "execution is terminal but outcome failed");
+    assert!(
+        eligibility.execution_terminal,
+        "execution is terminal but outcome failed"
+    );
     assert!(!eligibility.required_steps_complete, "steps not all passed");
 }
 
@@ -789,8 +807,14 @@ async fn test_completion_eligibility_rejects_active_process() {
         harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-ap")
             .await
             .unwrap();
-    assert!(!eligibility.all_passed(), "active process must block completion");
-    assert!(!eligibility.process_inactive, "process must be detected as active");
+    assert!(
+        !eligibility.all_passed(),
+        "active process must block completion"
+    );
+    assert!(
+        !eligibility.process_inactive,
+        "process must be detected as active"
+    );
 }
 
 #[tokio::test]
@@ -812,8 +836,14 @@ async fn test_completion_eligibility_rejects_missing_dossier() {
         harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-md")
             .await
             .unwrap();
-    assert!(!eligibility.all_passed(), "missing dossier must block completion");
-    assert!(!eligibility.dossier_fingerprint_valid, "dossier must be invalid");
+    assert!(
+        !eligibility.all_passed(),
+        "missing dossier must block completion"
+    );
+    assert!(
+        !eligibility.dossier_fingerprint_valid,
+        "dossier must be invalid"
+    );
 }
 
 #[tokio::test]
@@ -837,8 +867,14 @@ async fn test_completion_eligibility_rejects_stale_ownership() {
         harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-so")
             .await
             .unwrap();
-    assert!(!eligibility.all_passed(), "released handoff must block completion");
-    assert!(!eligibility.ownership_valid, "released ownership must be invalid");
+    assert!(
+        !eligibility.all_passed(),
+        "released handoff must block completion"
+    );
+    assert!(
+        !eligibility.ownership_valid,
+        "released ownership must be invalid"
+    );
 }
 
 // ── Workspace Continuation (Phase 3) ────────────────────────────
@@ -947,7 +983,9 @@ async fn test_workspace_continuation_validates_git_head() {
         .current_dir(&repo_path)
         .output()
         .unwrap();
-    let actual_head = String::from_utf8_lossy(&head_output.stdout).trim().to_string();
+    let actual_head = String::from_utf8_lossy(&head_output.stdout)
+        .trim()
+        .to_string();
 
     // Valid continuation with correct HEAD.
     let source = AttemptWorkspaceSource::ContinueFromAttempt {
@@ -959,7 +997,11 @@ async fn test_workspace_continuation_validates_git_head() {
         expected_diff_fingerprint: "df1".into(),
     };
     let result = TaskEngineeringLoopService::validate_workspace_continuation(&source);
-    assert!(result.is_ok(), "valid HEAD must be accepted: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "valid HEAD must be accepted: {:?}",
+        result.err()
+    );
 
     // Wrong HEAD — must be rejected.
     let bad_source = AttemptWorkspaceSource::ContinueFromAttempt {
@@ -980,26 +1022,46 @@ async fn test_prepare_attempt_rejects_invalid_continuation() {
     let s = TaskEngineeringLoopService::new(db.pool.clone()).with_i4_gateway(gw);
     let CreateLoopOutcome::Created { loop_id } =
         s.create_loop(&loop_req("ik-wsv", "hwsv")).await.unwrap()
-    else { panic!("not created") };
-    let LoopStartOutcome::Started { version } =
-        s.start_or_resume_loop(&loop_id, "owner1", 300).await.unwrap()
-    else { panic!("not started") };
+    else {
+        panic!("not created")
+    };
+    let LoopStartOutcome::Started { version } = s
+        .start_or_resume_loop(&loop_id, "owner1", 300)
+        .await
+        .unwrap()
+    else {
+        panic!("not started")
+    };
     let v = version.unwrap();
-    let l = TaskLoopRepo::new(db.pool.clone()).load_loop(&loop_id).await.unwrap().unwrap();
+    let l = TaskLoopRepo::new(db.pool.clone())
+        .load_loop(&loop_id)
+        .await
+        .unwrap()
+        .unwrap();
 
     // Attempt with invalid continuation (empty fields) → must be rejected.
-    let r = s.prepare_next_attempt(
-        &loop_id, "owner1", v, l.fencing_token, "prof-1",
-        AttemptWorkspaceSource::ContinueFromAttempt {
-            source_attempt_id: "".into(),
-            source_execution_id: "".into(),
-            source_worktree_id: "".into(),
-            expected_baseline_commit: "abc".into(),
-            expected_head: "def".into(),
-            expected_diff_fingerprint: "df1".into(),
-        },
-        None,
-    ).await.unwrap();
-    assert!(matches!(r, PrepareAttemptOutcome::InfrastructureError { .. }),
-        "invalid continuation must be rejected: {:?}", r);
+    let r = s
+        .prepare_next_attempt(
+            &loop_id,
+            "owner1",
+            v,
+            l.fencing_token,
+            "prof-1",
+            AttemptWorkspaceSource::ContinueFromAttempt {
+                source_attempt_id: "".into(),
+                source_execution_id: "".into(),
+                source_worktree_id: "".into(),
+                expected_baseline_commit: "abc".into(),
+                expected_head: "def".into(),
+                expected_diff_fingerprint: "df1".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(r, PrepareAttemptOutcome::InfrastructureError { .. }),
+        "invalid continuation must be rejected: {:?}",
+        r
+    );
 }
