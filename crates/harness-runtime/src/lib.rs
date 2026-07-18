@@ -11,6 +11,7 @@ pub mod process;
 pub mod repo;
 pub mod resource_claim;
 pub mod scheduler;
+pub mod task_loop;
 pub mod transition;
 pub mod verification;
 pub mod worktree;

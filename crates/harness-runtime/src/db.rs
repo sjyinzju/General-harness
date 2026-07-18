@@ -128,7 +128,13 @@ mod tests {
                 "runtime_profiles",
                 "scheduler_reconciliations",
                 "scheduler_reservations",
+                "task_attempt_decisions",
+                "task_context_packs",
                 "task_dependencies",
+                "task_engineering_attempts",
+                "task_engineering_loops",
+                "task_loop_operations",
+                "task_usage_ledger",
                 "tasks",
                 "verification_approvals",
                 "verification_diagnostics",
@@ -147,7 +153,7 @@ mod tests {
                 "workspace_leases",
                 "worktrees"
             ],
-            "36 business tables expected (001\u{2013}019)"
+            "42 business tables expected (001\u{2013}021)"
         );
     }
 
