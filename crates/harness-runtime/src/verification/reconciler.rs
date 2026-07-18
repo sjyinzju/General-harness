@@ -130,6 +130,8 @@ pub struct ObservedState {
     pub active_command_op: bool,
     pub active_scanner_op: bool,
     pub resource_mismatch: bool,
+    pub terminal_event_missing: bool,
+    pub dossier_missing: bool,
     pub release_progress_json: Option<String>,
     pub observed_fingerprint: Option<String>,
 }
@@ -445,6 +447,22 @@ impl VerificationReconciler {
             return ReconciliationClassification::ProgressConflict;
         }
 
+        // ── Repair: missing terminal event ──
+        if has_outcome
+            && state.handoff_released
+            && !state.claim_active
+            && !state.lease_active
+            && !state.heartbeat_exists
+            && state.terminal_event_missing
+        {
+            return ReconciliationClassification::RepairMissingEvent;
+        }
+
+        // ── Repair: missing dossier ──
+        if has_outcome && run_lc == Some("completed") && state.dossier_missing {
+            return ReconciliationClassification::RepairMissingDossierLink;
+        }
+
         // ── Case E/F: Handoff released but events/operation incomplete ──
         if has_outcome && state.handoff_released && !state.claim_active && !state.lease_active {
             return ReconciliationClassification::CompleteOperationRecord;
@@ -453,6 +471,11 @@ impl VerificationReconciler {
         // ── Active heartbeat when resources released = stale ──
         if state.heartbeat_exists && state.handoff_released {
             return ReconciliationClassification::RuntimeHeartbeatStale;
+        }
+
+        // ── Durable heartbeat missing ──
+        if state.handoff_verification_owned && !state.heartbeat_exists && state.claim_active {
+            return ReconciliationClassification::DurableHeartbeatMissing;
         }
 
         ReconciliationClassification::IrrecoverableAmbiguity
@@ -939,5 +962,127 @@ mod tests {
                 || classification == ReconciliationClassification::WorktreeMissing,
             "got {classification:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_classify_repair_missing_event() {
+        let s = ObservedState {
+            run_has_outcome: true,
+            run_lifecycle: Some("completed".into()),
+            handoff_released: true,
+            claim_active: false,
+            lease_active: false,
+            heartbeat_exists: false,
+            worktree_db_exists: true,
+            terminal_event_missing: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            VerificationReconciler::classify(&s),
+            ReconciliationClassification::RepairMissingEvent
+        );
+    }
+
+    #[tokio::test]
+    async fn test_classify_repair_missing_dossier() {
+        let s = ObservedState {
+            run_has_outcome: true,
+            run_lifecycle: Some("completed".into()),
+            handoff_released: true,
+            claim_active: false,
+            lease_active: false,
+            heartbeat_exists: false,
+            worktree_db_exists: true,
+            dossier_missing: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            VerificationReconciler::classify(&s),
+            ReconciliationClassification::RepairMissingDossierLink
+        );
+    }
+
+    #[tokio::test]
+    async fn test_classify_durable_heartbeat_missing() {
+        let s = ObservedState {
+            run_has_outcome: true,
+            run_lifecycle: Some("completed".into()),
+            handoff_verification_owned: true,
+            handoff_released: false,
+            heartbeat_exists: false,
+            claim_active: true,
+            worktree_db_exists: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            VerificationReconciler::classify(&s),
+            ReconciliationClassification::DurableHeartbeatMissing
+        );
+    }
+
+    #[tokio::test]
+    async fn test_active_process_blocks_release() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO verification_step_operations(op_id,verification_run_id,step_id,plan_id,execution_id,step_config_hash,worktree_id,fencing_token,status,idempotency_key,request_hash) VALUES('op-run','run-1','step-1','plan-1','e1','cfg','wt1',5,'running','ik-op','h-op')").execute(&c.db.pool).await.unwrap();
+        let state = c.rec.observe_state(&mkrec("ik-ap", "h-ap")).await;
+        assert!(state.active_command_op);
+        let c2 = VerificationReconciler::classify(&state);
+        assert!(
+            c2 == ReconciliationClassification::ActiveProcessUnknown
+                || c2 == ReconciliationClassification::OutcomeMissing
+        );
+    }
+
+    #[tokio::test]
+    async fn test_active_scanner_blocks_release() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO verification_policy_operations(policy_op_id,verification_run_id,step_id,step_kind,sequence_index,idempotency_key,request_hash,worktree_id,fencing_token,lifecycle) VALUES('pop-run','run-1','step-1','secret_scan',0,'ik-pop','h-pop','wt1',5,'running')").execute(&c.db.pool).await.unwrap();
+        let state = c.rec.observe_state(&mkrec("ik-as", "h-as")).await;
+        assert!(state.active_scanner_op);
+        let c2 = VerificationReconciler::classify(&state);
+        assert!(
+            c2 == ReconciliationClassification::ActiveScannerUnknown
+                || c2 == ReconciliationClassification::OutcomeMissing
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reconciler_two_pool_strict() {
+        let td = tempfile::tempdir().unwrap();
+        let dp = td.path().join("rec-strict.db");
+        let db1 = Database::open(&dp).await.unwrap();
+        let db2 = Database::open(&dp).await.unwrap();
+        let p = db1.pool.clone();
+        sqlx::query("INSERT INTO projects(id,objective,lifecycle) VALUES('p1','t','active')")
+            .execute(&p)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tasks(id,project_id,goal,lifecycle) VALUES('t1','p1','t','submitted')",
+        )
+        .execute(&p)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO execution_attempts(id,task_id,attempt_number,lifecycle) VALUES('e1','t1',1,'completed')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO verification_plans(plan_id,task_id,execution_id,project_id,plan_hash,plan_version,steps_json) VALUES('plan-1','t1','e1','p1','ha',1,'[]')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO verification_runs(run_id,plan_id,plan_hash,plan_version,execution_id,task_id,project_id,lifecycle,idempotency_key,request_hash) VALUES('run-1','plan-1','ha',1,'e1','t1','p1','running','ik-r','hr')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO resource_handoffs(handoff_id,project_id,task_id,execution_id,worktree_id,lease_id,fencing_token,owner_kind,owner_id,status) VALUES('ho-1','p1','t1','e1','wt1','l1',5,'verification','verify-run-1','verification_owned')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO workspace_leases(id,task_id,owner_execution_id,lifecycle,worktree_path,branch_name,expires_at) VALUES('l1','t1','e1','acquired','/tmp/wt','main','2099-01-01')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO resource_claims(id,project_id,task_id,execution_id,resource_kind,normalized_resource,access_mode,status) VALUES('c1','p1','t1','e1','workspace','wt1','read_write','active')").execute(&p).await.unwrap();
+        let hb2 = Arc::new(HeartbeatRegistry::new());
+        let rec1 = VerificationReconciler::new(db1.pool.clone(), hb2.clone());
+        let rec2 = VerificationReconciler::new(db2.pool.clone(), hb2.clone());
+        let rq = mkrec("ik-rts", "h-rts");
+        let (r1, r2) = tokio::join!(rec1.reconcile(&rq), rec2.reconcile(&rq));
+        assert!(!matches!(
+            r1,
+            ReconciliationOutcome::InfrastructureError { .. }
+        ));
+        assert!(!matches!(
+            r2,
+            ReconciliationOutcome::InfrastructureError { .. }
+        ));
+        let op_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM verification_reconciliation_operations WHERE verification_run_id='run-1'").fetch_one(&p).await.unwrap();
+        assert_eq!(op_count.0, 1);
     }
 }
