@@ -11,6 +11,7 @@
 
 pub mod decision;
 pub mod events;
+pub mod gateway;
 pub mod progress;
 pub mod reconciler;
 pub mod repo;
@@ -19,13 +20,14 @@ pub mod types;
 
 pub use decision::DecisionInput;
 pub use events::TaskLoopEventWriter;
+pub use gateway::{ExecutionCreated, ExecutionObservation, FixtureI4Gateway, I4Gateway, ProductionI4Gateway, CreateExecutionRequest};
 pub use progress::{
     classify_progress, detect_cycle, AttemptProgressFingerprint, BudgetCheckResult, BudgetPolicy,
 };
 pub use reconciler::{ReconcileOutcome, TaskLoopReconciler};
 pub use repo::TaskLoopRepo;
 pub use service::{
-    CancelLoopOutcome, LoopInspection, LoopStartOutcome, ObserveOutcome, PrepareAttemptOutcome,
-    TaskEngineeringLoopService,
+    CancelLoopOutcome, LoopInspection, LoopStartOutcome, ObserveOutcome,
+    PrepareAttemptOutcome, TaskEngineeringLoopService,
 };
 pub use types::*;

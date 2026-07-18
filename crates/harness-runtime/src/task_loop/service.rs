@@ -13,6 +13,7 @@ use std::sync::Arc;
 use sqlx::SqlitePool;
 
 use super::events::TaskLoopEventWriter;
+use super::gateway::{CreateExecutionRequest, ExecutionCreated, I4Gateway};
 use super::repo::{LoopUsageSummary, TaskLoopRepo};
 use super::types::*;
 
@@ -22,8 +23,10 @@ pub struct TaskEngineeringLoopService {
     pool: SqlitePool,
     repo: TaskLoopRepo,
     events: TaskLoopEventWriter,
+    i4_gateway: Option<Arc<dyn I4Gateway>>,
     pub loop_create_count: Arc<AtomicUsize>,
     pub attempt_create_count: Arc<AtomicUsize>,
+    pub execution_create_count: Arc<AtomicUsize>,
     pub decision_count: Arc<AtomicUsize>,
     _worker_id: String,
 }
@@ -34,11 +37,19 @@ impl TaskEngineeringLoopService {
             repo: TaskLoopRepo::new(pool.clone()),
             events: TaskLoopEventWriter::new(pool.clone()),
             pool,
+            i4_gateway: None,
             loop_create_count: Arc::new(AtomicUsize::new(0)),
             attempt_create_count: Arc::new(AtomicUsize::new(0)),
+            execution_create_count: Arc::new(AtomicUsize::new(0)),
             decision_count: Arc::new(AtomicUsize::new(0)),
             _worker_id: format!("tls-{}", uuid::Uuid::new_v4()),
         }
+    }
+
+    /// Wire a real I4 gateway for production use.
+    pub fn with_i4_gateway(mut self, gateway: Arc<dyn I4Gateway>) -> Self {
+        self.i4_gateway = Some(gateway);
+        self
     }
 
     /// Shared counters (clone for two-pool testing).
@@ -54,6 +65,11 @@ impl TaskEngineeringLoopService {
 
     pub fn with_decision_count(mut self, c: Arc<AtomicUsize>) -> Self {
         self.decision_count = c;
+        self
+    }
+
+    pub fn with_execution_count(mut self, c: Arc<AtomicUsize>) -> Self {
+        self.execution_create_count = c;
         self
     }
 
@@ -342,9 +358,80 @@ impl TaskEngineeringLoopService {
             )
             .await?;
         if ok {
-            let _ = self.events.attempt_dispatched(&a.loop_id, attempt_id).await;
+            let _ = self
+                .events
+                .attempt_dispatched(&a.loop_id, attempt_id)
+                .await;
         }
         Ok(ok)
+    }
+
+    /// Create an Execution through the certified I4 gateway and bind it.
+    /// Idempotent: if the gateway returns an existing Execution, we bind
+    /// that instead of creating a duplicate.
+    pub async fn dispatch_attempt(
+        &self,
+        attempt_id: &str,
+        task_id: &str,
+        runtime_profile_id: &str,
+        worktree_id: Option<&str>,
+        worktree_path: Option<&str>,
+        idempotency_key: &str,
+        request_hash: &str,
+    ) -> Result<ExecutionCreated, String> {
+        let gateway = self
+            .i4_gateway
+            .as_ref()
+            .ok_or("no I4 gateway configured")?;
+
+        let a = self
+            .repo
+            .load_attempt(attempt_id)
+            .await?
+            .ok_or("attempt not found")?;
+
+        let req = CreateExecutionRequest {
+            task_id: task_id.to_string(),
+            attempt_id: attempt_id.to_string(),
+            attempt_ordinal: a.ordinal,
+            runtime_profile_id: runtime_profile_id.to_string(),
+            worktree_id: worktree_id.map(|s| s.to_string()),
+            worktree_path: worktree_path.map(|s| s.to_string()),
+            idempotency_key: idempotency_key.to_string(),
+            request_hash: request_hash.to_string(),
+        };
+
+        let result = gateway.create_execution(&req).await?;
+        self.execution_create_count
+            .fetch_add(1, Ordering::SeqCst);
+
+        // Bind the Execution to the Attempt.
+        let _ = self
+            .bind_execution(attempt_id, &result.execution_id)
+            .await?;
+
+        Ok(result)
+    }
+
+    /// Use the I4 gateway to observe Execution + Verification facts.
+    pub async fn observe_via_gateway(
+        &self,
+        execution_id: &str,
+    ) -> Result<crate::task_loop::gateway::ExecutionObservation, String> {
+        let gateway = self
+            .i4_gateway
+            .as_ref()
+            .ok_or("no I4 gateway configured")?;
+        gateway.observe_execution(execution_id).await
+    }
+
+    /// Request I4 cancellation of an active Execution.
+    pub async fn cancel_execution(&self, execution_id: &str) -> Result<bool, String> {
+        let gateway = self
+            .i4_gateway
+            .as_ref()
+            .ok_or("no I4 gateway configured")?;
+        gateway.request_cancellation(execution_id).await
     }
 
     // ── Observation ─────────────────────────────────────────────
