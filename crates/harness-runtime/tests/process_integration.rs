@@ -254,7 +254,10 @@ async fn reconciler_idempotent() {
 
 #[tokio::test]
 async fn operation_claim_only_one_succeeds() {
-    let db = Database::open_in_memory().await.unwrap();
+    // File-backed: concurrent writers on the shared-cache in-memory pool
+    // surface table-lock errors by design; WAL serializes them.
+    let td = tempfile::tempdir().unwrap();
+    let db = Database::open(&td.path().join("opclaim.db")).await.unwrap();
     let pid = format!("p-{}", uuid::Uuid::new_v4());
     let tid = format!("t-{}", uuid::Uuid::new_v4());
     sqlx::query("INSERT INTO projects (id, objective, lifecycle) VALUES (?,'test','active')")
@@ -343,7 +346,9 @@ async fn operation_claim_old_owner_cannot_complete() {
 
 #[tokio::test]
 async fn idempotency_two_reconciler_claim_one_winner() {
-    let db = Database::open_in_memory().await.unwrap();
+    // File-backed: see operation_claim_only_one_succeeds.
+    let td = tempfile::tempdir().unwrap();
+    let db = Database::open(&td.path().join("ikclaim.db")).await.unwrap();
     let key = format!("recon-{}", uuid::Uuid::new_v4());
     let hash = "hash-recon";
     let pool = Arc::new(db.pool.clone());

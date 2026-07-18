@@ -820,7 +820,12 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_reconcilers_single_repair() {
         use std::sync::Arc;
-        let db = setup().await;
+        // File-backed: concurrent writers on the shared-cache in-memory pool
+        // surface table-lock errors by design; WAL serializes them.
+        let td = tempfile::tempdir().unwrap();
+        let db = crate::db::Database::open(&td.path().join("srec.db"))
+            .await
+            .unwrap();
         seed_project_task(&db, "t1", "pending").await;
         sqlx::query("INSERT INTO scheduler_reservations (id, task_id, status, expires_at) VALUES ('r1','t1','active','2000-01-01')")
             .execute(&db.pool).await.unwrap();
