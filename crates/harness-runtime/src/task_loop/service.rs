@@ -14,6 +14,7 @@ use sqlx::SqlitePool;
 
 use super::events::TaskLoopEventWriter;
 use super::gateway::{CreateExecutionRequest, ExecutionCreated, I4Gateway};
+use super::progress::BudgetPolicy;
 use super::repo::{LoopUsageSummary, TaskLoopRepo};
 use super::types::*;
 
@@ -24,9 +25,13 @@ pub struct TaskEngineeringLoopService {
     repo: TaskLoopRepo,
     events: TaskLoopEventWriter,
     i4_gateway: Option<Arc<dyn I4Gateway>>,
+    profile_policy: LoopProfilePolicy,
+    budget_policy: BudgetPolicy,
     pub loop_create_count: Arc<AtomicUsize>,
     pub attempt_create_count: Arc<AtomicUsize>,
     pub execution_create_count: Arc<AtomicUsize>,
+    pub context_pack_count: Arc<AtomicUsize>,
+    pub budget_reserve_count: Arc<AtomicUsize>,
     pub decision_count: Arc<AtomicUsize>,
     _worker_id: String,
 }
@@ -38,9 +43,13 @@ impl TaskEngineeringLoopService {
             events: TaskLoopEventWriter::new(pool.clone()),
             pool,
             i4_gateway: None,
+            profile_policy: LoopProfilePolicy::default(),
+            budget_policy: BudgetPolicy::default(),
             loop_create_count: Arc::new(AtomicUsize::new(0)),
             attempt_create_count: Arc::new(AtomicUsize::new(0)),
             execution_create_count: Arc::new(AtomicUsize::new(0)),
+            context_pack_count: Arc::new(AtomicUsize::new(0)),
+            budget_reserve_count: Arc::new(AtomicUsize::new(0)),
             decision_count: Arc::new(AtomicUsize::new(0)),
             _worker_id: format!("tls-{}", uuid::Uuid::new_v4()),
         }
@@ -49,6 +58,18 @@ impl TaskEngineeringLoopService {
     /// Wire a real I4 gateway for production use.
     pub fn with_i4_gateway(mut self, gateway: Arc<dyn I4Gateway>) -> Self {
         self.i4_gateway = Some(gateway);
+        self
+    }
+
+    /// Configure profile policy.
+    pub fn with_profile_policy(mut self, policy: LoopProfilePolicy) -> Self {
+        self.profile_policy = policy;
+        self
+    }
+
+    /// Configure budget policy.
+    pub fn with_budget_policy(mut self, policy: BudgetPolicy) -> Self {
+        self.budget_policy = policy;
         self
     }
 
@@ -70,6 +91,16 @@ impl TaskEngineeringLoopService {
 
     pub fn with_execution_count(mut self, c: Arc<AtomicUsize>) -> Self {
         self.execution_create_count = c;
+        self
+    }
+
+    pub fn with_context_pack_count(mut self, c: Arc<AtomicUsize>) -> Self {
+        self.context_pack_count = c;
+        self
+    }
+
+    pub fn with_budget_reserve_count(mut self, c: Arc<AtomicUsize>) -> Self {
+        self.budget_reserve_count = c;
         self
     }
 
@@ -192,6 +223,38 @@ impl TaskEngineeringLoopService {
             return Ok(PrepareAttemptOutcome::OwnershipLost);
         }
 
+        // Guard: profile must be allowed by policy.
+        if !self.profile_policy.is_allowed(runtime_profile_id) {
+            return Ok(PrepareAttemptOutcome::InfrastructureError {
+                reason: format!("profile {runtime_profile_id} not in allowlist"),
+            });
+        }
+
+        // Guard: budget must allow another attempt.
+        let usage = self.repo.sum_loop_usage(loop_id).await?;
+        let budget_check = self.budget_policy.check_can_attempt(
+            l.attempt_count,
+            l.no_progress_streak,
+            l.same_failure_streak,
+            l.profile_switch_count,
+            usage.total_input_tokens,
+            usage.total_output_tokens,
+            None,
+            usage.total_tool_calls,
+            usage.total_wall_time_ms,
+            usage.total_estimated_cost_micros,
+            true,
+        );
+        match budget_check {
+            crate::task_loop::progress::BudgetCheckResult::Ok => {}
+            other => {
+                return Ok(PrepareAttemptOutcome::InfrastructureError {
+                    reason: format!("budget check failed: {other:?}"),
+                });
+            }
+        }
+        self.budget_reserve_count.fetch_add(1, Ordering::SeqCst);
+
         // Guard: no active Attempt.
         if let Some(active) = self.repo.load_active_attempt(loop_id).await? {
             if active.lifecycle.is_active() {
@@ -250,6 +313,7 @@ impl TaskEngineeringLoopService {
                     "valid",
                 )
                 .await?;
+            self.context_pack_count.fetch_add(1, Ordering::SeqCst);
             let _ = self.events.context_pack_created(loop_id, &cp_id).await;
             Some(cp_id)
         } else {
