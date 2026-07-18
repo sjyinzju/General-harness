@@ -168,7 +168,7 @@ impl TaskEngineeringLoopService {
         &self,
         loop_id: &str,
         owner_id: &str,
-        expected_version: i64,
+        _expected_version: i64,
         expected_fencing: i64,
         runtime_profile_id: &str,
         workspace_source: AttemptWorkspaceSource,
@@ -202,18 +202,31 @@ impl TaskEngineeringLoopService {
         }
 
         // Transition loop: Ready/Evaluating → PreparingAttempt.
+        // Use the freshly-loaded version for the CAS, not the caller's
+        // potentially-stale expected_version.  Two concurrent callers
+        // racing to prepare will both receive a clean LoopNotReady
+        // outcome instead of an Err — the loser never panics.
         let v1 = self
             .repo
             .transition_loop(
                 loop_id,
-                expected_version,
-                expected_fencing,
+                l.version,
+                l.fencing_token,
                 owner_id,
                 LoopLifecycle::PreparingAttempt,
                 None,
             )
-            .await?
-            .ok_or("loop transition CAS lost")?;
+            .await?;
+        let v1 = match v1 {
+            Some(v) => v,
+            None => {
+                // CAS lost: re-read to report the actual lifecycle.
+                let cur = self.repo.load_loop(loop_id).await?.ok_or("loop vanished")?;
+                return Ok(PrepareAttemptOutcome::LoopNotReady {
+                    lifecycle: cur.lifecycle,
+                });
+            }
+        };
 
         let ordinal = l.current_attempt_ordinal + 1;
         let attempt_id = format!("ta-{}-{}", loop_id, ordinal);
@@ -312,13 +325,15 @@ impl TaskEngineeringLoopService {
             )
             .await;
 
-        // Transition loop to AttemptActive.
+        // Transition loop to AttemptActive. Use l.fencing_token which was
+        // loaded at function entry and validated against the caller's value
+        // — consistent within this single invocation.
         let v2 = self
             .repo
             .transition_loop(
                 loop_id,
                 v1 + 1,
-                expected_fencing,
+                l.fencing_token,
                 owner_id,
                 LoopLifecycle::AttemptActive,
                 None,
