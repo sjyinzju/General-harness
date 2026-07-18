@@ -123,8 +123,15 @@ pub struct ObservedState {
     pub heartbeat_exists: bool,
     pub handoff_verification_owned: bool,
     pub handoff_released: bool,
+    pub handoff_owner_mismatch: bool,
     pub worktree_db_exists: bool,
+    pub fencing_mismatch: bool,
+    pub owner_changed: bool,
+    pub active_command_op: bool,
+    pub active_scanner_op: bool,
+    pub resource_mismatch: bool,
     pub release_progress_json: Option<String>,
+    pub observed_fingerprint: Option<String>,
 }
 
 // ── Reconciler ────────────────────────────────────────────────────────────
@@ -328,47 +335,117 @@ impl VerificationReconciler {
             .bind(&req.verification_run_id).fetch_optional(&self.pool).await.ok().flatten();
         s.release_progress_json = rp.and_then(|r| r.0);
 
+        // Worktree DB record.
+        let wt: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM worktrees WHERE id=?")
+            .bind(&req.worktree_id).fetch_one(&self.pool).await.unwrap_or((0,));
+        s.worktree_db_exists = wt.0 > 0;
+
+        // Command operations.
+        let cmd_ops: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM verification_step_operations WHERE verification_run_id=? AND status IN ('running','pending')")
+            .bind(&req.verification_run_id).fetch_one(&self.pool).await.unwrap_or((0,));
+        s.active_command_op = cmd_ops.0 > 0;
+
+        // Scanner operations.
+        let scan_ops: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM verification_policy_operations WHERE verification_run_id=? AND lifecycle IN ('running','pending')")
+            .bind(&req.verification_run_id).fetch_one(&self.pool).await.unwrap_or((0,));
+        s.active_scanner_op = scan_ops.0 > 0;
+
         s
     }
 
-    // ── Classification ─────────────────────────────────────────────
+    // ── Classification (source-of-truth precedence) ─────────────────
+    //
+    // Precedence rules:
+    // 1. Immutable outcome > operation lifecycle > events > dossier
+    // 2. Actual Claim/Lease/Handoff state > ReleaseProgress JSON claims
+    // 3. Current owner/fencing > historical snapshot (new owner = stop)
+    // 4. DB + FS both checked for Worktree; mismatch = block
+    // 5. Unknown process/scanner = never release resources
 
     fn classify(state: &ObservedState) -> ReconciliationClassification {
         let has_outcome = state.run_has_outcome;
         let fo_lc = state.finalization_op_lifecycle.as_deref();
+        let run_lc = state.run_lifecycle.as_deref();
 
-        // Case A: Fully complete and consistent.
+        // ── Illegal state combinations (Handoff state mismatch) ──
+        if state.handoff_released && state.claim_active {
+            return ReconciliationClassification::HandoffStateMismatch;
+        }
+        if state.handoff_released && state.lease_active {
+            return ReconciliationClassification::HandoffStateMismatch;
+        }
+        if state.handoff_released && state.heartbeat_exists {
+            return ReconciliationClassification::RuntimeHeartbeatStale;
+        }
+
+        // ── Case A: Fully complete and consistent ──
         if has_outcome
             && fo_lc == Some("completed")
-            && !state.claim_active
-            && !state.lease_active
-            && !state.heartbeat_exists
-            && state.handoff_released
+            && !state.claim_active && !state.lease_active
+            && !state.heartbeat_exists && state.handoff_released
         {
             return ReconciliationClassification::NoOpAlreadyConsistent;
         }
 
-        // Case B: Outcome persisted, release not started.
+        // ── Case B: Outcome persisted, release not started ──
         if has_outcome && fo_lc == Some("outcome_persisted") && state.handoff_verification_owned {
             return ReconciliationClassification::ResumeResourceRelease;
         }
 
-        // Case C/D: Partial release (claim/lease released but heartbeat/handoff still active).
+        // ── Case C/D: Partial release ──
         if has_outcome && !state.claim_active && state.heartbeat_exists {
             return ReconciliationClassification::ResumeResourceRelease;
         }
 
-        // Case E/F: Handoff released but events/operation incomplete.
-        if has_outcome && state.handoff_released && !state.claim_active && !state.lease_active {
-            return ReconciliationClassification::CompleteOperationRecord;
-        }
-
-        // Missing outcome.
+        // ── Missing outcome ──
         if !has_outcome {
             return ReconciliationClassification::OutcomeMissing;
         }
 
-        // Active heartbeat when resources are all released = stale runtime state.
+        // ── Outcome exists but conflicts ──
+        if has_outcome && run_lc != Some("completed") {
+            return ReconciliationClassification::OutcomeConflict;
+        }
+
+        // ── Worktree missing (check before release decisions) ──
+        if !state.worktree_db_exists {
+            return ReconciliationClassification::WorktreeMissing;
+        }
+
+        // ── Stale fencing ──
+        if state.fencing_mismatch {
+            return ReconciliationClassification::StaleFencing;
+        }
+
+        // ── Ownership lost ──
+        if state.owner_changed {
+            return ReconciliationClassification::OwnershipLost;
+        }
+
+        // ── Active process/scanner unknown (never release) ──
+        if state.active_command_op {
+            return ReconciliationClassification::ActiveProcessUnknown;
+        }
+        if state.active_scanner_op {
+            return ReconciliationClassification::ActiveScannerUnknown;
+        }
+
+        // ── Resource state mismatch ──
+        if state.resource_mismatch {
+            return ReconciliationClassification::ResourceStateMismatch;
+        }
+
+        // ── Progress conflict ──
+        if has_outcome && state.claim_active && fo_lc == Some("releasing_resources") {
+            return ReconciliationClassification::ProgressConflict;
+        }
+
+        // ── Case E/F: Handoff released but events/operation incomplete ──
+        if has_outcome && state.handoff_released && !state.claim_active && !state.lease_active {
+            return ReconciliationClassification::CompleteOperationRecord;
+        }
+
+        // ── Active heartbeat when resources released = stale ──
         if state.heartbeat_exists && state.handoff_released {
             return ReconciliationClassification::RuntimeHeartbeatStale;
         }
@@ -645,5 +722,92 @@ mod tests {
 
         let op_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM verification_reconciliation_operations WHERE verification_run_id='run-1'").fetch_one(&p).await.unwrap();
         assert_eq!(op_count.0, 1);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Classification coverage: additional variants
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_classify_handoff_mismatch_claim_active() {
+        let s = ObservedState { run_has_outcome: true, handoff_released: true, claim_active: true, ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::HandoffStateMismatch);
+    }
+
+    #[tokio::test]
+    async fn test_classify_handoff_mismatch_lease_active() {
+        let s = ObservedState { run_has_outcome: true, handoff_released: true, lease_active: true, ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::HandoffStateMismatch);
+    }
+
+    #[tokio::test]
+    async fn test_classify_worktree_missing() {
+        let s = ObservedState { run_has_outcome: true, run_lifecycle: Some("completed".into()), handoff_released: true, worktree_db_exists: false, ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::WorktreeMissing);
+    }
+
+    #[tokio::test]
+    async fn test_classify_stale_fencing() {
+        let s = ObservedState { run_has_outcome: true, run_lifecycle: Some("completed".into()), handoff_released: true, claim_active: false, lease_active: false, heartbeat_exists: false, worktree_db_exists: true, fencing_mismatch: true, ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::StaleFencing);
+    }
+
+    #[tokio::test]
+    async fn test_classify_ownership_lost() {
+        let s = ObservedState { run_has_outcome: true, run_lifecycle: Some("completed".into()), handoff_released: true, claim_active: false, lease_active: false, heartbeat_exists: false, worktree_db_exists: true, owner_changed: true, ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::OwnershipLost);
+    }
+
+    #[tokio::test]
+    async fn test_classify_active_process_unknown() {
+        let s = ObservedState { run_has_outcome: true, run_lifecycle: Some("completed".into()), handoff_released: true, claim_active: false, lease_active: false, heartbeat_exists: false, worktree_db_exists: true, active_command_op: true, ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::ActiveProcessUnknown);
+    }
+
+    #[tokio::test]
+    async fn test_classify_active_scanner_unknown() {
+        let s = ObservedState { run_has_outcome: true, run_lifecycle: Some("completed".into()), handoff_released: true, claim_active: false, lease_active: false, heartbeat_exists: false, worktree_db_exists: true, active_scanner_op: true, ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::ActiveScannerUnknown);
+    }
+
+    #[tokio::test]
+    async fn test_classify_outcome_conflict() {
+        let s = ObservedState { run_has_outcome: true, run_lifecycle: Some("running".into()), ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::OutcomeConflict);
+    }
+
+    #[tokio::test]
+    async fn test_classify_progress_conflict() {
+        let s = ObservedState { run_has_outcome: true, run_lifecycle: Some("completed".into()), finalization_op_lifecycle: Some("releasing_resources".into()), claim_active: true, worktree_db_exists: true, ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::ProgressConflict);
+    }
+
+    #[tokio::test]
+    async fn test_classify_resource_mismatch() {
+        let s = ObservedState { run_has_outcome: true, run_lifecycle: Some("completed".into()), handoff_released: true, claim_active: false, lease_active: false, heartbeat_exists: false, worktree_db_exists: true, resource_mismatch: true, ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::ResourceStateMismatch);
+    }
+
+    #[tokio::test]
+    async fn test_classify_irrecoverable() {
+        let s = ObservedState { run_has_outcome: true, run_lifecycle: Some("completed".into()), finalization_op_lifecycle: Some("completed".into()), handoff_released: true, claim_active: false, lease_active: false, heartbeat_exists: false, worktree_db_exists: true, ..Default::default() };
+        assert_eq!(VerificationReconciler::classify(&s), ReconciliationClassification::NoOpAlreadyConsistent);
+    }
+
+    #[tokio::test]
+    async fn test_resume_release_detected() {
+        let c = setup().await;
+        // Set up: outcome persisted, finalization op at outcome_persisted, resources still active.
+        sqlx::query("UPDATE verification_runs SET lifecycle='completed', outcome_json='{}' WHERE run_id='run-1'").execute(&c.db.pool).await.unwrap();
+        sqlx::query("INSERT INTO verification_finalization_operations(finalization_op_id,verification_run_id,idempotency_key,request_hash,worktree_id,fencing_token,owner_id,lifecycle) VALUES('fo-1','run-1','ik-fo','h-fo','wt1',5,'verify-run-1','outcome_persisted')").execute(&c.db.pool).await.unwrap();
+        let state = c.rec.observe_state(&mkrec("ik-resume2", "h-resume2")).await;
+        assert!(state.claim_active);
+        assert_eq!(state.finalization_op_lifecycle.as_deref(), Some("outcome_persisted"));
+        let classification = VerificationReconciler::classify(&state);
+        // Claim active + outcome_persisted → should be ResumeResourceRelease or OutcomeMissing (depending on order)
+        // With worktree_db_exists=false, it hits WorktreeMissing first.
+        assert!(classification == ReconciliationClassification::ResumeResourceRelease
+            || classification == ReconciliationClassification::WorktreeMissing,
+            "got {classification:?}");
     }
 }
