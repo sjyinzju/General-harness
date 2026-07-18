@@ -53,16 +53,10 @@ pub trait I4Gateway: Send + Sync {
     ) -> Result<ExecutionCreated, String>;
 
     /// Observe an Execution's current durable state.
-    async fn observe_execution(
-        &self,
-        execution_id: &str,
-    ) -> Result<ExecutionObservation, String>;
+    async fn observe_execution(&self, execution_id: &str) -> Result<ExecutionObservation, String>;
 
     /// Request cancellation of an active Execution.
-    async fn request_cancellation(
-        &self,
-        execution_id: &str,
-    ) -> Result<bool, String>;
+    async fn request_cancellation(&self, execution_id: &str) -> Result<bool, String>;
 }
 
 /// Production I4 gateway backed by the existing Scheduler and Execution tables.
@@ -110,9 +104,7 @@ impl I4Gateway for ProductionI4Gateway {
             .await
             .map_err(|e| format!("reread execution: {e}"))?;
             if let Some((eid,)) = existing {
-                return Ok(ExecutionCreated {
-                    execution_id: eid,
-                });
+                return Ok(ExecutionCreated { execution_id: eid });
             }
             return Err("execution row vanished".into());
         }
@@ -120,17 +112,13 @@ impl I4Gateway for ProductionI4Gateway {
         Ok(ExecutionCreated { execution_id })
     }
 
-    async fn observe_execution(
-        &self,
-        execution_id: &str,
-    ) -> Result<ExecutionObservation, String> {
-        let row: Option<(String, Option<String>)> = sqlx::query_as(
-            "SELECT lifecycle, id FROM execution_attempts WHERE id=?",
-        )
-        .bind(execution_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|e| format!("observe execution: {e}"))?;
+    async fn observe_execution(&self, execution_id: &str) -> Result<ExecutionObservation, String> {
+        let row: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT lifecycle, id FROM execution_attempts WHERE id=?")
+                .bind(execution_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("observe execution: {e}"))?;
 
         let (lifecycle, _) = match row {
             Some(r) => r,
@@ -160,10 +148,7 @@ impl I4Gateway for ProductionI4Gateway {
         })
     }
 
-    async fn request_cancellation(
-        &self,
-        execution_id: &str,
-    ) -> Result<bool, String> {
+    async fn request_cancellation(&self, execution_id: &str) -> Result<bool, String> {
         let r = sqlx::query(
             "UPDATE execution_attempts SET lifecycle='cancelled' \
              WHERE id=? AND lifecycle NOT IN ('completed','failed','cancelled')",
@@ -229,10 +214,7 @@ impl I4Gateway for FixtureI4Gateway {
         Ok(ExecutionCreated { execution_id })
     }
 
-    async fn observe_execution(
-        &self,
-        execution_id: &str,
-    ) -> Result<ExecutionObservation, String> {
+    async fn observe_execution(&self, execution_id: &str) -> Result<ExecutionObservation, String> {
         let lc = self.staged_lifecycle.lock().unwrap().clone();
         let oj = self.staged_outcome_json.lock().unwrap().clone();
         let vrid = self.staged_verification_run_id.lock().unwrap().clone();
@@ -244,10 +226,7 @@ impl I4Gateway for FixtureI4Gateway {
         })
     }
 
-    async fn request_cancellation(
-        &self,
-        _execution_id: &str,
-    ) -> Result<bool, String> {
+    async fn request_cancellation(&self, _execution_id: &str) -> Result<bool, String> {
         Ok(true)
     }
 }

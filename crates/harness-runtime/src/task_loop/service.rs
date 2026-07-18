@@ -358,10 +358,7 @@ impl TaskEngineeringLoopService {
             )
             .await?;
         if ok {
-            let _ = self
-                .events
-                .attempt_dispatched(&a.loop_id, attempt_id)
-                .await;
+            let _ = self.events.attempt_dispatched(&a.loop_id, attempt_id).await;
         }
         Ok(ok)
     }
@@ -369,6 +366,7 @@ impl TaskEngineeringLoopService {
     /// Create an Execution through the certified I4 gateway and bind it.
     /// Idempotent: if the gateway returns an existing Execution, we bind
     /// that instead of creating a duplicate.
+    #[allow(clippy::too_many_arguments)]
     pub async fn dispatch_attempt(
         &self,
         attempt_id: &str,
@@ -379,10 +377,7 @@ impl TaskEngineeringLoopService {
         idempotency_key: &str,
         request_hash: &str,
     ) -> Result<ExecutionCreated, String> {
-        let gateway = self
-            .i4_gateway
-            .as_ref()
-            .ok_or("no I4 gateway configured")?;
+        let gateway = self.i4_gateway.as_ref().ok_or("no I4 gateway configured")?;
 
         let a = self
             .repo
@@ -402,8 +397,7 @@ impl TaskEngineeringLoopService {
         };
 
         let result = gateway.create_execution(&req).await?;
-        self.execution_create_count
-            .fetch_add(1, Ordering::SeqCst);
+        self.execution_create_count.fetch_add(1, Ordering::SeqCst);
 
         // Bind the Execution to the Attempt.
         let _ = self
@@ -418,19 +412,13 @@ impl TaskEngineeringLoopService {
         &self,
         execution_id: &str,
     ) -> Result<crate::task_loop::gateway::ExecutionObservation, String> {
-        let gateway = self
-            .i4_gateway
-            .as_ref()
-            .ok_or("no I4 gateway configured")?;
+        let gateway = self.i4_gateway.as_ref().ok_or("no I4 gateway configured")?;
         gateway.observe_execution(execution_id).await
     }
 
     /// Request I4 cancellation of an active Execution.
     pub async fn cancel_execution(&self, execution_id: &str) -> Result<bool, String> {
-        let gateway = self
-            .i4_gateway
-            .as_ref()
-            .ok_or("no I4 gateway configured")?;
+        let gateway = self.i4_gateway.as_ref().ok_or("no I4 gateway configured")?;
         gateway.request_cancellation(execution_id).await
     }
 
