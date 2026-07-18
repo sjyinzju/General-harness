@@ -685,3 +685,83 @@ async fn reconciliation_required_operation_blocks_release() {
     assert_zero_release(&counters);
     resources_intact(&e.db.pool).await;
 }
+
+// ══════════════════════════════════════════════════════════════════════
+// Remaining classifications: production-path reachability
+// ══════════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn outcome_conflict_terminal_run_without_outcome() {
+    let e = env().await;
+    // Run lifecycle is terminal but the immutable outcome is MISSING —
+    // a contradiction the reconciler must never auto-repair.
+    sqlx::query("UPDATE verification_runs SET outcome_json=NULL WHERE run_id='run-1'")
+        .execute(&e.db.pool)
+        .await
+        .unwrap();
+    // Heartbeat present so DurableHeartbeatMissing does not preempt.
+    register_hb(&e.hb).await;
+    let counters = ReleaseCounters::default();
+    let rec = VerificationReconciler::new(e.db.pool.clone(), e.hb.clone())
+        .with_counters(counters.clone());
+    let r = rec.reconcile(&mkrec("oc")).await;
+    blocked_as(&r, ReconciliationClassification::OutcomeConflict);
+    assert_zero_release(&counters);
+    resources_intact(&e.db.pool).await;
+}
+
+#[tokio::test]
+async fn irrecoverable_ambiguity_resources_without_ownership_record() {
+    let e = env().await;
+    // Claims/lease active but NO handoff row: ownership cannot be
+    // established — irrecoverable, human decision required, zero effects.
+    sqlx::query("DELETE FROM resource_handoffs WHERE handoff_id='ho-1'")
+        .execute(&e.db.pool)
+        .await
+        .unwrap();
+    let counters = ReleaseCounters::default();
+    let rec = VerificationReconciler::new(e.db.pool.clone(), e.hb.clone())
+        .with_counters(counters.clone());
+    let r = rec.reconcile(&mkrec("ia")).await;
+    match r {
+        ReconciliationOutcome::AwaitingHuman { classification, .. } => assert_eq!(
+            classification,
+            ReconciliationClassification::IrrecoverableAmbiguity
+        ),
+        other => panic!("expected AwaitingHuman(IrrecoverableAmbiguity), got {other:?}"),
+    }
+    assert_zero_release(&counters);
+    resources_intact(&e.db.pool).await;
+    let op: (String, String) = sqlx::query_as("SELECT lifecycle, planned_action FROM verification_reconciliation_operations WHERE verification_run_id='run-1'").fetch_one(&e.db.pool).await.unwrap();
+    assert_eq!((op.0.as_str(), op.1.as_str()), ("awaiting_human", "none"));
+}
+
+#[tokio::test]
+async fn complete_operation_record_backfills_completion_only() {
+    let e = env().await;
+    released_state(&e.db.pool, "passed", false).await;
+    sqlx::query("INSERT OR IGNORE INTO verification_step_events (event_id, verification_run_id, step_id, step_op_id, execution_id, task_id, worktree_id, fencing_token, event_type, step_kind, detail_json, idempotency_key) VALUES ('evt-term','run-1','finalization','fo-1','e1','t1','wt1',5,'VerificationPassed','finalization',NULL,'final-ev-run-1-VerificationPassed')")
+        .execute(&e.db.pool).await.unwrap();
+    // Everything released, events + dossier present, but the operation
+    // record itself never reached 'completed' AND its completion step is
+    // still pending.
+    sqlx::query("UPDATE verification_finalization_operations SET lifecycle='releasing_resources' WHERE finalization_op_id='fo-1'")
+        .execute(&e.db.pool).await.unwrap();
+    sqlx::query("UPDATE verification_release_steps SET state='pending' WHERE finalization_op_id='fo-1' AND step_kind='operation_completion'")
+        .execute(&e.db.pool).await.unwrap();
+    let counters = ReleaseCounters::default();
+    let rec = VerificationReconciler::new(e.db.pool.clone(), e.hb.clone())
+        .with_counters(counters.clone());
+    let r = rec.reconcile(&mkrec("cor")).await;
+    assert!(matches!(r, ReconciliationOutcome::Resumed { .. }), "{r:?}");
+    // ONLY the operation-completion side effect executed.
+    let s = counters.snapshot();
+    assert_eq!(
+        [s[0], s[1], s[2], s[3], s[4]],
+        [0, 0, 0, 0, 0],
+        "no resource or event side effects"
+    );
+    assert_eq!(s[5], 1, "operation completion backfilled once");
+    let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM verification_finalization_operations WHERE finalization_op_id='fo-1'").fetch_one(&e.db.pool).await.unwrap();
+    assert_eq!(lc.0, "completed");
+}
