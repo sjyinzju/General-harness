@@ -239,7 +239,7 @@ async fn test_fc06_attempt_insert_before_effect() {
         .with_fault_plan(fp)
         .with_attempt_create_count(ac.clone());
 
-    let (loop_id, v, ft) = create_and_start(
+    let (loop_id, _v, ft) = create_and_start(
         &db,
         Arc::new(FixtureI4Gateway::new(db.pool.clone())),
         "ik-fc06i",
@@ -363,7 +363,7 @@ async fn test_fc13_execution_create_response_lost() {
         .with_i4_gateway(gw.clone())
         .with_fault_plan(fp);
 
-    let (loop_id, v, ft) = create_and_start(&db, gw.clone(), "ik-fc13", "hfc13").await;
+    let (loop_id, _v, ft) = create_and_start(&db, gw.clone(), "ik-fc13", "hfc13").await;
     let l = TaskLoopRepo::new(db.pool.clone())
         .load_loop(&loop_id)
         .await
@@ -405,7 +405,7 @@ async fn test_fc20_decision_insert_before_effect() {
     let dc = Arc::new(AtomicUsize::new(0));
     let fp = Arc::new(FaultPlan::new());
     fp.inject_once(FaultBoundary::DecisionInsert, FaultKind::FailBeforeEffect);
-    let svc = TaskEngineeringLoopService::new(db.pool.clone())
+    let _svc = TaskEngineeringLoopService::new(db.pool.clone())
         .with_fault_plan(fp)
         .with_decision_count(dc.clone());
 
@@ -444,7 +444,7 @@ async fn test_fc21_decision_response_lost() {
         FaultBoundary::DecisionInsert,
         FaultKind::ResponseLostAfterSuccess,
     );
-    let svc = TaskEngineeringLoopService::new(db.pool.clone())
+    let _svc = TaskEngineeringLoopService::new(db.pool.clone())
         .with_fault_plan(fp)
         .with_decision_count(dc.clone());
 
@@ -505,7 +505,7 @@ async fn test_fc22_context_pack_before_effect() {
         FaultBoundary::ContextPackInsert,
         FaultKind::FailBeforeEffect,
     );
-    let svc = TaskEngineeringLoopService::new(db.pool.clone())
+    let _svc = TaskEngineeringLoopService::new(db.pool.clone())
         .with_fault_plan(fp)
         .with_context_pack_count(cc.clone());
 
@@ -539,7 +539,7 @@ async fn test_fc23_context_pack_response_lost() {
         FaultBoundary::ContextPackInsert,
         FaultKind::ResponseLostAfterSuccess,
     );
-    let svc = TaskEngineeringLoopService::new(db.pool.clone())
+    let _svc = TaskEngineeringLoopService::new(db.pool.clone())
         .with_fault_plan(fp)
         .with_context_pack_count(cc.clone());
 
@@ -1046,7 +1046,7 @@ async fn test_fc17_dispatch_response_lost() {
         .with_fault_plan(fp)
         .with_execution_count(ec.clone());
 
-    let (loop_id, v, ft) = create_and_start(
+    let (loop_id, _v, ft) = create_and_start(
         &db,
         Arc::new(FixtureI4Gateway::new(db.pool.clone())),
         "ik-fc17",
