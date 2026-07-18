@@ -122,6 +122,14 @@ pub enum NextActionCategory {
 
 // ── Outcome aggregator ────────────────────────────────────────────────────
 
+/// Identity of a plan step that MUST have exactly one terminal result.
+#[derive(Debug, Clone)]
+pub struct RequiredStep {
+    pub step_id: String,
+    pub kind: VerificationStepKind,
+    pub sequence_index: u32,
+}
+
 /// Pure deterministic function: computes VerificationOutcome from step results
 /// and evidence. No LLM, no heuristics, no agent self-report.
 pub struct VerificationOutcomeAggregator;
@@ -135,43 +143,69 @@ impl VerificationOutcomeAggregator {
         task_id: &str,
         execution_id: &str,
         plan_fingerprint: &str,
-        required_step_kinds: &[VerificationStepKind],
+        required_steps: &[RequiredStep],
         step_results: &[VerificationStepResult],
         _evidence: &[VerificationEvidence],
         cancellation_requested: bool,
     ) -> Result<(VerificationOutcome, FinalizationDossier), CoreError> {
-        // Verify all required steps have results.
-        for kind in required_step_kinds {
-            let found = step_results.iter().any(|sr| {
-                // Match by checking if any result corresponds to this kind.
-                // In production, results are keyed by step_id; here we check
-                // that at least one result exists for each required kind.
-                sr.status != VerificationStepStatus::Skipped
-            });
-            if !found && *kind != VerificationStepKind::CustomCheck {
-                return Ok(Self::blocked(
-                    run_id,
-                    task_id,
-                    execution_id,
-                    plan_fingerprint,
-                    &format!("missing result for required step kind: {kind:?}"),
-                ));
+        // Every REQUIRED plan step must be satisfied by EXACTLY ONE result
+        // with the same step_id, in a terminal, non-skipped status. "Some
+        // result exists" NEVER satisfies a required step of another identity.
+        for rs in required_steps {
+            let matching: Vec<&VerificationStepResult> = step_results
+                .iter()
+                .filter(|sr| sr.step_id == rs.step_id)
+                .collect();
+            match matching.len() {
+                0 => {
+                    return Ok(Self::blocked(
+                        run_id,
+                        task_id,
+                        execution_id,
+                        plan_fingerprint,
+                        &format!(
+                            "missing result for required step {} (kind {:?}, index {})",
+                            rs.step_id, rs.kind, rs.sequence_index
+                        ),
+                    ));
+                }
+                1 => {
+                    let sr = matching[0];
+                    if matches!(
+                        sr.status,
+                        VerificationStepStatus::Skipped | VerificationStepStatus::Error
+                    ) {
+                        return Ok(Self::blocked(
+                            run_id,
+                            task_id,
+                            execution_id,
+                            plan_fingerprint,
+                            &format!("required step {} not terminal: {:?}", rs.step_id, sr.status),
+                        ));
+                    }
+                }
+                n => {
+                    return Ok(Self::blocked(
+                        run_id,
+                        task_id,
+                        execution_id,
+                        plan_fingerprint,
+                        &format!("duplicate results ({n}) for required step {}", rs.step_id),
+                    ));
+                }
             }
         }
 
-        // Check for any required step not terminal.
+        // Any Error result — required or not — blocks finalization
+        // (conservative: an errored check proves nothing).
         for sr in step_results {
-            if matches!(
-                sr.status,
-                VerificationStepStatus::Skipped | VerificationStepStatus::Error
-            ) && !Self::is_optional(sr)
-            {
+            if sr.status == VerificationStepStatus::Error {
                 return Ok(Self::blocked(
                     run_id,
                     task_id,
                     execution_id,
                     plan_fingerprint,
-                    &format!("required step {} not terminal: {:?}", sr.step_id, sr.status),
+                    &format!("step {} not terminal: {:?}", sr.step_id, sr.status),
                 ));
             }
         }
@@ -383,10 +417,6 @@ impl VerificationOutcomeAggregator {
         (outcome, dossier)
     }
 
-    fn is_optional(sr: &VerificationStepResult) -> bool {
-        sr.status == VerificationStepStatus::Skipped
-    }
-
     fn dossier_template(
         run_id: &str,
         task_id: &str,
@@ -499,40 +529,28 @@ impl VerificationFinalizationService {
 
     /// Finalize a verification run: check prerequisites, aggregate outcome,
     /// persist it, and release resources.
+    ///
+    /// Winner selection is a single atomic `INSERT … ON CONFLICT DO NOTHING`
+    /// on the idempotency key. A loser NEVER continues finalization; it reads
+    /// the existing operation and returns Duplicate / IdempotencyConflict, or
+    /// resumes an INCOMPLETE operation from its durable release steps (safe:
+    /// every step is claim-CAS'd, so concurrent resumers cannot double-execute).
     pub async fn finalize(&self, req: &FinalizationRequest) -> FinalizationOutcome {
-        // ── 0. Idempotency ──────────────────────────────────────────
-        let existing: Option<(String, String, String)> = sqlx::query_as(
-            "SELECT finalization_op_id, request_hash, lifecycle FROM verification_finalization_operations WHERE idempotency_key=?",
-        )
-        .bind(&req.idempotency_key)
-        .fetch_optional(&self.pool)
-        .await
-        .unwrap_or(None);
-
-        if let Some((op_id, eh, lc)) = existing {
-            if eh == req.request_hash {
-                return FinalizationOutcome::Duplicate {
-                    existing_outcome_summary: format!("{op_id}:{lc}"),
-                };
-            }
-            return FinalizationOutcome::IdempotencyConflict {
-                existing_hash: eh,
-                new_hash: req.request_hash.clone(),
-            };
+        // ── 0. Existing operation for this idempotency key? ─────────
+        if let Some(outcome) = self.resume_or_reject_existing(req).await {
+            return outcome;
         }
 
-        // ── 1. Prerequisites ────────────────────────────────────────
+        // ── 1. Prerequisites (advisory; the atomic insert + run CAS gate) ──
         if let Some(o) = self.check_prerequisites(req).await {
             return o;
         }
 
-        self.finalizer_start_count.fetch_add(1, Ordering::SeqCst);
-
-        // ── 2. Atomic Started: insert operation + started event ──────
+        // ── 2. Atomic winner: exactly one inserter per idempotency key ──
         let op_id = format!("fo-{}", Uuid::new_v4());
         let now = chrono::Utc::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        if let Err(e) = sqlx::query(
-            "INSERT INTO verification_finalization_operations (finalization_op_id, verification_run_id, idempotency_key, request_hash, plan_fingerprint, worktree_id, fencing_token, owner_id, lifecycle, started_at) VALUES (?,?,?,?,?,?,?,?,'running',?)",
+        let inserted = sqlx::query(
+            "INSERT INTO verification_finalization_operations (finalization_op_id, verification_run_id, idempotency_key, request_hash, plan_fingerprint, worktree_id, fencing_token, owner_id, lifecycle, started_at) VALUES (?,?,?,?,?,?,?,?,'running',?) ON CONFLICT(idempotency_key) DO NOTHING",
         )
         .bind(&op_id)
         .bind(&req.verification_run_id)
@@ -544,17 +562,86 @@ impl VerificationFinalizationService {
         .bind(&req.verification_owner_id)
         .bind(&now)
         .execute(&self.pool)
-        .await
-        {
-            return FinalizationOutcome::InfrastructureError {
-                reason: format!("insert op: {e}"),
-            };
+        .await;
+
+        match inserted {
+            Ok(r) if r.rows_affected() == 1 => {}
+            Ok(_) => {
+                // Loser: another worker owns this key. Read the durable truth
+                // — never a bare UNIQUE error, never a fresh finalization.
+                return self.resume_or_reject_existing(req).await.unwrap_or(
+                    FinalizationOutcome::InfrastructureError {
+                        reason: "operation row vanished after conflict".into(),
+                    },
+                );
+            }
+            Err(e) => {
+                return FinalizationOutcome::InfrastructureError {
+                    reason: format!("insert op: {e}"),
+                }
+            }
         }
+
+        // Winner only.
+        self.finalizer_start_count.fetch_add(1, Ordering::SeqCst);
+
         // Write started event.
         let _ = self
             .write_finalization_event(req, &op_id, "VerificationFinalizationStarted", None)
             .await;
 
+        self.run_finalization(req, &op_id).await
+    }
+
+    /// Same-key re-entry policy. Returns None when no operation exists yet.
+    ///
+    /// - different request hash → IdempotencyConflict
+    /// - completed             → Duplicate (existing result)
+    /// - incomplete            → RESUME from durable state (never restart,
+    ///   never a bare Duplicate that strands a half-released saga)
+    async fn resume_or_reject_existing(
+        &self,
+        req: &FinalizationRequest,
+    ) -> Option<FinalizationOutcome> {
+        let existing: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT finalization_op_id, request_hash, lifecycle FROM verification_finalization_operations WHERE idempotency_key=?",
+        )
+        .bind(&req.idempotency_key)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or(None);
+
+        let (op_id, eh, lc) = existing?;
+        if eh != req.request_hash {
+            return Some(FinalizationOutcome::IdempotencyConflict {
+                existing_hash: eh,
+                new_hash: req.request_hash.clone(),
+            });
+        }
+        match lc.as_str() {
+            "completed" => Some(FinalizationOutcome::Duplicate {
+                existing_outcome_summary: format!("{op_id}:{lc}"),
+            }),
+            // Outcome already durable — resume the release saga from the
+            // first unfinished durable step.
+            "outcome_persisted" | "releasing_resources" | "reconciliation_required" => {
+                Some(self.resume_release_only(req, &op_id).await)
+            }
+            // Crashed before the outcome was persisted: re-run deterministic
+            // aggregation against the SAME operation row.
+            _ => Some(self.run_finalization(req, &op_id).await),
+        }
+    }
+    /// Aggregate → persist outcome → dossier → terminal event → release.
+    /// Used by the fresh winner path AND by same-key resume when the prior
+    /// worker crashed before the outcome was persisted. All writes are
+    /// state-CAS'd or idempotent, so a concurrent resumer cannot double-apply.
+    async fn run_finalization(
+        &self,
+        req: &FinalizationRequest,
+        op_id: &str,
+    ) -> FinalizationOutcome {
+        let op_id = op_id.to_string();
         // ── 3. Aggregate outcome ────────────────────────────────────
         let step_results = match self
             .evidence_repo
@@ -578,22 +665,26 @@ impl VerificationFinalizationService {
             .await
             .unwrap_or_default();
 
-        let required_kinds = vec![
-            VerificationStepKind::AcceptanceCheck,
-            VerificationStepKind::GitDiffCheck,
-            VerificationStepKind::FileScopeCheck,
-            VerificationStepKind::SecretScanCheck,
-            VerificationStepKind::PolicyCheck,
-            VerificationStepKind::ArtifactCheck,
-            VerificationStepKind::WorktreeCheck,
-        ];
+        // Required steps come from the PLAN (identity: step_id + kind +
+        // sequence_index), never from "any result exists".
+        let required_steps = match self.load_required_steps(&req.verification_run_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = self
+                    .mark_reconciliation(&op_id, &format!("load plan steps: {e}"))
+                    .await;
+                return FinalizationOutcome::InfrastructureError {
+                    reason: format!("load plan steps: {e}"),
+                };
+            }
+        };
 
-        let (outcome, mut dossier) = match VerificationOutcomeAggregator::aggregate(
+        let (mut outcome, mut dossier) = match VerificationOutcomeAggregator::aggregate(
             &req.verification_run_id,
             &req.task_id,
             &req.execution_id,
             &req.plan_fingerprint,
-            &required_kinds,
+            &required_steps,
             &step_results,
             &evidence,
             req.cancellation_requested,
@@ -654,10 +745,31 @@ impl VerificationFinalizationService {
         match rows {
             Ok(r) if r.rows_affected() == 1 => {}
             Ok(_) => {
-                let _ = self.mark_reconciliation(&op_id, "run CAS failed").await;
-                return FinalizationOutcome::Blocked {
-                    reason: "run not running or already terminal".into(),
-                };
+                // 0 rows: either the run is genuinely not running, or the
+                // outcome was ALREADY persisted (crash after outcome commit,
+                // or a concurrent winner). The immutable stored outcome is
+                // the source of truth — adopt it and continue; never
+                // re-aggregate over it.
+                let stored: Option<(String, Option<String>)> = sqlx::query_as(
+                    "SELECT lifecycle, outcome_json FROM verification_runs WHERE run_id=?",
+                )
+                .bind(&req.verification_run_id)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or(None);
+                match stored {
+                    Some((lc, Some(oj))) if lc == "completed" => {
+                        if let Ok(o) = serde_json::from_str::<VerificationOutcome>(&oj) {
+                            outcome = o;
+                        }
+                    }
+                    _ => {
+                        let _ = self.mark_reconciliation(&op_id, "run CAS failed").await;
+                        return FinalizationOutcome::Blocked {
+                            reason: "run not running or already terminal".into(),
+                        };
+                    }
+                }
             }
             Err(e) => {
                 let _ = self
@@ -671,15 +783,20 @@ impl VerificationFinalizationService {
 
         // Persist dossier to DB.
         let dossier_json = serde_json::to_string(&dossier).unwrap_or_default();
-        // Mark outcome persisted with dossier.
+        // Mark outcome persisted with dossier (state-CAS: only the first
+        // transition out of 'running' writes; a concurrent resumer no-ops).
         let _ = sqlx::query(
-            "UPDATE verification_finalization_operations SET lifecycle='outcome_persisted', outcome_summary=?, outcome_classification=?, dossier_json=?, outcome_persisted_at=datetime('now') WHERE finalization_op_id=?",
+            "UPDATE verification_finalization_operations SET lifecycle='outcome_persisted', outcome_summary=?, outcome_classification=?, dossier_json=?, outcome_persisted_at=datetime('now') WHERE finalization_op_id=? AND lifecycle='running'",
         )
         .bind(&outcome.summary)
         .bind(outcome.failure_classification.as_ref().map(|c| c.category_name()))
         .bind(&dossier_json)
         .bind(&op_id)
         .execute(&self.pool).await;
+
+        // Re-serialize: `outcome` may have been replaced by the immutable
+        // stored outcome above.
+        let outcome_json = serde_json::to_string(&outcome).unwrap_or_else(|_| "{}".into());
 
         // Write terminal outcome event.
         let terminal_event = if req.cancellation_requested {
@@ -702,6 +819,16 @@ impl VerificationFinalizationService {
         // Every step is CAS-claimed pending→in_progress BEFORE its side
         // effect; ownership is re-verified before every effect; operation
         // completion is itself the final durable step.
+        //
+        // Blocked/Error outcomes (missing required steps, cancellation,
+        // infrastructure) RETAIN resources: the operation rests at
+        // outcome_persisted for Batch 6 reconciliation / human decision.
+        if !Self::outcome_releases_resources(&outcome.result) {
+            return FinalizationOutcome::Finalized {
+                outcome,
+                dossier: Box::new(dossier),
+            };
+        }
         let _ = self
             .write_finalization_event(req, &op_id, "VerificationResourceReleaseStarted", None)
             .await;
@@ -739,6 +866,131 @@ impl VerificationFinalizationService {
         }
     }
 
+    /// Which terminal outcomes release resources. Blocked/Error retain them
+    /// (missing required results, cancellation, infrastructure) so Batch 6 /
+    /// a human can decide — releasing on an unproven outcome is forbidden.
+    fn outcome_releases_resources(result: &VerificationResult) -> bool {
+        matches!(
+            result,
+            VerificationResult::Passed
+                | VerificationResult::PassedWithWarnings
+                | VerificationResult::Failed
+        )
+    }
+
+    /// Load the run's PLAN steps and derive the required-step identity list.
+    async fn load_required_steps(&self, run_id: &str) -> Result<Vec<RequiredStep>, String> {
+        let steps_json: Option<(String,)> = sqlx::query_as(
+            "SELECT p.steps_json FROM verification_plans p \
+             JOIN verification_runs r ON r.plan_id = p.plan_id WHERE r.run_id=?",
+        )
+        .bind(run_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| format!("plan steps: {e}"))?;
+        let raw = match steps_json {
+            Some((s,)) => s,
+            None => return Err("plan not found for run".into()),
+        };
+        let steps: Vec<harness_core::contracts::verification::VerificationStep> =
+            serde_json::from_str(&raw).unwrap_or_default();
+        Ok(steps
+            .into_iter()
+            .filter(|s| s.required)
+            .map(|s| RequiredStep {
+                step_id: s.step_id,
+                kind: s.kind,
+                sequence_index: s.sequence_index,
+            })
+            .collect())
+    }
+
+    /// Resume ONLY the release saga of an existing operation (outcome already
+    /// durable). Never re-aggregates; adopts the immutable stored outcome.
+    async fn resume_release_only(
+        &self,
+        req: &FinalizationRequest,
+        op_id: &str,
+    ) -> FinalizationOutcome {
+        let (outcome, dossier) = match self.load_finalized(req, op_id).await {
+            Some(v) => v,
+            None => {
+                return FinalizationOutcome::InfrastructureError {
+                    reason: "stored outcome unreadable during resume".into(),
+                }
+            }
+        };
+        if !Self::outcome_releases_resources(&outcome.result) {
+            // Resources are retained for this outcome class; nothing to resume.
+            return FinalizationOutcome::Finalized {
+                outcome,
+                dossier: Box::new(dossier),
+            };
+        }
+        let engine = self.release_engine();
+        let ctx = self.release_context(req, op_id);
+        match engine.run_release(&ctx).await {
+            ReleaseRunOutcome::Completed { .. } => FinalizationOutcome::Finalized {
+                outcome,
+                dossier: Box::new(dossier),
+            },
+            ReleaseRunOutcome::HeldByOther { step, worker_id } => {
+                // Another live worker is driving the saga — report the
+                // existing operation, execute nothing.
+                FinalizationOutcome::Duplicate {
+                    existing_outcome_summary: format!(
+                        "{op_id}:in_progress:{}:{worker_id}",
+                        step.as_str()
+                    ),
+                }
+            }
+            ReleaseRunOutcome::OwnershipLost { reason, .. } => {
+                FinalizationOutcome::OwnershipLost { reason }
+            }
+            ReleaseRunOutcome::ReconciliationRequired { step, reason } => {
+                let _ = self
+                    .mark_reconciliation(op_id, &format!("release {} : {}", step.as_str(), reason))
+                    .await;
+                FinalizationOutcome::Finalized {
+                    outcome,
+                    dossier: Box::new(dossier),
+                }
+            }
+            ReleaseRunOutcome::Crashed { step } => FinalizationOutcome::InfrastructureError {
+                reason: format!("crash injected at {}", step.as_str()),
+            },
+            ReleaseRunOutcome::InfrastructureError { reason } => {
+                FinalizationOutcome::InfrastructureError { reason }
+            }
+        }
+    }
+
+    /// Load the immutable stored outcome + dossier for a finalized/finalizing run.
+    async fn load_finalized(
+        &self,
+        req: &FinalizationRequest,
+        op_id: &str,
+    ) -> Option<(VerificationOutcome, FinalizationDossier)> {
+        let oj: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT outcome_json FROM verification_runs WHERE run_id=?")
+                .bind(&req.verification_run_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        let outcome: VerificationOutcome = serde_json::from_str(&oj?.0?).ok()?;
+        let dj: Option<(Option<String>,)> = sqlx::query_as(
+            "SELECT dossier_json FROM verification_finalization_operations WHERE finalization_op_id=?",
+        )
+        .bind(op_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+        let dossier: FinalizationDossier = serde_json::from_str(&dj?.0?).ok()?;
+        Some((outcome, dossier))
+    }
+
     // ── Prerequisites ──────────────────────────────────────────────
 
     async fn check_prerequisites(&self, req: &FinalizationRequest) -> Option<FinalizationOutcome> {
@@ -761,6 +1013,26 @@ impl VerificationFinalizationService {
                 return Some(FinalizationOutcome::Blocked {
                     reason: "run not found".into(),
                 })
+            }
+        }
+
+        // Plan fingerprint must match the run's recorded plan_hash — a
+        // finalization request built against a different plan never proceeds.
+        let ph: Option<(String,)> =
+            sqlx::query_as("SELECT plan_hash FROM verification_runs WHERE run_id=?")
+                .bind(&req.verification_run_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+        if let Some((ph,)) = ph {
+            if ph != req.plan_fingerprint {
+                return Some(FinalizationOutcome::Blocked {
+                    reason: format!(
+                        "plan fingerprint mismatch: run={ph} request={}",
+                        req.plan_fingerprint
+                    ),
+                });
             }
         }
 
@@ -906,6 +1178,14 @@ mod tests {
             request_hash: hash.into(),
             cancellation_requested: false,
             budget_facts_json: None,
+        }
+    }
+
+    fn rq(step_id: &str, kind: VerificationStepKind) -> RequiredStep {
+        RequiredStep {
+            step_id: step_id.into(),
+            kind,
+            sequence_index: 0,
         }
     }
 
@@ -1076,7 +1356,7 @@ mod tests {
             "t1",
             "e1",
             "ha",
-            &[VerificationStepKind::AcceptanceCheck],
+            &[rq("step-1", VerificationStepKind::AcceptanceCheck)],
             &results,
             &[],
             false,
@@ -1104,7 +1384,7 @@ mod tests {
             "t1",
             "e1",
             "ha",
-            &[VerificationStepKind::AcceptanceCheck],
+            &[rq("step-1", VerificationStepKind::AcceptanceCheck)],
             &results,
             &[],
             false,
@@ -1121,13 +1401,162 @@ mod tests {
             "t1",
             "e1",
             "ha",
-            &[VerificationStepKind::AcceptanceCheck],
+            &[rq("step-1", VerificationStepKind::AcceptanceCheck)],
             &results,
             &[],
             false,
         )
         .unwrap();
         assert_eq!(outcome.result, VerificationResult::Blocked);
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_every_required_kind_missing_blocks() {
+        // Any missing required kind → Blocked, for EVERY kind in the enum.
+        let kinds = [
+            VerificationStepKind::GitDiffCheck,
+            VerificationStepKind::FileScopeCheck,
+            VerificationStepKind::SecretScanCheck,
+            VerificationStepKind::PolicyCheck,
+            VerificationStepKind::AcceptanceCheck,
+            VerificationStepKind::ArtifactCheck,
+            VerificationStepKind::TaskResultCheck,
+            VerificationStepKind::WorktreeCheck,
+            VerificationStepKind::ResourceOwnershipCheck,
+            VerificationStepKind::CustomCheck,
+        ];
+        for kind in kinds {
+            // An unrelated passed result exists — it must NOT satisfy the
+            // missing required step of a different identity.
+            let results = vec![VerificationStepResult {
+                result_id: "sr-other".into(),
+                run_id: "run-1".into(),
+                step_id: "other-step".into(),
+                plan_id: "plan-1".into(),
+                status: VerificationStepStatus::Passed,
+                detail_json: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                error_message: None,
+            }];
+            let (outcome, _d) = VerificationOutcomeAggregator::aggregate(
+                "run-1",
+                "t1",
+                "e1",
+                "ha",
+                &[rq("required-step", kind.clone())],
+                &results,
+                &[],
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                outcome.result,
+                VerificationResult::Blocked,
+                "missing required {kind:?} must block"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_duplicate_result_blocks() {
+        let mk = |rid: &str| VerificationStepResult {
+            result_id: rid.into(),
+            run_id: "run-1".into(),
+            step_id: "step-1".into(),
+            plan_id: "plan-1".into(),
+            status: VerificationStepStatus::Passed,
+            detail_json: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            error_message: None,
+        };
+        let (outcome, _d) = VerificationOutcomeAggregator::aggregate(
+            "run-1",
+            "t1",
+            "e1",
+            "ha",
+            &[rq("step-1", VerificationStepKind::AcceptanceCheck)],
+            &[mk("sr-a"), mk("sr-b")],
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome.result, VerificationResult::Blocked);
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_required_skipped_blocks() {
+        let results = vec![VerificationStepResult {
+            result_id: "sr-1".into(),
+            run_id: "run-1".into(),
+            step_id: "step-1".into(),
+            plan_id: "plan-1".into(),
+            status: VerificationStepStatus::Skipped,
+            detail_json: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            error_message: None,
+        }];
+        let (outcome, _d) = VerificationOutcomeAggregator::aggregate(
+            "run-1",
+            "t1",
+            "e1",
+            "ha",
+            &[rq("step-1", VerificationStepKind::AcceptanceCheck)],
+            &results,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome.result, VerificationResult::Blocked);
+    }
+
+    #[tokio::test]
+    async fn test_aggregator_optional_step_not_required_for_completeness() {
+        // A passed required step + a skipped OPTIONAL step (not in the
+        // required list) → Passed.
+        let results = vec![
+            VerificationStepResult {
+                result_id: "sr-1".into(),
+                run_id: "run-1".into(),
+                step_id: "step-1".into(),
+                plan_id: "plan-1".into(),
+                status: VerificationStepStatus::Passed,
+                detail_json: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                error_message: None,
+            },
+            VerificationStepResult {
+                result_id: "sr-2".into(),
+                run_id: "run-1".into(),
+                step_id: "optional-step".into(),
+                plan_id: "plan-1".into(),
+                status: VerificationStepStatus::Skipped,
+                detail_json: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+                error_message: None,
+            },
+        ];
+        let (outcome, _d) = VerificationOutcomeAggregator::aggregate(
+            "run-1",
+            "t1",
+            "e1",
+            "ha",
+            &[rq("step-1", VerificationStepKind::AcceptanceCheck)],
+            &results,
+            &[],
+            false,
+        )
+        .unwrap();
+        assert_eq!(outcome.result, VerificationResult::Passed);
     }
 
     #[tokio::test]
@@ -1181,7 +1610,7 @@ mod tests {
             "t1",
             "e1",
             "ha",
-            &[VerificationStepKind::SecretScanCheck],
+            &[rq("step-1", VerificationStepKind::SecretScanCheck)],
             &results,
             &[],
             false,
@@ -1192,7 +1621,7 @@ mod tests {
             "t1",
             "e1",
             "ha",
-            &[VerificationStepKind::SecretScanCheck],
+            &[rq("step-1", VerificationStepKind::SecretScanCheck)],
             &results,
             &[],
             false,
@@ -1602,7 +2031,7 @@ mod tests {
             "t",
             "e",
             "fp",
-            &[VerificationStepKind::SecretScanCheck],
+            &[rq("s", VerificationStepKind::SecretScanCheck)],
             &[result_with_class("SecretExposure")],
             &[],
             false,
@@ -1618,7 +2047,7 @@ mod tests {
             "t",
             "e",
             "fp",
-            &[VerificationStepKind::FileScopeCheck],
+            &[rq("s", VerificationStepKind::FileScopeCheck)],
             &[result_with_class("ScopeViolation")],
             &[],
             false,
@@ -1634,7 +2063,7 @@ mod tests {
             "t",
             "e",
             "fp",
-            &[VerificationStepKind::AcceptanceCheck],
+            &[rq("s", VerificationStepKind::AcceptanceCheck)],
             &[result_with_class("BuildFailure")],
             &[],
             false,
@@ -1645,17 +2074,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_aggregator_multiple_failures_precedence() {
-        let results = vec![
-            result_with_class("OutputMismatch"),
-            result_with_class("SecretExposure"),
-            result_with_class("BuildFailure"),
-        ];
+        let mut r1 = result_with_class("OutputMismatch");
+        r1.step_id = "s1".into();
+        let mut r2 = result_with_class("SecretExposure");
+        r2.step_id = "s2".into();
+        let mut r3 = result_with_class("BuildFailure");
+        r3.step_id = "s3".into();
+        let results = vec![r1, r2, r3];
         let (o, d) = VerificationOutcomeAggregator::aggregate(
             "r",
             "t",
             "e",
             "fp",
-            &[VerificationStepKind::SecretScanCheck],
+            &[
+                rq("s1", VerificationStepKind::AcceptanceCheck),
+                rq("s2", VerificationStepKind::SecretScanCheck),
+                rq("s3", VerificationStepKind::AcceptanceCheck),
+            ],
             &results,
             &[],
             false,
@@ -1706,12 +2141,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_failure_injection_claim_failure_persists() {
+    async fn test_claim_rows_absent_release_completes() {
         let c = setup().await;
         sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-fi','run-1','step-1','plan-1','passed',datetime('now'))")
             .execute(&c.db.pool).await.unwrap();
-        // Delete claim to simulate claim release returning 0 rows, which is not an error per se,
-        // but finalize still completes. The test verifies no crash and proper state.
+        // No active claim rows for the execution: the claim step is an
+        // executed no-op (NOT a failure injection — see the integration
+        // suite for real injected repository failures).
         sqlx::query("DELETE FROM resource_claims WHERE id='c1'")
             .execute(&c.db.pool)
             .await
@@ -1757,5 +2193,141 @@ mod tests {
         assert_eq!(done.0, 6, "all six release steps durably completed");
         let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM verification_finalization_operations WHERE verification_run_id='run-1'").fetch_one(&c.db.pool).await.unwrap();
         assert_eq!(lc.0, "completed");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    // Phase 2: plan fingerprint, blocked-outcome retention, resume
+    // ══════════════════════════════════════════════════════════════════
+
+    #[tokio::test]
+    async fn test_plan_fingerprint_mismatch_blocks_and_retains() {
+        let c = setup().await;
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-pfm','run-1','step-1','plan-1','passed',datetime('now'))")
+            .execute(&c.db.pool).await.unwrap();
+        let mut rq = mkreq("ik-pfm", "h-pfm");
+        rq.plan_fingerprint = "not-the-plan".into();
+        let r = c.svc.finalize(&rq).await;
+        assert!(matches!(r, FinalizationOutcome::Blocked { .. }), "{r:?}");
+        // Zero release side effects.
+        let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(cs.0, "active");
+        let ls: (String,) = sqlx::query_as("SELECT lifecycle FROM workspace_leases WHERE id='l1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(ls.0, "acquired");
+    }
+
+    #[tokio::test]
+    async fn test_missing_required_plan_step_blocked_and_retains_resources() {
+        let c = setup().await;
+        // The PLAN declares a required step that has NO result. The unrelated
+        // passed result must not satisfy it, the outcome must be Blocked, and
+        // resources must be RETAINED.
+        let step = harness_core::contracts::verification::VerificationStep {
+            step_id: "required-acceptance".into(),
+            plan_id: "plan-1".into(),
+            kind: VerificationStepKind::AcceptanceCheck,
+            description: "acceptance".into(),
+            required: true,
+            sequence_index: 0,
+            config_json: "{}".into(),
+        };
+        let steps_json = serde_json::to_string(&vec![step]).unwrap();
+        sqlx::query("UPDATE verification_plans SET steps_json=? WHERE plan_id='plan-1'")
+            .bind(&steps_json)
+            .execute(&c.db.pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-x','run-1','other-step','plan-1','passed',datetime('now'))")
+            .execute(&c.db.pool).await.unwrap();
+        let r = c.svc.finalize(&mkreq("ik-mrs", "h-mrs")).await;
+        match r {
+            FinalizationOutcome::Finalized { outcome, .. } => {
+                assert_eq!(outcome.result, VerificationResult::Blocked);
+            }
+            other => panic!("expected Finalized(Blocked), got {other:?}"),
+        }
+        // Resources retained: claim/lease/handoff untouched, heartbeat n/a.
+        let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(cs.0, "active", "Blocked outcome must NOT release claim");
+        let ls: (String,) = sqlx::query_as("SELECT lifecycle FROM workspace_leases WHERE id='l1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(ls.0, "acquired", "Blocked outcome must NOT release lease");
+        let hs: (String,) =
+            sqlx::query_as("SELECT status FROM resource_handoffs WHERE handoff_id='ho-1'")
+                .fetch_one(&c.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(hs.0, "verification_owned");
+        // Operation rests at outcome_persisted for Batch 6.
+        let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM verification_finalization_operations WHERE verification_run_id='run-1'").fetch_one(&c.db.pool).await.unwrap();
+        assert_eq!(lc.0, "outcome_persisted");
+    }
+
+    #[tokio::test]
+    async fn test_same_key_reentry_resumes_incomplete_release() {
+        let c = setup().await;
+        // Durable state left by a crashed winner: outcome persisted, release
+        // never started. Same-key re-entry must RESUME (not just Duplicate).
+        let outcome = VerificationOutcome {
+            result: VerificationResult::Passed,
+            failure_classification: None,
+            summary: "all required steps passed".into(),
+            blockers: vec![],
+            findings_count: 0,
+        };
+        let outcome_json = serde_json::to_string(&outcome).unwrap();
+        sqlx::query("UPDATE verification_runs SET lifecycle='completed', outcome_json=?, completed_at=datetime('now') WHERE run_id='run-1'")
+            .bind(&outcome_json).execute(&c.db.pool).await.unwrap();
+        let dossier = FinalizationDossier {
+            run_id: "run-1".into(),
+            task_id: "t1".into(),
+            project_id: "p1".into(),
+            execution_id: "e1".into(),
+            plan_fingerprint: "ha".into(),
+            outcome: VerificationResult::Passed,
+            primary_classification: None,
+            all_blocker_classifications: vec![],
+            blockers: vec![],
+            failed_step_ids: vec![],
+            step_result_refs: vec![],
+            evidence_refs: vec![],
+            worktree_id: "wt1".into(),
+            worktree_path: "/tmp/wt1".into(),
+            baseline_commit: None,
+            worktree_head: None,
+            fencing_snapshot: 5,
+            cancellation_requested: false,
+            budget_facts_json: None,
+            outcome_fingerprint: Some("f".into()),
+            dossier_fingerprint: Some("f".into()),
+            next_action: NextActionCategory::CompleteCandidate,
+        };
+        let dossier_json = serde_json::to_string(&dossier).unwrap();
+        sqlx::query("INSERT INTO verification_finalization_operations(finalization_op_id,verification_run_id,idempotency_key,request_hash,worktree_id,fencing_token,owner_id,lifecycle,dossier_json) VALUES('fo-crashed','run-1','ik-res','h-res','wt1',5,'verify-run-1','outcome_persisted',?)")
+            .bind(&dossier_json).execute(&c.db.pool).await.unwrap();
+
+        let r = c.svc.finalize(&mkreq("ik-res", "h-res")).await;
+        assert!(matches!(r, FinalizationOutcome::Finalized { .. }), "{r:?}");
+        // Release actually resumed and completed.
+        let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
+        assert_eq!(cs.0, "released");
+        let lc: (String,) = sqlx::query_as("SELECT lifecycle FROM verification_finalization_operations WHERE finalization_op_id='fo-crashed'").fetch_one(&c.db.pool).await.unwrap();
+        assert_eq!(lc.0, "completed");
+        // No SECOND operation row was created for the same key.
+        let n: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM verification_finalization_operations WHERE verification_run_id='run-1'").fetch_one(&c.db.pool).await.unwrap();
+        assert_eq!(n.0, 1);
     }
 }
