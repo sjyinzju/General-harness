@@ -260,18 +260,29 @@ async fn create_temp_git_repo() -> PathBuf {
         .arg(&dir)
         .output()
         .unwrap();
-    assert!(status.status.success());
+    assert!(status.status.success(), "git init failed: {}", String::from_utf8_lossy(&status.stderr));
+    // Configure git identity so commits succeed on systems without global config.
+    for (key, val) in &[("user.name", "scheduler-test"), ("user.email", "test@harness.local")] {
+        let cfg = std::process::Command::new("git")
+            .args(["config", key, val])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert!(cfg.status.success(), "git config {key} failed");
+    }
     std::fs::write(dir.join("README.md"), "# test\n").unwrap();
-    std::process::Command::new("git")
+    let add = std::process::Command::new("git")
         .args(["add", "README.md"])
         .current_dir(&dir)
         .output()
         .unwrap();
-    std::process::Command::new("git")
+    assert!(add.status.success(), "git add failed: {}", String::from_utf8_lossy(&add.stderr));
+    let commit = std::process::Command::new("git")
         .args(["commit", "-m", "init"])
         .current_dir(&dir)
         .output()
         .unwrap();
+    assert!(commit.status.success(), "git commit failed: {}", String::from_utf8_lossy(&commit.stderr));
     dir
 }
 
