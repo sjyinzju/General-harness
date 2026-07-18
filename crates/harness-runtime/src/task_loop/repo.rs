@@ -9,8 +9,12 @@
 //! because sqlx FromRow is capped at 16-element tuples.
 //!
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
 use sqlx::{Row, SqlitePool};
 
+use super::faults::{FaultBoundary, FaultKind, FaultPlan};
 use super::types::*;
 
 /// Helper: extract a loop row from a sqlx Row.
@@ -87,12 +91,32 @@ const ATTEMPT_COLS: &str = "\
 
 pub struct TaskLoopRepo {
     pool: SqlitePool,
+    /// Optional fault plan for injecting faults at repo-level boundaries.
+    pub fault_plan: Option<Arc<FaultPlan>>,
+    fault_call_counts: Arc<Mutex<HashMap<FaultBoundary, u64>>>,
 }
 
 #[allow(clippy::too_many_arguments)]
 impl TaskLoopRepo {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            fault_plan: None,
+            fault_call_counts: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Wire a fault plan for fault injection testing.
+    pub fn with_fault_plan(mut self, fp: Arc<FaultPlan>) -> Self {
+        self.fault_plan = Some(fp);
+        self
+    }
+
+    fn check_fault(&self, boundary: FaultBoundary) -> Option<FaultKind> {
+        let fp = self.fault_plan.as_ref()?;
+        let mut counts = self.fault_call_counts.lock().unwrap();
+        let call_count = counts.entry(boundary).or_insert(0);
+        fp.check(boundary, call_count)
     }
 
     // ── Loop CRUD ──────────────────────────────────────────────────
@@ -539,6 +563,12 @@ impl TaskLoopRepo {
         idempotency_key: &str,
         request_hash: &str,
     ) -> Result<bool, String> {
+        // Fault: DecisionInsert before effect
+        if let Some(FaultKind::FailBeforeEffect) =
+            self.check_fault(FaultBoundary::DecisionInsert)
+        {
+            return Err("fault: DecisionInsert before effect".into());
+        }
         let r = sqlx::query(
             "INSERT INTO task_attempt_decisions \
              (decision_id,loop_id,attempt_id,classification,action,\
@@ -566,6 +596,12 @@ impl TaskLoopRepo {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("insert decision: {e}"))?;
+        // Fault: DecisionInsert response lost (after durable write)
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::DecisionInsert)
+        {
+            return Err("fault: DecisionInsert response lost".into());
+        }
         Ok(r.rows_affected() == 1)
     }
 
@@ -635,6 +671,12 @@ impl TaskLoopRepo {
         estimated_input_tokens: Option<i64>,
         validation_status: &str,
     ) -> Result<bool, String> {
+        // Fault: ContextPackInsert before effect
+        if let Some(FaultKind::FailBeforeEffect) =
+            self.check_fault(FaultBoundary::ContextPackInsert)
+        {
+            return Err("fault: ContextPackInsert before effect".into());
+        }
         let r = sqlx::query(
             "INSERT INTO task_context_packs \
              (context_pack_id,loop_id,source_attempt_id,target_attempt_ordinal,\
@@ -655,6 +697,12 @@ impl TaskLoopRepo {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("insert context pack: {e}"))?;
+        // Fault: ContextPackInsert response lost (after durable write)
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::ContextPackInsert)
+        {
+            return Err("fault: ContextPackInsert response lost".into());
+        }
         Ok(r.rows_affected() == 1)
     }
 
@@ -744,6 +792,12 @@ impl TaskLoopRepo {
         usage_fingerprint: Option<&str>,
         idempotency_key: &str,
     ) -> Result<bool, String> {
+        // Fault: UsageWrite before effect
+        if let Some(FaultKind::FailBeforeEffect) =
+            self.check_fault(FaultBoundary::UsageWrite)
+        {
+            return Err("fault: UsageWrite before effect".into());
+        }
         let r = sqlx::query(
             "INSERT INTO task_usage_ledger \
              (usage_id,loop_id,attempt_id,execution_id,runtime_profile_id,\
@@ -773,6 +827,12 @@ impl TaskLoopRepo {
         .execute(&self.pool)
         .await
         .map_err(|e| format!("insert usage: {e}"))?;
+        // Fault: UsageWrite response lost (after durable write)
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::UsageWrite)
+        {
+            return Err("fault: UsageWrite response lost".into());
+        }
         Ok(r.rows_affected() == 1)
     }
 

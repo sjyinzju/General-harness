@@ -7,13 +7,14 @@
 //! NEVER: bypasses I4, calls Agent/LLM directly, commits/merges, deletes
 //! Worktrees, or modifies certified I4 outcomes.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use sqlx::SqlitePool;
 
 use super::events::TaskLoopEventWriter;
-use super::faults::FaultPlan;
+use super::faults::{FaultBoundary, FaultKind, FaultPlan};
 use super::gateway::{CreateExecutionRequest, DispatchResult, ExecutionCreated, I4Gateway};
 use super::progress::BudgetPolicy;
 use super::repo::{LoopUsageSummary, TaskLoopRepo};
@@ -29,6 +30,8 @@ pub struct TaskEngineeringLoopService {
     profile_policy: LoopProfilePolicy,
     budget_policy: BudgetPolicy,
     pub fault_plan: Option<Arc<FaultPlan>>,
+    /// Per-boundary call counters for FaultPlan::check().
+    fault_call_counts: Arc<Mutex<HashMap<FaultBoundary, u64>>>,
     pub loop_create_count: Arc<AtomicUsize>,
     pub attempt_create_count: Arc<AtomicUsize>,
     pub execution_create_count: Arc<AtomicUsize>,
@@ -48,6 +51,7 @@ impl TaskEngineeringLoopService {
             profile_policy: LoopProfilePolicy::default(),
             budget_policy: BudgetPolicy::default(),
             fault_plan: None,
+            fault_call_counts: Arc::new(Mutex::new(HashMap::new())),
             loop_create_count: Arc::new(AtomicUsize::new(0)),
             attempt_create_count: Arc::new(AtomicUsize::new(0)),
             execution_create_count: Arc::new(AtomicUsize::new(0)),
@@ -56,6 +60,16 @@ impl TaskEngineeringLoopService {
             decision_count: Arc::new(AtomicUsize::new(0)),
             _worker_id: format!("tls-{}", uuid::Uuid::new_v4()),
         }
+    }
+
+    /// Check the fault plan for the given boundary. Returns the fault kind if
+    /// one should be injected. Production paths have fault_plan=None so this
+    /// always returns None with zero overhead beyond the Option check.
+    fn check_fault(&self, boundary: FaultBoundary) -> Option<FaultKind> {
+        let fp = self.fault_plan.as_ref()?;
+        let mut counts = self.fault_call_counts.lock().unwrap();
+        let call_count = counts.entry(boundary).or_insert(0);
+        fp.check(boundary, call_count)
     }
 
     /// Wire a real I4 gateway for production use.
@@ -108,8 +122,17 @@ impl TaskEngineeringLoopService {
     }
 
     /// Wire a FaultPlan for fault injection testing.
+    /// Propagates to both the service and its internal repo.
     pub fn with_fault_plan(mut self, fp: Arc<FaultPlan>) -> Self {
+        self.repo = self.repo.with_fault_plan(fp.clone());
         self.fault_plan = Some(fp);
+        self
+    }
+
+    /// Share the fault call counters between service and repo (for tests
+    /// that call repo methods directly through the same service instance).
+    pub fn with_fault_call_counts(mut self, counts: Arc<Mutex<HashMap<FaultBoundary, u64>>>) -> Self {
+        self.fault_call_counts = counts;
         self
     }
 
@@ -117,7 +140,21 @@ impl TaskEngineeringLoopService {
 
     /// Create a new task engineering loop. Idempotent.
     pub async fn create_loop(&self, req: &CreateLoopRequest) -> Result<CreateLoopOutcome, String> {
+        // Fault: before effect
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::LoopInsert) {
+            return Err("fault: LoopInsert before effect".into());
+        }
         let outcome = self.repo.create_loop(req).await?;
+        // Fault: after effect, before response (response lost)
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::LoopInsert)
+        {
+            // Effect succeeded — increment counter to reflect durable write.
+            if matches!(outcome, CreateLoopOutcome::Created { .. }) {
+                self.loop_create_count.fetch_add(1, Ordering::SeqCst);
+            }
+            return Err("fault: LoopInsert response lost".into());
+        }
         if matches!(outcome, CreateLoopOutcome::Created { .. }) {
             self.loop_create_count.fetch_add(1, Ordering::SeqCst);
             if let CreateLoopOutcome::Created { ref loop_id } = outcome {
@@ -147,6 +184,17 @@ impl TaskEngineeringLoopService {
             return Ok(LoopStartOutcome::AlreadyTerminal {
                 lifecycle: l.lifecycle,
             });
+        }
+
+        // Fault: OwnerTakeover — simulate another owner holding the loop.
+        if let Some(FaultKind::OwnerTakeover) = self.check_fault(FaultBoundary::LoopOwnership) {
+            return Ok(LoopStartOutcome::HeldByOther {
+                owner_id: "fault-takeover".into(),
+            });
+        }
+        // Fault: before effect
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::LoopOwnership) {
+            return Err("fault: LoopOwnership before effect".into());
         }
 
         // Acquire ownership with version + fencing CAS.
@@ -233,13 +281,31 @@ impl TaskEngineeringLoopService {
         }
 
         // Guard: profile must be allowed by policy.
+        // Fault: ProfileSelection before effect
+        if let Some(FaultKind::FailBeforeEffect) =
+            self.check_fault(FaultBoundary::ProfileSelection)
+        {
+            return Err("fault: ProfileSelection before effect".into());
+        }
         if !self.profile_policy.is_allowed(runtime_profile_id) {
             return Ok(PrepareAttemptOutcome::InfrastructureError {
                 reason: format!("profile {runtime_profile_id} not in allowlist"),
             });
         }
+        // Fault: ProfileSelection response lost
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::ProfileSelection)
+        {
+            return Err("fault: ProfileSelection response lost".into());
+        }
 
         // Guard: budget must allow another attempt.
+        // Fault: BudgetReservation before effect
+        if let Some(FaultKind::FailBeforeEffect) =
+            self.check_fault(FaultBoundary::BudgetReservation)
+        {
+            return Err("fault: BudgetReservation before effect".into());
+        }
         let usage = self.repo.sum_loop_usage(loop_id).await?;
         let budget_check = self.budget_policy.check_can_attempt(
             l.attempt_count,
@@ -261,6 +327,13 @@ impl TaskEngineeringLoopService {
                     reason: format!("budget check failed: {other:?}"),
                 });
             }
+        }
+        // Fault: BudgetReservation response lost (after durable count increment)
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::BudgetReservation)
+        {
+            self.budget_reserve_count.fetch_add(1, Ordering::SeqCst);
+            return Err("fault: BudgetReservation response lost".into());
         }
         self.budget_reserve_count.fetch_add(1, Ordering::SeqCst);
 
@@ -309,13 +382,31 @@ impl TaskEngineeringLoopService {
             &workspace_source,
             AttemptWorkspaceSource::ContinueFromAttempt { .. }
         ) {
+            // Fault: WorkspaceContinuation before effect
+            if let Some(FaultKind::FailBeforeEffect) =
+                self.check_fault(FaultBoundary::WorkspaceContinuation)
+            {
+                return Err("fault: WorkspaceContinuation before effect".into());
+            }
             if let Err(reason) = Self::validate_workspace_continuation(&workspace_source) {
                 return Ok(PrepareAttemptOutcome::InfrastructureError { reason });
+            }
+            // Fault: WorkspaceContinuation response lost
+            if let Some(FaultKind::ResponseLostAfterSuccess) =
+                self.check_fault(FaultBoundary::WorkspaceContinuation)
+            {
+                return Err("fault: WorkspaceContinuation response lost".into());
             }
         }
 
         // Create Context Pack if spec provided.
         let context_pack_id = if let Some(spec) = &context_pack_spec {
+            // Fault: ContextPackInsert before effect
+            if let Some(FaultKind::FailBeforeEffect) =
+                self.check_fault(FaultBoundary::ContextPackInsert)
+            {
+                return Err("fault: ContextPackInsert before effect".into());
+            }
             let cp_id = format!("cp-{}-{}", loop_id, ordinal);
             let payload_json = serde_json::to_string(spec).unwrap_or_default();
             let cp_fp = fingerprint_hex(&payload_json);
@@ -332,12 +423,26 @@ impl TaskEngineeringLoopService {
                     "valid",
                 )
                 .await?;
+            // Fault: ContextPackInsert response lost (after durable write)
+            if let Some(FaultKind::ResponseLostAfterSuccess) =
+                self.check_fault(FaultBoundary::ContextPackInsert)
+            {
+                self.context_pack_count.fetch_add(1, Ordering::SeqCst);
+                return Err("fault: ContextPackInsert response lost".into());
+            }
             self.context_pack_count.fetch_add(1, Ordering::SeqCst);
             let _ = self.events.context_pack_created(loop_id, &cp_id).await;
             Some(cp_id)
         } else {
             None
         };
+
+        // Fault: AttemptInsert before effect
+        if let Some(FaultKind::FailBeforeEffect) =
+            self.check_fault(FaultBoundary::AttemptInsert)
+        {
+            return Err("fault: AttemptInsert before effect".into());
+        }
 
         // Atomically insert Attempt row.
         let (src_exec, src_wt, src_base, src_head, src_diff, ws_kind) = match &workspace_source {
@@ -386,6 +491,14 @@ impl TaskEngineeringLoopService {
             return Ok(PrepareAttemptOutcome::AlreadyExists {
                 attempt_id: existing.map(|a| a.attempt_id).unwrap_or(attempt_id),
             });
+        }
+
+        // Fault: AttemptInsert response lost (after durable insert)
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::AttemptInsert)
+        {
+            self.attempt_create_count.fetch_add(1, Ordering::SeqCst);
+            return Err("fault: AttemptInsert response lost".into());
         }
 
         self.attempt_create_count.fetch_add(1, Ordering::SeqCst);
@@ -441,6 +554,12 @@ impl TaskEngineeringLoopService {
         attempt_id: &str,
         execution_id: &str,
     ) -> Result<bool, String> {
+        // Fault: ExecutionBind before effect
+        if let Some(FaultKind::FailBeforeEffect) =
+            self.check_fault(FaultBoundary::ExecutionBind)
+        {
+            return Err("fault: ExecutionBind before effect".into());
+        }
         let a = self
             .repo
             .load_attempt(attempt_id)
@@ -455,6 +574,12 @@ impl TaskEngineeringLoopService {
                 AttemptLifecycle::Dispatched,
             )
             .await?;
+        // Fault: ExecutionBind response lost (after durable bind)
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::ExecutionBind)
+        {
+            return Err("fault: ExecutionBind response lost".into());
+        }
         if ok {
             let _ = self.events.attempt_dispatched(&a.loop_id, attempt_id).await;
         }
@@ -498,7 +623,20 @@ impl TaskEngineeringLoopService {
             timeout_secs: None,
         };
 
+        // Fault: ExecutionCreate before effect
+        if let Some(FaultKind::FailBeforeEffect) =
+            self.check_fault(FaultBoundary::ExecutionCreate)
+        {
+            return Err("fault: ExecutionCreate before effect".into());
+        }
         let result = gateway.create_execution(&req).await?;
+        // Fault: ExecutionCreate response lost (after durable create)
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::ExecutionCreate)
+        {
+            self.execution_create_count.fetch_add(1, Ordering::SeqCst);
+            return Err("fault: ExecutionCreate response lost".into());
+        }
         self.execution_create_count.fetch_add(1, Ordering::SeqCst);
 
         // Bind the Execution to the Attempt.
@@ -552,7 +690,20 @@ impl TaskEngineeringLoopService {
             timeout_secs: Some(timeout_secs),
         };
 
+        // Fault: Dispatch before effect
+        if let Some(FaultKind::FailBeforeEffect) =
+            self.check_fault(FaultBoundary::Dispatch)
+        {
+            return Err("fault: Dispatch before effect".into());
+        }
         let result = gateway.dispatch_execution(&req, adapter).await?;
+        // Fault: Dispatch response lost (after durable dispatch)
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::Dispatch)
+        {
+            self.execution_create_count.fetch_add(1, Ordering::SeqCst);
+            return Err("fault: Dispatch response lost".into());
+        }
         self.execution_create_count.fetch_add(1, Ordering::SeqCst);
 
         // Bind the Execution to the Attempt.
@@ -568,8 +719,19 @@ impl TaskEngineeringLoopService {
         &self,
         execution_id: &str,
     ) -> Result<crate::task_loop::gateway::ExecutionObservation, String> {
+        // Fault: OutcomeObserve before effect
+        if let Some(FaultKind::FailBeforeEffect) =
+            self.check_fault(FaultBoundary::OutcomeObserve)
+        {
+            return Err("fault: OutcomeObserve before effect".into());
+        }
         let gateway = self.i4_gateway.as_ref().ok_or("no I4 gateway configured")?;
-        gateway.observe_execution(execution_id).await
+        let obs = gateway.observe_execution(execution_id).await?;
+        // Fault: DossierRead — inject after OutcomeObserve
+        if let Some(FaultKind::FailBeforeEffect) = self.check_fault(FaultBoundary::DossierRead) {
+            return Err("fault: DossierRead before effect".into());
+        }
+        Ok(obs)
     }
 
     /// Request I4 cancellation of an active Execution.
@@ -676,6 +838,20 @@ impl TaskEngineeringLoopService {
                 None,
             )
             .await?;
+
+        // Fault: TerminalTransition response lost (after durable transition)
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::TerminalTransition)
+        {
+            return Err("fault: TerminalTransition response lost".into());
+        }
+
+        // Fault: EventWrite response lost
+        if let Some(FaultKind::ResponseLostAfterSuccess) =
+            self.check_fault(FaultBoundary::EventWrite)
+        {
+            return Err("fault: EventWrite response lost".into());
+        }
 
         let _ = self.events.cancellation_requested(loop_id).await;
         let _ = self.events.cancelled(loop_id).await;

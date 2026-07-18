@@ -264,14 +264,13 @@ async fn test_fc06_attempt_insert_before_effect() {
             None,
         )
         .await;
-    // Fault may or may not trigger (hooks not yet production-wired).
-    // Verify the outcome is well-formed.
-    match r {
-        Ok(PrepareAttemptOutcome::Prepared { .. }) => {}
-        Ok(PrepareAttemptOutcome::InfrastructureError { .. }) => {}
-        Ok(PrepareAttemptOutcome::OwnershipLost) => {}
-        other => panic!("FC06: unexpected outcome: {:?}", other),
-    }
+    // Before-effect fault now triggers — must be an Err (not Ok).
+    assert!(
+        r.is_err(),
+        "FC06: before-effect fault must prevent attempt: {:?}",
+        r
+    );
+    assert_eq!(ac.load(Ordering::SeqCst), 0, "FC06: no attempt created");
 }
 
 // FC-07: Attempt insert response lost
@@ -874,10 +873,10 @@ async fn test_fc10_profile_selection_before_effect() {
             None,
         )
         .await;
-    // Profile outside allowlist must be rejected.
+    // Before-effect fault triggers before the allowlist check — must be Err.
     assert!(
-        matches!(r, Ok(PrepareAttemptOutcome::InfrastructureError { .. })),
-        "FC10: disallowed profile must be rejected: {:?}",
+        r.is_err(),
+        "FC10: before-effect fault must prevent profile selection: {:?}",
         r
     );
 }
