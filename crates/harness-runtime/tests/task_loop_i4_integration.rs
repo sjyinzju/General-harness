@@ -694,3 +694,312 @@ async fn test_context_pack_no_secret_in_payload() {
     assert!(!json.contains("ANTHROPIC_API_KEY"));
     assert!(!json.contains("OPENAI_API_KEY"));
 }
+
+// ── Completion Hard Gate (Phase 2) ──────────────────────────────
+
+#[tokio::test]
+async fn test_completion_eligibility_all_gates_pass() {
+    let (db, _gw) = setup_with_gateway().await;
+    sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id, version) VALUES ('exec-c1','t1',1,'completed','p1',1)")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_plans (plan_id, task_id, execution_id, project_id, plan_hash, plan_version, steps_json) VALUES ('plan-c1','t1','exec-c1','p1','ha',1,'[]')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_runs (run_id, plan_id, plan_hash, plan_version, execution_id, task_id, project_id, lifecycle, outcome_json, idempotency_key, request_hash) VALUES ('vr-c1','plan-c1','ha',1,'exec-c1','t1','p1','finalized','{\"result\":\"passed\",\"all_required_steps_passed\":true,\"evidence_complete\":true}','ik-c1','hc1')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_finalization_operations (finalization_op_id, verification_run_id, idempotency_key, request_hash, worktree_id, fencing_token, owner_id, lifecycle, dossier_json) VALUES ('fo-c1','vr-c1','fik-c1','fhc1','wt-c1',1,'v1','completed','{\"dossier\":\"ok\"}')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO worktrees (id, project_id, task_id, execution_id, repository_root, repository_identity, worktree_path, branch_name, base_commit, owner_supervisor_id, operation_id, status) VALUES ('wt-c1','p1','t1','exec-c1','/tmp','/tmp/.git','/tmp/wt1','br1','abc','sv1','op1','active')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO resource_handoffs (handoff_id, project_id, task_id, execution_id, worktree_id, lease_id, fencing_token, owner_kind, owner_id, status) VALUES ('ho-c1','p1','t1','exec-c1','wt-c1','l1',1,'verification','v1','verification_owned')")
+        .execute(&db.pool).await.unwrap();
+
+    let eligibility =
+        harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-c1")
+            .await;
+    let eligibility = match eligibility {
+        Ok(e) => e,
+        Err(e) => panic!("eligibility query failed: {e}"),
+    };
+    assert!(eligibility.all_passed(), "all gates must pass: {:?}", eligibility.failed_gates());
+}
+
+#[tokio::test]
+async fn test_completion_eligibility_rejects_fabricated_passed() {
+    let (db, _gw) = setup_with_gateway().await;
+    // Execution exists but has NO verification run — outcome cannot be passed.
+    sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id, version) VALUES ('exec-fab','t1',1,'created','p1',1)")
+        .execute(&db.pool).await.unwrap();
+
+    let eligibility =
+        harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-fab")
+            .await
+            .unwrap();
+    assert!(!eligibility.all_passed(), "fabricated passed must be rejected");
+    assert!(!eligibility.outcome_passed, "outcome must not be passed");
+    assert!(!eligibility.verification_terminal, "verification must not be terminal");
+    assert!(!eligibility.execution_terminal, "execution must not be terminal");
+}
+
+#[tokio::test]
+async fn test_completion_eligibility_rejects_failed_outcome() {
+    let (db, _gw) = setup_with_gateway().await;
+    sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id, version) VALUES ('exec-fail','t1',2,'completed','p1',1)")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_plans (plan_id, task_id, execution_id, project_id, plan_hash, plan_version, steps_json) VALUES ('plan-fail','t1','exec-fail','p1','ha',1,'[]')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_runs (run_id, plan_id, plan_hash, plan_version, execution_id, task_id, project_id, lifecycle, outcome_json, idempotency_key, request_hash) VALUES ('vr-fail','plan-fail','ha',1,'exec-fail','t1','p1','finalized','{\"result\":\"failed\",\"all_required_steps_passed\":false,\"evidence_complete\":true}','ik-fail','hf')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_finalization_operations (finalization_op_id, verification_run_id, idempotency_key, request_hash, worktree_id, fencing_token, owner_id, lifecycle, dossier_json) VALUES ('fo-fail','vr-fail','fik-fail','fhf','wt-f1',1,'v2','completed','{\"dossier\":\"ok\"}')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO worktrees (id, project_id, task_id, execution_id, repository_root, repository_identity, worktree_path, branch_name, base_commit, owner_supervisor_id, operation_id, status) VALUES ('wt-f1','p1','t1','exec-fail','/tmp/repo','/tmp/repo/.git','/tmp/wt2','br2','abc','sv1','op2','active')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO resource_handoffs (handoff_id, project_id, task_id, execution_id, worktree_id, lease_id, fencing_token, owner_kind, owner_id, status) VALUES ('ho-f1','p1','t1','exec-fail','wt-f1','l2',1,'verification','v2','verification_owned')")
+        .execute(&db.pool).await.unwrap();
+
+    let eligibility =
+        harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-fail")
+            .await
+            .unwrap();
+    assert!(!eligibility.all_passed(), "failed outcome must reject completion");
+    assert!(!eligibility.outcome_passed, "outcome must not be passed");
+    assert!(eligibility.execution_terminal, "execution is terminal but outcome failed");
+    assert!(!eligibility.required_steps_complete, "steps not all passed");
+}
+
+#[tokio::test]
+async fn test_completion_eligibility_rejects_active_process() {
+    let (db, _gw) = setup_with_gateway().await;
+    sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id, version) VALUES ('exec-ap','t1',3,'completed','p1',1)")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_plans (plan_id, task_id, execution_id, project_id, plan_hash, plan_version, steps_json) VALUES ('plan-ap','t1','exec-ap','p1','ha',1,'[]')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_runs (run_id, plan_id, plan_hash, plan_version, execution_id, task_id, project_id, lifecycle, outcome_json, idempotency_key, request_hash) VALUES ('vr-ap','plan-ap','ha',1,'exec-ap','t1','p1','finalized','{\"result\":\"passed\",\"all_required_steps_passed\":true,\"evidence_complete\":true}','ik-ap','hap')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_finalization_operations (finalization_op_id, verification_run_id, idempotency_key, request_hash, worktree_id, fencing_token, owner_id, lifecycle, dossier_json) VALUES ('fo-ap','vr-ap','fik-ap','fhap','wt-ap',1,'v3','completed','{\"dossier\":\"ok\"}')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO worktrees (id, project_id, task_id, execution_id, repository_root, repository_identity, worktree_path, branch_name, base_commit, owner_supervisor_id, operation_id, status) VALUES ('wt-ap','p1','t1','exec-ap','/tmp/repo','/tmp/repo/.git','/tmp/wt3','br3','abc','sv1','op3','active')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO resource_handoffs (handoff_id, project_id, task_id, execution_id, worktree_id, lease_id, fencing_token, owner_kind, owner_id, status) VALUES ('ho-ap','p1','t1','exec-ap','wt-ap','l3',1,'verification','v3','verification_owned')")
+        .execute(&db.pool).await.unwrap();
+    // Active process — verification step still running.
+    sqlx::query("INSERT INTO verification_step_operations (op_id, verification_run_id, step_id, plan_id, execution_id, step_config_hash, worktree_id, fencing_token, status, idempotency_key, request_hash) VALUES ('op-ap','vr-ap','s1','plan-ap','exec-ap','cfg','wt-ap',1,'running','ik-op','hop')")
+        .execute(&db.pool).await.unwrap();
+
+    let eligibility =
+        harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-ap")
+            .await
+            .unwrap();
+    assert!(!eligibility.all_passed(), "active process must block completion");
+    assert!(!eligibility.process_inactive, "process must be detected as active");
+}
+
+#[tokio::test]
+async fn test_completion_eligibility_rejects_missing_dossier() {
+    let (db, _gw) = setup_with_gateway().await;
+    sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id, version) VALUES ('exec-md','t1',4,'completed','p1',1)")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_plans (plan_id, task_id, execution_id, project_id, plan_hash, plan_version, steps_json) VALUES ('plan-md','t1','exec-md','p1','ha',1,'[]')")
+        .execute(&db.pool).await.unwrap();
+    // Verification run exists but NO finalization operation → no dossier.
+    sqlx::query("INSERT INTO verification_runs (run_id, plan_id, plan_hash, plan_version, execution_id, task_id, project_id, lifecycle, outcome_json, idempotency_key, request_hash) VALUES ('vr-md','plan-md','ha',1,'exec-md','t1','p1','finalized','{\"result\":\"passed\",\"all_required_steps_passed\":true,\"evidence_complete\":true}','ik-md','hmd')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO worktrees (id, project_id, task_id, execution_id, repository_root, repository_identity, worktree_path, branch_name, base_commit, owner_supervisor_id, operation_id, status) VALUES ('wt-md','p1','t1','exec-md','/tmp/repo','/tmp/repo/.git','/tmp/wt4','br4','abc','sv1','op4','active')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO resource_handoffs (handoff_id, project_id, task_id, execution_id, worktree_id, lease_id, fencing_token, owner_kind, owner_id, status) VALUES ('ho-md','p1','t1','exec-md','wt-md','l4',1,'verification','v4','verification_owned')")
+        .execute(&db.pool).await.unwrap();
+
+    let eligibility =
+        harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-md")
+            .await
+            .unwrap();
+    assert!(!eligibility.all_passed(), "missing dossier must block completion");
+    assert!(!eligibility.dossier_fingerprint_valid, "dossier must be invalid");
+}
+
+#[tokio::test]
+async fn test_completion_eligibility_rejects_stale_ownership() {
+    let (db, _gw) = setup_with_gateway().await;
+    sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id, version) VALUES ('exec-so','t1',5,'completed','p1',1)")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_plans (plan_id, task_id, execution_id, project_id, plan_hash, plan_version, steps_json) VALUES ('plan-so','t1','exec-so','p1','ha',1,'[]')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_runs (run_id, plan_id, plan_hash, plan_version, execution_id, task_id, project_id, lifecycle, outcome_json, idempotency_key, request_hash) VALUES ('vr-so','plan-so','ha',1,'exec-so','t1','p1','finalized','{\"result\":\"passed\",\"all_required_steps_passed\":true,\"evidence_complete\":true}','ik-so','hso')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO verification_finalization_operations (finalization_op_id, verification_run_id, idempotency_key, request_hash, worktree_id, fencing_token, owner_id, lifecycle, dossier_json) VALUES ('fo-so','vr-so','fik-so','fhso','wt-so',1,'v5','completed','{\"dossier\":\"ok\"}')")
+        .execute(&db.pool).await.unwrap();
+    sqlx::query("INSERT INTO worktrees (id, project_id, task_id, execution_id, repository_root, repository_identity, worktree_path, branch_name, base_commit, owner_supervisor_id, operation_id, status) VALUES ('wt-so','p1','t1','exec-so','/tmp/repo','/tmp/repo/.git','/tmp/wt5','br5','abc','sv1','op5','active')")
+        .execute(&db.pool).await.unwrap();
+    // Handoff is RELEASED — ownership lost.
+    sqlx::query("INSERT INTO resource_handoffs (handoff_id, project_id, task_id, execution_id, worktree_id, lease_id, fencing_token, owner_kind, owner_id, status) VALUES ('ho-so','p1','t1','exec-so','wt-so','l5',1,'verification','v5','released')")
+        .execute(&db.pool).await.unwrap();
+
+    let eligibility =
+        harness_runtime::task_loop::validate_completion_eligibility(&db.pool, "exec-so")
+            .await
+            .unwrap();
+    assert!(!eligibility.all_passed(), "released handoff must block completion");
+    assert!(!eligibility.ownership_valid, "released ownership must be invalid");
+}
+
+// ── Workspace Continuation (Phase 3) ────────────────────────────
+
+#[tokio::test]
+async fn test_workspace_continuation_rejects_empty_fields() {
+    let source = AttemptWorkspaceSource::ContinueFromAttempt {
+        source_attempt_id: "".into(),
+        source_execution_id: "".into(),
+        source_worktree_id: "".into(),
+        expected_baseline_commit: "abc".into(),
+        expected_head: "def".into(),
+        expected_diff_fingerprint: "df1".into(),
+    };
+    let result = TaskEngineeringLoopService::validate_workspace_continuation(&source);
+    assert!(result.is_err(), "empty fields must be rejected");
+}
+
+#[tokio::test]
+async fn test_workspace_continuation_rejects_missing_commits() {
+    let source = AttemptWorkspaceSource::ContinueFromAttempt {
+        source_attempt_id: "a1".into(),
+        source_execution_id: "e1".into(),
+        source_worktree_id: "wt1".into(),
+        expected_baseline_commit: "".into(),
+        expected_head: "".into(),
+        expected_diff_fingerprint: "df1".into(),
+    };
+    let result = TaskEngineeringLoopService::validate_workspace_continuation(&source);
+    assert!(result.is_err(), "missing commits must be rejected");
+}
+
+#[tokio::test]
+async fn test_workspace_continuation_rejects_missing_diff_fingerprint() {
+    let source = AttemptWorkspaceSource::ContinueFromAttempt {
+        source_attempt_id: "a1".into(),
+        source_execution_id: "e1".into(),
+        source_worktree_id: "wt1".into(),
+        expected_baseline_commit: "abc".into(),
+        expected_head: "def".into(),
+        expected_diff_fingerprint: "".into(),
+    };
+    let result = TaskEngineeringLoopService::validate_workspace_continuation(&source);
+    assert!(result.is_err(), "missing diff fingerprint must be rejected");
+}
+
+#[tokio::test]
+async fn test_workspace_continuation_rejects_nonexistent_path() {
+    let source = AttemptWorkspaceSource::ContinueFromAttempt {
+        source_attempt_id: "a1".into(),
+        source_execution_id: "e1".into(),
+        source_worktree_id: "/nonexistent/path/that/does/not/exist".into(),
+        expected_baseline_commit: "abc".into(),
+        expected_head: "def".into(),
+        expected_diff_fingerprint: "df1".into(),
+    };
+    let result = TaskEngineeringLoopService::validate_workspace_continuation(&source);
+    assert!(result.is_err(), "nonexistent path must be rejected");
+}
+
+#[tokio::test]
+async fn test_workspace_continuation_accepts_initial() {
+    let source = AttemptWorkspaceSource::InitialTaskWorkspace {
+        repository_path: "/tmp/repo".into(),
+    };
+    let result = TaskEngineeringLoopService::validate_workspace_continuation(&source);
+    assert!(result.is_ok(), "initial workspace must always be accepted");
+}
+
+#[tokio::test]
+async fn test_workspace_continuation_validates_git_head() {
+    // Create a real temp git repo and verify HEAD validation.
+    let td = tempfile::tempdir().unwrap();
+    let repo_path = td.path().join("repo");
+    std::fs::create_dir_all(&repo_path).unwrap();
+
+    // Init git repo with a commit.
+    let git_init = std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo_path)
+        .output();
+    if git_init.is_err() {
+        // Git not available — skip this test.
+        return;
+    }
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.name", "test"])
+        .current_dir(&repo_path)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["config", "user.email", "test@test.com"])
+        .current_dir(&repo_path)
+        .output();
+    std::fs::write(repo_path.join("file.txt"), "hello").unwrap();
+    let _ = std::process::Command::new("git")
+        .args(["add", "."])
+        .current_dir(&repo_path)
+        .output();
+    let _ = std::process::Command::new("git")
+        .args(["commit", "-m", "init"])
+        .current_dir(&repo_path)
+        .output();
+
+    let head_output = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&repo_path)
+        .output()
+        .unwrap();
+    let actual_head = String::from_utf8_lossy(&head_output.stdout).trim().to_string();
+
+    // Valid continuation with correct HEAD.
+    let source = AttemptWorkspaceSource::ContinueFromAttempt {
+        source_attempt_id: "a1".into(),
+        source_execution_id: "e1".into(),
+        source_worktree_id: repo_path.to_string_lossy().to_string(),
+        expected_baseline_commit: actual_head.clone(),
+        expected_head: actual_head.clone(),
+        expected_diff_fingerprint: "df1".into(),
+    };
+    let result = TaskEngineeringLoopService::validate_workspace_continuation(&source);
+    assert!(result.is_ok(), "valid HEAD must be accepted: {:?}", result.err());
+
+    // Wrong HEAD — must be rejected.
+    let bad_source = AttemptWorkspaceSource::ContinueFromAttempt {
+        source_attempt_id: "a1".into(),
+        source_execution_id: "e1".into(),
+        source_worktree_id: repo_path.to_string_lossy().to_string(),
+        expected_baseline_commit: "deadbeef".into(),
+        expected_head: "deadbeef".into(),
+        expected_diff_fingerprint: "df1".into(),
+    };
+    let bad_result = TaskEngineeringLoopService::validate_workspace_continuation(&bad_source);
+    assert!(bad_result.is_err(), "wrong HEAD must be rejected");
+}
+
+#[tokio::test]
+async fn test_prepare_attempt_rejects_invalid_continuation() {
+    let (db, gw) = setup_with_gateway().await;
+    let s = TaskEngineeringLoopService::new(db.pool.clone()).with_i4_gateway(gw);
+    let CreateLoopOutcome::Created { loop_id } =
+        s.create_loop(&loop_req("ik-wsv", "hwsv")).await.unwrap()
+    else { panic!("not created") };
+    let LoopStartOutcome::Started { version } =
+        s.start_or_resume_loop(&loop_id, "owner1", 300).await.unwrap()
+    else { panic!("not started") };
+    let v = version.unwrap();
+    let l = TaskLoopRepo::new(db.pool.clone()).load_loop(&loop_id).await.unwrap().unwrap();
+
+    // Attempt with invalid continuation (empty fields) → must be rejected.
+    let r = s.prepare_next_attempt(
+        &loop_id, "owner1", v, l.fencing_token, "prof-1",
+        AttemptWorkspaceSource::ContinueFromAttempt {
+            source_attempt_id: "".into(),
+            source_execution_id: "".into(),
+            source_worktree_id: "".into(),
+            expected_baseline_commit: "abc".into(),
+            expected_head: "def".into(),
+            expected_diff_fingerprint: "df1".into(),
+        },
+        None,
+    ).await.unwrap();
+    assert!(matches!(r, PrepareAttemptOutcome::InfrastructureError { .. }),
+        "invalid continuation must be rejected: {:?}", r);
+}

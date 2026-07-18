@@ -19,7 +19,9 @@ pub mod repo;
 pub mod service;
 pub mod types;
 
-pub use decision::DecisionInput;
+pub use decision::{
+    validate_completion_eligibility, CompletionEligibility, DecisionInput,
+};
 pub use events::TaskLoopEventWriter;
 pub use gateway::{
     CreateExecutionRequest, DispatchResult, ExecutionCreated, ExecutionObservation,

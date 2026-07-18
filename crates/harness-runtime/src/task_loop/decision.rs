@@ -160,6 +160,188 @@ pub fn is_always_blocking(failure_classification: &str) -> bool {
     )
 }
 
+// ── Completion Eligibility (Production Hard Gate) ────────────────────
+
+/// Production guard: eligibility for CompleteCandidate MUST be derived from
+/// durable I4 facts, not from caller-constructed DecisionInput fields.
+/// Every field must be independently verified against the database before
+/// CompleteCandidate can be accepted.
+#[derive(Debug, Clone, Default)]
+pub struct CompletionEligibility {
+    pub execution_terminal: bool,
+    pub outcome_passed: bool,
+    pub verification_terminal: bool,
+    pub required_steps_complete: bool,
+    pub evidence_complete: bool,
+    pub dossier_fingerprint_valid: bool,
+    pub process_inactive: bool,
+    pub reconciliation_clear: bool,
+    pub workspace_valid: bool,
+    pub ownership_valid: bool,
+}
+
+impl CompletionEligibility {
+    /// All gates must pass for CompleteCandidate to be valid.
+    pub fn all_passed(&self) -> bool {
+        self.execution_terminal
+            && self.outcome_passed
+            && self.verification_terminal
+            && self.required_steps_complete
+            && self.evidence_complete
+            && self.dossier_fingerprint_valid
+            && self.process_inactive
+            && self.reconciliation_clear
+            && self.workspace_valid
+            && self.ownership_valid
+    }
+
+    /// Return the list of failed gates for diagnostics.
+    pub fn failed_gates(&self) -> Vec<&'static str> {
+        let mut gates = Vec::new();
+        if !self.execution_terminal {
+            gates.push("execution_terminal");
+        }
+        if !self.outcome_passed {
+            gates.push("outcome_passed");
+        }
+        if !self.verification_terminal {
+            gates.push("verification_terminal");
+        }
+        if !self.required_steps_complete {
+            gates.push("required_steps_complete");
+        }
+        if !self.evidence_complete {
+            gates.push("evidence_complete");
+        }
+        if !self.dossier_fingerprint_valid {
+            gates.push("dossier_fingerprint_valid");
+        }
+        if !self.process_inactive {
+            gates.push("process_inactive");
+        }
+        if !self.reconciliation_clear {
+            gates.push("reconciliation_clear");
+        }
+        if !self.workspace_valid {
+            gates.push("workspace_valid");
+        }
+        if !self.ownership_valid {
+            gates.push("ownership_valid");
+        }
+        gates
+    }
+}
+
+/// Validate completion eligibility from durable I4 state.
+/// This is the PRODUCTION HARD GATE — it reads actual database state,
+/// not caller-provided DecisionInput fields.
+pub async fn validate_completion_eligibility(
+    pool: &sqlx::SqlitePool,
+    execution_id: &str,
+) -> Result<CompletionEligibility, String> {
+    let mut eligibility = CompletionEligibility::default();
+
+    // 1. Execution must be terminal.
+    let exec_row: Option<(String,)> =
+        sqlx::query_as("SELECT lifecycle FROM execution_attempts WHERE id=?")
+            .bind(execution_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("eligibility query: {e}"))?;
+    if let Some((lc,)) = exec_row {
+        eligibility.execution_terminal =
+            lc == "completed" || lc == "failed" || lc == "cancelled";
+    }
+
+    // 2. Verification must be terminal with passed outcome.
+    let ver_row: Option<(String, Option<String>)> = sqlx::query_as(
+        "SELECT lifecycle, outcome_json FROM verification_runs WHERE execution_id=?",
+    )
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("eligibility ver query: {e}"))?;
+
+    if let Some((v_lc, outcome_json)) = ver_row {
+        eligibility.verification_terminal =
+            v_lc == "finalized" || v_lc == "completed" || v_lc == "blocked";
+
+        // Parse outcome JSON for "result": "passed"
+        if let Some(ref oj) = outcome_json {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(oj) {
+                eligibility.outcome_passed = v
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s == "passed")
+                    .unwrap_or(false);
+                eligibility.required_steps_complete = v
+                    .get("all_required_steps_passed")
+                    .and_then(|s| s.as_bool())
+                    .unwrap_or(false);
+                eligibility.evidence_complete = v
+                    .get("evidence_complete")
+                    .and_then(|s| s.as_bool())
+                    .unwrap_or(false);
+            }
+        }
+    }
+
+    // Dossier fingerprint: verify finalization operation has dossier_json and
+    // is in a terminal lifecycle.
+    let dossier_row: Option<(String,)> = sqlx::query_as(
+        "SELECT dossier_json FROM verification_finalization_operations \
+         WHERE verification_run_id=(SELECT run_id FROM verification_runs WHERE execution_id=? LIMIT 1) \
+         AND dossier_json IS NOT NULL \
+         AND lifecycle IN ('completed','outcome_persisted') \
+         LIMIT 1",
+    )
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("eligibility dossier query: {e}"))?;
+    eligibility.dossier_fingerprint_valid = dossier_row.is_some();
+
+    // 3. No active process for this execution.
+    let proc_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM verification_step_operations WHERE execution_id=? AND status='running'")
+            .bind(execution_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("eligibility proc query: {e}"))?;
+    eligibility.process_inactive = proc_count.0 == 0;
+
+    // 4. No reconciliation required.
+    let rec_count: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM verification_reconciliation_operations WHERE verification_run_id=(SELECT run_id FROM verification_runs WHERE execution_id=? LIMIT 1) AND lifecycle NOT IN ('completed','noop')",
+    )
+    .bind(execution_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("eligibility rec query: {e}"))?;
+    eligibility.reconciliation_clear = rec_count.0 == 0;
+
+    // 5. Workspace / worktree must exist and be valid.
+    let wt_row: Option<(String,)> =
+        sqlx::query_as("SELECT id FROM worktrees WHERE execution_id=?")
+            .bind(execution_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("eligibility wt query: {e}"))?;
+    eligibility.workspace_valid = wt_row.is_some();
+
+    // 6. Ownership / handoff must be valid.
+    let ho_row: Option<(String,)> = sqlx::query_as(
+        "SELECT handoff_id FROM resource_handoffs WHERE execution_id=? AND status NOT IN ('released','failed')",
+    )
+    .bind(execution_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("eligibility ho query: {e}"))?;
+    eligibility.ownership_valid = ho_row.is_some();
+
+    Ok(eligibility)
+}
+
 /// Compute a decision fingerprint from input facts.
 pub fn decision_fingerprint(input: &DecisionInput) -> String {
     let s = format!(
