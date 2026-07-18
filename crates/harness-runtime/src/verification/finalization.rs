@@ -302,8 +302,7 @@ impl VerificationOutcomeAggregator {
                     out_of_scope_files: blockers.clone(),
                 })
             }
-            Some("RequiredFileMissing") | Some("ArtifactMissing")
-            | Some("ArtifactCorruption") => {
+            Some("RequiredFileMissing") | Some("ArtifactMissing") | Some("ArtifactCorruption") => {
                 Some(FailureClassification::ArtifactCorruption {
                     artifact_ids: failed_step_ids.clone(),
                 })
@@ -880,14 +879,22 @@ impl VerificationFinalizationService {
     }
 
     async fn save_release_progress(
-        &self, op_id: &str, rp: &ReleaseProgress,
+        &self,
+        op_id: &str,
+        rp: &ReleaseProgress,
     ) -> Result<(), CoreError> {
         let progress_json = serde_json::to_string(rp).unwrap_or_default();
         let rows = sqlx::query("UPDATE verification_finalization_operations SET release_progress_json=?, resources_released_at=datetime('now'), version=version+1 WHERE finalization_op_id=?")
             .bind(&progress_json).bind(op_id).execute(&self.pool).await
             .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("save progress: {e}"), ErrorSource::System))?;
         if rows.rows_affected() == 0 {
-            return Err(CoreError::new(ErrorCode::ResourceConflict { resource: "finalization_op".into() }, "concurrent progress conflict", ErrorSource::System));
+            return Err(CoreError::new(
+                ErrorCode::ResourceConflict {
+                    resource: "finalization_op".into(),
+                },
+                "concurrent progress conflict",
+                ErrorSource::System,
+            ));
         }
         Ok(())
     }
@@ -1576,8 +1583,16 @@ mod tests {
         let db1 = Database::open(&dp).await.unwrap();
         let db2 = Database::open(&dp).await.unwrap();
         let p = db1.pool.clone();
-        sqlx::query("INSERT INTO projects(id,objective,lifecycle) VALUES('p1','t','active')").execute(&p).await.unwrap();
-        sqlx::query("INSERT INTO tasks(id,project_id,goal,lifecycle) VALUES('t1','p1','t','submitted')").execute(&p).await.unwrap();
+        sqlx::query("INSERT INTO projects(id,objective,lifecycle) VALUES('p1','t','active')")
+            .execute(&p)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO tasks(id,project_id,goal,lifecycle) VALUES('t1','p1','t','submitted')",
+        )
+        .execute(&p)
+        .await
+        .unwrap();
         sqlx::query("INSERT INTO execution_attempts(id,task_id,attempt_number,lifecycle) VALUES('e1','t1',1,'completed')").execute(&p).await.unwrap();
         sqlx::query("INSERT INTO verification_plans(plan_id,task_id,execution_id,project_id,plan_hash,plan_version,steps_json) VALUES('plan-1','t1','e1','p1','ha',1,'[]')").execute(&p).await.unwrap();
         sqlx::query("INSERT INTO verification_runs(run_id,plan_id,plan_hash,plan_version,execution_id,task_id,project_id,lifecycle,idempotency_key,request_hash) VALUES('run-1','plan-1','ha',1,'e1','t1','p1','running','ik-r','hr')").execute(&p).await.unwrap();
@@ -1600,22 +1615,44 @@ mod tests {
         let fo_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM verification_finalization_operations WHERE verification_run_id='run-1'").fetch_one(&p).await.unwrap();
         assert_eq!(fo_count.0, 1, "finalization_operation_count == 1");
 
-        let outcome_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM verification_runs WHERE run_id='run-1' AND lifecycle='completed'").fetch_one(&p).await.unwrap();
+        let outcome_count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_runs WHERE run_id='run-1' AND lifecycle='completed'",
+        )
+        .fetch_one(&p)
+        .await
+        .unwrap();
         assert_eq!(outcome_count.0, 1, "final_outcome_count == 1");
 
-        let terminal_ev: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM verification_step_events WHERE event_type='VerificationPassed'").fetch_one(&p).await.unwrap();
+        let terminal_ev: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_step_events WHERE event_type='VerificationPassed'",
+        )
+        .fetch_one(&p)
+        .await
+        .unwrap();
         assert_eq!(terminal_ev.0, 1, "terminal_event_count == 1");
 
-        let claim_rel: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM resource_claims WHERE status='released'").fetch_one(&p).await.unwrap();
+        let claim_rel: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM resource_claims WHERE status='released'")
+                .fetch_one(&p)
+                .await
+                .unwrap();
         assert_eq!(claim_rel.0, 1, "claim_release_count == 1");
 
-        let lease_rel: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM workspace_leases WHERE lifecycle='released'").fetch_one(&p).await.unwrap();
+        let lease_rel: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM workspace_leases WHERE lifecycle='released'")
+                .fetch_one(&p)
+                .await
+                .unwrap();
         assert_eq!(lease_rel.0, 1, "lease_release_count == 1");
 
         let hb_exists = hb.exists("e1").await;
         assert!(!hb_exists, "heartbeat_unregister_count == 1");
 
-        let handoff_rel: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM resource_handoffs WHERE status='released'").fetch_one(&p).await.unwrap();
+        let handoff_rel: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM resource_handoffs WHERE status='released'")
+                .fetch_one(&p)
+                .await
+                .unwrap();
         assert_eq!(handoff_rel.0, 1, "handoff_release_count == 1");
     }
 
@@ -1632,9 +1669,15 @@ mod tests {
         // Instead, verify that finalize completes normally and claim is released.
         c.svc.finalize(&mkreq("ik-pf2", "h-pf2")).await;
 
-        let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'").fetch_one(&c.db.pool).await.unwrap();
+        let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
         assert_eq!(cs.0, "released", "claim released");
-        let ls: (String,) = sqlx::query_as("SELECT lifecycle FROM workspace_leases WHERE id='l1'").fetch_one(&c.db.pool).await.unwrap();
+        let ls: (String,) = sqlx::query_as("SELECT lifecycle FROM workspace_leases WHERE id='l1'")
+            .fetch_one(&c.db.pool)
+            .await
+            .unwrap();
         assert_eq!(ls.0, "released", "lease released");
     }
 
@@ -1663,28 +1706,64 @@ mod tests {
 
     fn result_with_class(class: &str) -> VerificationStepResult {
         VerificationStepResult {
-            result_id: "sr-c".into(), run_id: "r".into(), step_id: "s".into(),
-            plan_id: "p".into(), status: VerificationStepStatus::Failed,
+            result_id: "sr-c".into(),
+            run_id: "r".into(),
+            step_id: "s".into(),
+            plan_id: "p".into(),
+            status: VerificationStepStatus::Failed,
             detail_json: Some(format!(r#"{{"classification":"{class}"}}"#)),
-            started_at: None, completed_at: None, duration_ms: None, error_message: None,
+            started_at: None,
+            completed_at: None,
+            duration_ms: None,
+            error_message: None,
         }
     }
 
     #[tokio::test]
     async fn test_aggregator_secret_exposure() {
-        let (o, _) = VerificationOutcomeAggregator::aggregate("r","t","e","fp",&[VerificationStepKind::SecretScanCheck],&[result_with_class("SecretExposure")],&[],false).unwrap();
+        let (o, _) = VerificationOutcomeAggregator::aggregate(
+            "r",
+            "t",
+            "e",
+            "fp",
+            &[VerificationStepKind::SecretScanCheck],
+            &[result_with_class("SecretExposure")],
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(o.result, VerificationResult::Failed);
     }
 
     #[tokio::test]
     async fn test_aggregator_scope_violation() {
-        let (o, _) = VerificationOutcomeAggregator::aggregate("r","t","e","fp",&[VerificationStepKind::FileScopeCheck],&[result_with_class("ScopeViolation")],&[],false).unwrap();
+        let (o, _) = VerificationOutcomeAggregator::aggregate(
+            "r",
+            "t",
+            "e",
+            "fp",
+            &[VerificationStepKind::FileScopeCheck],
+            &[result_with_class("ScopeViolation")],
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(o.result, VerificationResult::Failed);
     }
 
     #[tokio::test]
     async fn test_aggregator_build_failure() {
-        let (o, _) = VerificationOutcomeAggregator::aggregate("r","t","e","fp",&[VerificationStepKind::AcceptanceCheck],&[result_with_class("BuildFailure")],&[],false).unwrap();
+        let (o, _) = VerificationOutcomeAggregator::aggregate(
+            "r",
+            "t",
+            "e",
+            "fp",
+            &[VerificationStepKind::AcceptanceCheck],
+            &[result_with_class("BuildFailure")],
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(o.result, VerificationResult::Failed);
     }
 
@@ -1695,7 +1774,17 @@ mod tests {
             result_with_class("SecretExposure"),
             result_with_class("BuildFailure"),
         ];
-        let (o, d) = VerificationOutcomeAggregator::aggregate("r","t","e","fp",&[VerificationStepKind::SecretScanCheck],&results,&[],false).unwrap();
+        let (o, d) = VerificationOutcomeAggregator::aggregate(
+            "r",
+            "t",
+            "e",
+            "fp",
+            &[VerificationStepKind::SecretScanCheck],
+            &results,
+            &[],
+            false,
+        )
+        .unwrap();
         assert_eq!(o.result, VerificationResult::Failed);
         // SecretExposure has highest precedence.
         assert!(d.primary_classification.as_deref() == Some("SecretExposure"));

@@ -11,6 +11,7 @@ pub mod finalization;
 pub mod ownership_service;
 pub mod plan_repo;
 pub mod policy_evidence;
+pub mod reconciler;
 pub mod run_repo;
 
 pub use content_validator::VerificationContentValidator;
