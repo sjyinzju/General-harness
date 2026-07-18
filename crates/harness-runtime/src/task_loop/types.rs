@@ -557,6 +557,94 @@ pub struct ContextPackSpec {
     pub stop_conditions: Vec<String>,
 }
 
+// ── Profile policy ──────────────────────────────────────────────
+
+/// Loop-level profile selection and switching policy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopProfilePolicy {
+    pub allowed_profile_ids: Vec<String>,
+    pub preferred_profile_ids: Vec<String>,
+    pub allow_profile_switch: bool,
+    pub max_profile_switches: u32,
+    pub required_capabilities: Vec<String>,
+    pub forbidden_provider_changes: bool,
+}
+
+impl Default for LoopProfilePolicy {
+    fn default() -> Self {
+        Self {
+            allowed_profile_ids: vec![],
+            preferred_profile_ids: vec![],
+            allow_profile_switch: false,
+            max_profile_switches: 1,
+            required_capabilities: vec![],
+            forbidden_provider_changes: true,
+        }
+    }
+}
+
+impl LoopProfilePolicy {
+    /// Check if a profile is allowed.
+    pub fn is_allowed(&self, profile_id: &str) -> bool {
+        if self.allowed_profile_ids.is_empty() {
+            return true; // No allowlist = all allowed.
+        }
+        self.allowed_profile_ids.iter().any(|id| id == profile_id)
+    }
+
+    /// Check if profile switching is permitted under current policy.
+    pub fn can_switch(
+        &self,
+        current_switch_count: i64,
+        from_provider: Option<&str>,
+        to_provider: Option<&str>,
+    ) -> bool {
+        if !self.allow_profile_switch {
+            return false;
+        }
+        if current_switch_count >= self.max_profile_switches as i64 {
+            return false;
+        }
+        if self.forbidden_provider_changes {
+            if let (Some(f), Some(t)) = (from_provider, to_provider) {
+                if f != t {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Select the best profile from an available list. Deterministic tie-break.
+    pub fn select(&self, available: &[(&str, Option<&str>)]) -> Option<String> {
+        // available: Vec<(profile_id, provider)>
+        for pref in &self.preferred_profile_ids {
+            if self.is_allowed(pref) && available.iter().any(|(id, _)| id == pref) {
+                return Some(pref.clone());
+            }
+        }
+        // No preferred match: pick first allowed.
+        for (id, _) in available {
+            if self.is_allowed(id) {
+                return Some(id.to_string());
+            }
+        }
+        None
+    }
+}
+
+/// Record of a profile selection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileSelectionRecord {
+    pub loop_id: String,
+    pub attempt_id: String,
+    pub selected_profile_id: String,
+    pub provider: Option<String>,
+    pub reason: String,
+    pub switch_from: Option<String>,
+    pub switch_ordinal: i64,
+}
+
 // ── FNV-1a helper ──────────────────────────────────────────────────
 
 /// Deterministic, platform-stable FNV-1a 64-bit hash.
