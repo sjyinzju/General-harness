@@ -60,20 +60,19 @@ impl VerificationRunRepo {
     }
 
     /// Atomically create a verification run or detect a duplicate/conflict.
+    ///
+    /// Arbitration is the single atomic INSERT (unique idempotency_key), not
+    /// a read-then-write transaction: a deferred tx upgrading read→write
+    /// under writer contention dies with SQLITE_BUSY_SNAPSHOT, which
+    /// busy_timeout does not retry. Autocommit single-statement writes
+    /// serialize cleanly on the WAL write lock.
     pub async fn create_run(&self, run: &VerificationRun) -> Result<RunIntentOutcome, CoreError> {
-        let mut tx = self.pool.begin().await.map_err(|e| {
-            CoreError::new(
-                ErrorCode::PersistenceError,
-                format!("begin create run tx: {e}"),
-                ErrorSource::System,
-            )
-        })?;
-
+        // Fast path: existing operation for this key.
         let existing: Option<(String, String, String, i64)> = sqlx::query_as(
             "SELECT run_id, request_hash, lifecycle, version FROM verification_runs WHERE idempotency_key = ?",
         )
         .bind(&run.idempotency_key)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("check dup: {e}"), ErrorSource::System))?;
 
@@ -108,23 +107,58 @@ impl VerificationRunRepo {
             VerificationContentValidator::validate_detail_json(oj)?;
         }
 
-        sqlx::query(
-            "INSERT INTO verification_runs (run_id, plan_id, plan_hash, plan_version, execution_id, task_id, project_id, lifecycle, idempotency_key, request_hash, outcome_json) VALUES (?,?,?,?,?,?,?,'created',?,?,?)",
+        // Atomic winner insert: a concurrent racer that loses the unique
+        // constraint re-reads the winner's durable row and returns
+        // Duplicate/IdempotencyConflict — a bare UNIQUE error never escapes.
+        let inserted = sqlx::query(
+            "INSERT OR IGNORE INTO verification_runs (run_id, plan_id, plan_hash, plan_version, execution_id, task_id, project_id, lifecycle, idempotency_key, request_hash, outcome_json) VALUES (?,?,?,?,?,?,?,'created',?,?,?)",
         )
         .bind(&run.run_id).bind(&run.plan_id).bind(&run.plan_fingerprint.plan_hash)
         .bind(run.plan_fingerprint.plan_version as i64).bind(&run.execution_id)
         .bind(&run.task_id).bind(&run.project_id).bind(&run.idempotency_key)
         .bind(&run.request_hash).bind(outcome_json.as_deref())
-        .execute(&mut *tx).await
+        .execute(&self.pool).await
         .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("insert run: {e}"), ErrorSource::System))?;
 
-        tx.commit().await.map_err(|e| {
-            CoreError::new(
-                ErrorCode::PersistenceError,
-                format!("commit run: {e}"),
-                ErrorSource::System,
+        if inserted.rows_affected() == 0 {
+            let existing: Option<(String, String)> = sqlx::query_as(
+                "SELECT run_id, request_hash FROM verification_runs WHERE idempotency_key = ?",
             )
-        })?;
+            .bind(&run.idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::PersistenceError,
+                    format!("reread after conflict: {e}"),
+                    ErrorSource::System,
+                )
+            })?;
+            let (existing_id, existing_hash) = existing.ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::PersistenceError,
+                    "run insert ignored but no row for idempotency key (conflicting active run?)",
+                    ErrorSource::System,
+                )
+            })?;
+            if existing_hash == run.request_hash {
+                let existing_run = self.load_run_by_id(&existing_id).await?.ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        "run found by ikey but not loadable",
+                        ErrorSource::System,
+                    )
+                })?;
+                return Ok(RunIntentOutcome::Duplicate {
+                    existing: Box::new(existing_run),
+                });
+            }
+            return Ok(RunIntentOutcome::IdempotencyConflict {
+                existing_run_id: existing_id,
+                existing_hash,
+                new_hash: run.request_hash.clone(),
+            });
+        }
 
         Ok(RunIntentOutcome::Created {
             run_id: run.run_id.clone(),
@@ -266,16 +300,32 @@ mod tests {
 
     async fn setup() -> Database {
         let db = Database::open_in_memory().await.unwrap();
+        seed_prereqs(&db.pool).await;
+        db
+    }
+
+    /// File-backed variant for concurrency tests: WAL + busy_timeout give
+    /// deterministic writer serialization (the shared-cache in-memory pool
+    /// surfaces table-lock errors under concurrent transactions).
+    async fn setup_file_backed() -> (Database, tempfile::TempDir) {
+        let td = tempfile::tempdir().unwrap();
+        let db = Database::open(&td.path().join("run_repo.db"))
+            .await
+            .unwrap();
+        seed_prereqs(&db.pool).await;
+        (db, td)
+    }
+
+    async fn seed_prereqs(pool: &SqlitePool) {
         sqlx::query(
             "INSERT INTO projects (id, objective, lifecycle) VALUES ('p1','test','active')",
         )
-        .execute(&db.pool)
+        .execute(pool)
         .await
         .unwrap();
-        sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES ('t1','p1','test','submitted')").execute(&db.pool).await.unwrap();
-        sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'completed')").execute(&db.pool).await.unwrap();
-        sqlx::query("INSERT INTO verification_plans (plan_id, task_id, execution_id, project_id, plan_hash, plan_version, steps_json) VALUES ('plan-1','t1','e1','p1','hash-aaa',1,'[]')").execute(&db.pool).await.unwrap();
-        db
+        sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES ('t1','p1','test','submitted')").execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO execution_attempts (id, task_id, attempt_number, lifecycle) VALUES ('e1','t1',1,'completed')").execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO verification_plans (plan_id, task_id, execution_id, project_id, plan_hash, plan_version, steps_json) VALUES ('plan-1','t1','e1','p1','hash-aaa',1,'[]')").execute(pool).await.unwrap();
     }
 
     fn make_run(run_id: &str, ikey: &str, hash: &str) -> VerificationRun {
@@ -345,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_same_key_one_winner() {
-        let db = setup().await;
+        let (db, _td) = setup_file_backed().await;
         let repo1 = VerificationRunRepo::new(db.pool.clone());
         let repo2 = VerificationRunRepo::new(db.pool.clone());
 
@@ -357,8 +407,8 @@ mod tests {
             || matches!(r2, Ok(RunIntentOutcome::Created { .. }));
         let has_duplicate = matches!(r1, Ok(RunIntentOutcome::Duplicate { .. }))
             || matches!(r2, Ok(RunIntentOutcome::Duplicate { .. }));
-        assert!(has_created, "one must create");
-        assert!(has_duplicate, "other must be duplicate");
+        assert!(has_created, "one must create: {r1:?} / {r2:?}");
+        assert!(has_duplicate, "other must be duplicate: {r1:?} / {r2:?}");
     }
 
     /// True file-backed two-pool concurrency: two independent SqlitePools

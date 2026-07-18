@@ -77,11 +77,15 @@ impl DispatchRepository {
     ///   claim request hash, scheduler request identity)
     /// - request_hash (fingerprint of the full request)
     ///
-    /// Within a single write transaction:
-    /// 1. If an operation with the same idempotency_key exists:
+    /// Arbitration is the single atomic INSERT on the UNIQUE idempotency_key
+    /// (not a read-then-write transaction: a deferred tx upgrading read→write
+    /// under writer contention dies with SQLITE_BUSY_SNAPSHOT, which
+    /// busy_timeout does not retry):
+    /// 1. Existing operation with the same idempotency_key:
     ///    a. Same request_hash → return the existing outcome (duplicate)
     ///    b. Different request_hash → return IdempotencyConflict
-    /// 2. Otherwise → insert new intent with status='preparing'
+    /// 2. Otherwise → atomic insert; the ON CONFLICT loser re-reads the
+    ///    winner's row (never a bare UNIQUE error).
     #[allow(clippy::too_many_arguments)]
     pub async fn record_intent(
         &self,
@@ -92,20 +96,12 @@ impl DispatchRepository {
         idempotency_key: &str,
         request_hash: &str,
     ) -> Result<IntentOutcome, CoreError> {
-        let mut tx = self.pool.begin().await.map_err(|e| {
-            CoreError::new(
-                ErrorCode::PersistenceError,
-                format!("begin tx: {e}"),
-                ErrorSource::System,
-            )
-        })?;
-
-        // Check for existing operation with same idempotency_key
+        // Fast path: existing operation with same idempotency_key.
         let existing: Option<(String, String, String, Option<String>)> = sqlx::query_as(
             "SELECT id, request_hash, status, execution_id FROM dispatch_operations WHERE idempotency_key = ?",
         )
         .bind(idempotency_key)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&self.pool)
         .await
         .map_err(|e| {
             CoreError::new(
@@ -142,9 +138,11 @@ impl DispatchRepository {
             }
         }
 
-        // No existing operation — insert new intent
-        sqlx::query(
-            "INSERT INTO dispatch_operations (id, project_id, task_id, selected_profile_id, request_hash, idempotency_key, status, stage) VALUES (?,?,?,?,?,?,'preparing','init')",
+        // No existing operation — atomic winner insert. A concurrent racer
+        // that loses the ON CONFLICT re-reads the durable row and returns
+        // Duplicate/Conflict; a bare UNIQUE error never escapes.
+        let inserted = sqlx::query(
+            "INSERT INTO dispatch_operations (id, project_id, task_id, selected_profile_id, request_hash, idempotency_key, status, stage) VALUES (?,?,?,?,?,?,'preparing','init') ON CONFLICT(idempotency_key) DO NOTHING",
         )
         .bind(op_id)
         .bind(project_id)
@@ -152,7 +150,7 @@ impl DispatchRepository {
         .bind(profile_id)
         .bind(request_hash)
         .bind(idempotency_key)
-        .execute(&mut *tx)
+        .execute(&self.pool)
         .await
         .map_err(|e| {
             CoreError::new(
@@ -162,13 +160,50 @@ impl DispatchRepository {
             )
         })?;
 
-        tx.commit().await.map_err(|e| {
-            CoreError::new(
-                ErrorCode::PersistenceError,
-                format!("commit intent: {e}"),
-                ErrorSource::System,
+        if inserted.rows_affected() == 0 {
+            // Lost the insert race: read the winner's durable row.
+            let existing: Option<(String, String, String, Option<String>)> = sqlx::query_as(
+                "SELECT id, request_hash, status, execution_id FROM dispatch_operations WHERE idempotency_key = ?",
             )
-        })?;
+            .bind(idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::PersistenceError,
+                    format!("reread after conflict: {e}"),
+                    ErrorSource::System,
+                )
+            })?;
+            let (existing_id, existing_hash, existing_status, existing_exec_id) = existing
+                .ok_or_else(|| {
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        "intent row vanished after conflict",
+                        ErrorSource::System,
+                    )
+                })?;
+            if existing_hash == request_hash {
+                let outcome = DispatchOutcome {
+                    dispatch_op_id: existing_id,
+                    task_id: task_id.to_string(),
+                    execution_id: existing_exec_id,
+                    status: match existing_status.as_str() {
+                        "agent_completed" | "completed" => DispatchStatus::Completed,
+                        "failed" => DispatchStatus::Failed,
+                        _ => DispatchStatus::Preparing,
+                    },
+                    terminal_outcome: None,
+                    compensation_actions: vec!["idempotent-replay".to_string()],
+                };
+                return Ok(IntentOutcome::Duplicate { existing: outcome });
+            }
+            return Ok(IntentOutcome::IdempotencyConflict {
+                existing_op_id: existing_id,
+                existing_hash,
+                new_hash: request_hash.to_string(),
+            });
+        }
 
         Ok(IntentOutcome::Created {
             op_id: op_id.to_string(),
@@ -408,18 +443,34 @@ mod tests {
 
     async fn setup() -> Database {
         let db = Database::open_in_memory().await.unwrap();
+        seed_prereqs(&db.pool).await;
+        db
+    }
+
+    /// File-backed variant for concurrency tests: WAL + busy_timeout give
+    /// deterministic writer serialization (the shared-cache in-memory pool
+    /// surfaces table-lock errors under concurrent transactions).
+    async fn setup_file_backed() -> (Database, tempfile::TempDir) {
+        let td = tempfile::tempdir().unwrap();
+        let db = Database::open(&td.path().join("dispatch_repo.db"))
+            .await
+            .unwrap();
+        seed_prereqs(&db.pool).await;
+        (db, td)
+    }
+
+    async fn seed_prereqs(pool: &SqlitePool) {
         // Create prerequisite records for FK constraints
         sqlx::query(
             "INSERT INTO projects (id, objective, lifecycle) VALUES ('proj-1','test','active')",
         )
-        .execute(&db.pool)
+        .execute(pool)
         .await
         .unwrap();
         sqlx::query("INSERT INTO tasks (id, project_id, goal, lifecycle) VALUES ('task-1','proj-1','test','pending')")
-            .execute(&db.pool)
+            .execute(pool)
             .await
             .unwrap();
-        db
     }
 
     #[tokio::test]
@@ -511,7 +562,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_same_key_one_winner() {
-        let db = setup().await;
+        let (db, _td) = setup_file_backed().await;
         let repo1 = DispatchRepository::new(db.pool.clone());
         let repo2 = DispatchRepository::new(db.pool.clone());
 
@@ -540,7 +591,13 @@ mod tests {
             || matches!(r2, Ok(IntentOutcome::Duplicate { .. }));
         let has_created = matches!(r1, Ok(IntentOutcome::Created { .. }))
             || matches!(r2, Ok(IntentOutcome::Created { .. }));
-        assert!(has_duplicate, "second concurrent should be duplicate");
-        assert!(has_created, "first concurrent should create");
+        assert!(
+            has_duplicate,
+            "second concurrent should be duplicate: {r1:?} / {r2:?}"
+        );
+        assert!(
+            has_created,
+            "first concurrent should create: {r1:?} / {r2:?}"
+        );
     }
 }
