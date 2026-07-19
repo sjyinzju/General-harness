@@ -8,6 +8,8 @@
 //! NEVER: stage_outcome(), direct insertion of verification_runs,
 //!        fabricated dossiers, or marking executions terminal directly.
 
+#![allow(clippy::useless_format)]
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -342,6 +344,7 @@ async fn table_count(pool: &sqlx::SqlitePool, table: &str) -> i64 {
 // Real I4 Fixture
 // ═══════════════════════════════════════════════════════════════════════
 
+#[allow(dead_code)]
 struct RealI4Fixture {
     pool: sqlx::SqlitePool,
     orch: Arc<SchedulerOrchestrator>,
@@ -856,7 +859,7 @@ async fn test_real_i4_repair_then_pass() {
 async fn test_real_i4_workspace_continuation() {
     // Dispatch 1: make changes to worktree, verification fails
     let fix1 = RealI4Fixture::new().await;
-    let (_l1, a1_id, e1) = fix1.create_loop_and_dispatch("ik-wc1", "hwc1").await;
+    let (_l1, _a1_id, e1) = fix1.create_loop_and_dispatch("ik-wc1", "hwc1").await;
     let wt1 = fix1.get_worktree_path(&e1).await;
     std::fs::write(
         std::path::PathBuf::from(&wt1).join("file.txt"),
