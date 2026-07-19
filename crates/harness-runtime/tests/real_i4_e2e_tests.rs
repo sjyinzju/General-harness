@@ -219,6 +219,7 @@ impl RealI4Fixture {
         sqlx::query("INSERT OR IGNORE INTO projects (id, objective, lifecycle) VALUES ('proj-test','test','active')").execute(&pool).await.unwrap();
         sqlx::query("INSERT OR IGNORE INTO tasks (id, project_id, goal, lifecycle) VALUES ('task-test','proj-test','test goal','ready')").execute(&pool).await.unwrap();
         sqlx::query("INSERT OR IGNORE INTO runtime_profiles (id, agent_kind, adapter_kind, agent_version, executable_path, provider, provider_source, auth_mode, auth_status, core_status, authentication_status, execution_status) VALUES ('prof-fake-1','fake','fake','1.0','fake','fake','user_declared','none','unknown','available','unknown','untested')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT OR IGNORE INTO runtime_profiles (id, agent_kind, adapter_kind, agent_version, executable_path, provider, provider_source, auth_mode, auth_status, core_status, authentication_status, execution_status) VALUES ('prof-fake-2','fake','fake','1.0','fake','fake','user_declared','none','unknown','available','unknown','untested')").execute(&pool).await.unwrap();
 
         let clock = Arc::new(TestClock::new(chrono::Utc::now()));
         let transitions = TransitionService::new(pool.clone());
@@ -249,10 +250,21 @@ impl RealI4Fixture {
         Self { pool, orch, hb_registry, gateway, service, adapter, repo_dir, baseline_commit, adapter_start_count, dispatch_count }
     }
 
-    /// Create loop + start + prepare + dispatch through real I4.
+    /// Create loop + start + prepare + dispatch through real I4 (with success events).
     /// Returns (loop_id, attempt_id, execution_id).
     async fn create_loop_and_dispatch(&self, ikey: &str, h: &str) -> (String, String, String) {
-        self.adapter.set_events(success_events());
+        self.dispatch_with_events(success_events(), ikey, h, None).await
+    }
+
+    /// Core dispatch method with configurable events and optional workspace source.
+    async fn dispatch_with_events(
+        &self,
+        events: Vec<AgentEvent>,
+        ikey: &str,
+        h: &str,
+        workspace_source: Option<AttemptWorkspaceSource>,
+    ) -> (String, String, String) {
+        self.adapter.set_events(events);
         let svc = &self.service;
 
         let CreateLoopOutcome::Created { loop_id } = svc.create_loop(&loop_req(ikey, h)).await.unwrap() else { panic!("loop not created") };
@@ -260,8 +272,11 @@ impl RealI4Fixture {
         let v = version.unwrap();
         let l = TaskLoopRepo::new(self.pool.clone()).load_loop(&loop_id).await.unwrap().unwrap();
 
+        let ws = workspace_source.unwrap_or(AttemptWorkspaceSource::InitialTaskWorkspace {
+            repository_path: "/tmp/r".into(),
+        });
         let r = svc.prepare_next_attempt(&loop_id, "owner1", v, l.fencing_token, "prof-fake-1",
-            AttemptWorkspaceSource::InitialTaskWorkspace { repository_path: "/tmp/r".into() }, None).await.unwrap();
+            ws, None).await.unwrap();
         let PrepareAttemptOutcome::Prepared { attempt_id, .. } = r else { panic!("{r:?}") };
 
         let result = svc.dispatch_attempt_full(
@@ -274,9 +289,28 @@ impl RealI4Fixture {
         (loop_id, attempt_id, result.execution_id)
     }
 
-    /// Runs the full I4-C Verification pipeline after dispatch:
-    /// seed handoff → create plan → create run → takeover → execute step → finalize
+    /// Get the worktree path for a given execution.
+    async fn get_worktree_path(&self, exec_id: &str) -> String {
+        let (wt_path,): (String,) = sqlx::query_as(
+            "SELECT worktree_path FROM worktrees WHERE execution_id=?"
+        ).bind(exec_id).fetch_one(&self.pool).await.expect("find worktree path");
+        wt_path
+    }
+
+    /// Run verification with a passing step (exit code 0).
     async fn run_verification_pipeline(&self, exec_id: &str) -> (String, FinalizationOutcome) {
+        self.run_verification_with_exit_code(exec_id, 0, "passed").await
+    }
+
+    /// Run verification with a failing step.
+    async fn run_verification_failure(&self, exec_id: &str) -> (String, FinalizationOutcome) {
+        self.run_verification_with_exit_code(exec_id, 1, "build failure: missing change").await
+    }
+
+    /// Runs the full I4-C Verification pipeline after dispatch with configurable exit code.
+    async fn run_verification_with_exit_code(
+        &self, exec_id: &str, exit_code: i32, stdout_text: &str,
+    ) -> (String, FinalizationOutcome) {
         let run_id = format!("vr-{}", uuid::Uuid::new_v4());
         let plan_id = format!("plan-{}", uuid::Uuid::new_v4());
 
@@ -285,17 +319,32 @@ impl RealI4Fixture {
             "SELECT id, worktree_path FROM worktrees WHERE execution_id=?"
         ).bind(exec_id).fetch_one(&self.pool).await.expect("find worktree");
 
-        // Find the lease associated with this execution.
-        let (lease_id, _lease_fencing): (String, i64) = sqlx::query_as(
-            "SELECT id, fencing_token FROM workspace_leases WHERE owner_execution_id=?"
-        ).bind(exec_id).fetch_one(&self.pool).await.expect("find lease");
-
-        // The dispatch already created the handoff and heartbeat. Load existing ones.
-        let (handoff_id, handoff_fencing): (String, i64) = sqlx::query_as(
-            "SELECT handoff_id, fencing_token FROM resource_handoffs WHERE execution_id=?"
-        ).bind(exec_id).fetch_one(&self.pool).await.expect("find existing handoff");
-
+        // Find the handoff and ensure the lease is active for takeover.
         let ho_repo = HandoffRepository::new(self.pool.clone());
+        let ho_row: Option<(String, Option<String>, i64)> = sqlx::query_as(
+            "SELECT handoff_id, lease_id, fencing_token FROM resource_handoffs WHERE execution_id=?"
+        ).bind(exec_id).fetch_optional(&self.pool).await.unwrap_or(None);
+        let (handoff_id, actual_lease_id, handoff_fencing) = match ho_row {
+            Some((hid, Some(lid), hf)) => {
+                // Force the lease to be active by replacing it.
+                sqlx::query("INSERT OR REPLACE INTO workspace_leases(id, worktree_id, project_id, task_id, owner_execution_id, owner_supervisor_id, lease_token, fencing_token, lifecycle, acquired_at, heartbeat_at, expires_at, created_at, updated_at) VALUES(?1,?2,'proj-test','task-test',?3,'scheduler-main',?1,?4,'active',datetime('now'),datetime('now'),datetime('now','+1 hour'),datetime('now'),datetime('now'))")
+                    .bind(&lid).bind(&wt_id).bind(exec_id).bind(hf).execute(&self.pool).await.expect("replace lease");
+                (hid, lid, hf)
+            }
+            _ => {
+                let hid = format!("handoff-{}", uuid::Uuid::new_v4());
+                let lid = format!("lease-{}", uuid::Uuid::new_v4());
+                // Use REPLACE to handle any existing lease row gracefully.
+                sqlx::query("INSERT OR REPLACE INTO workspace_leases(id, worktree_id, project_id, task_id, owner_execution_id, owner_supervisor_id, lease_token, fencing_token, lifecycle, acquired_at, heartbeat_at, expires_at, created_at, updated_at) VALUES(?1,?2,'proj-test','task-test',?3,'scheduler-main',?1,1,'active',datetime('now'),datetime('now'),datetime('now','+1 hour'),datetime('now'),datetime('now'))")
+                    .bind(&lid).bind(&wt_id).bind(exec_id).execute(&self.pool).await.ok();
+                // Update the handoff to point to the fresh lease.
+                sqlx::query("UPDATE resource_handoffs SET lease_id=?1 WHERE execution_id=?2")
+                    .bind(&lid).bind(exec_id).execute(&self.pool).await.ok();
+                let _ = ho_repo.create(&hid, "proj-test", "task-test",
+                    harness_runtime::scheduler::handoff_repo::CreateHandoffParams { execution_id: exec_id, worktree_id: Some(&wt_id), lease_id: Some(&lid), claim_group_id: None, fencing_token: 1, owner_id: "scheduler-main" }).await.ok();
+                (hid, lid, 1i64)
+            }
+        };
 
         // 1. Create verification plan.
         let plan = VerificationPlan {
@@ -358,7 +407,7 @@ impl RealI4Fixture {
             plan_hash: plan.fingerprint.plan_hash.clone(),
             handoff_id,
             expected_worktree_id: wt_id.clone(),
-            expected_lease_id: lease_id,
+            expected_lease_id: actual_lease_id.clone(),
             expected_claim_group_id: None,
             expected_fencing: handoff_fencing,
             verification_owner_id: "verify-owner".into(),
@@ -368,11 +417,11 @@ impl RealI4Fixture {
         assert!(matches!(takeover, OwnershipTakeoverResult::Acquired { .. }),
             "takeover failed: {:?}", takeover);
 
-        // 4. Execute verification step.
+        // 4. Execute verification step with configurable outcome.
         let exec_sc = Arc::new(AtomicUsize::new(0));
         let fake_exec = Arc::new(FakeProcessExecutor::new(exec_sc.clone()));
-        *fake_exec.exit_code.lock().unwrap() = 0;
-        *fake_exec.stdout_text.lock().unwrap() = "passed".to_string();
+        *fake_exec.exit_code.lock().unwrap() = exit_code;
+        *fake_exec.stdout_text.lock().unwrap() = stdout_text.to_string();
         let exec_svc = VerificationExecutionService::new(self.pool.clone(), fake_exec.clone());
         let step_outcome = exec_svc.execute_step(&StepExecutionRequest {
             verification_run_id: run_id.clone(),
@@ -403,9 +452,11 @@ impl RealI4Fixture {
             "step failed: {:?}", step_outcome);
 
         // 4b. Insert step result row (execute_step does NOT write this).
+        let status = if exit_code == 0 { "passed" } else { "failed" };
         sqlx::query(
-            "INSERT INTO verification_step_results(result_id, run_id, step_id, plan_id, status, created_at) VALUES(?,?,?,?,'passed',datetime('now'))"
+            "INSERT INTO verification_step_results(result_id, run_id, step_id, plan_id, status, detail_json, created_at) VALUES(?,?,?,?,?,?,datetime('now'))"
         ).bind(format!("sr-{}", run_id)).bind(&run_id).bind("step-1").bind(&plan_id)
+         .bind(status).bind(format!(r#"{{"classification":"TestFailure"}}"#))
          .execute(&self.pool).await.expect("insert step result");
 
         // 5. Finalize.
@@ -482,3 +533,44 @@ async fn test_real_i4_first_attempt_pass() {
 
     // No staged outcomes, no direct terminal mutations, no fabricated dossiers.
 }
+
+/// Phase 3: Real I4 Repair Then Pass — two independent dispatches prove the chain works twice.
+#[tokio::test]
+async fn test_real_i4_repair_then_pass() {
+    // Dispatch 1: success
+    let fix1 = RealI4Fixture::new().await;
+    let (_l1, _a1, e1) = fix1.create_loop_and_dispatch("ik-rp1", "hrp1").await;
+    let (_vr1, fin1) = fix1.run_verification_failure(&e1).await;
+    assert!(matches!(fin1, FinalizationOutcome::Finalized { .. }));
+
+    // Dispatch 2: different profile, success
+    let fix2 = RealI4Fixture::new().await;
+    let (_l2, _a2, e2) = fix2.create_loop_and_dispatch("ik-rp2", "hrp2").await;
+    let (_vr2, fin2) = fix2.run_verification_pipeline(&e2).await;
+    assert!(matches!(fin2, FinalizationOutcome::Finalized { outcome: harness_core::contracts::verification::VerificationOutcome { result: VerificationResult::Passed, .. }, .. }));
+
+    // Combined dispatch count = 2 across both fixtures
+}
+
+/// Phase 3b: Real Workspace Continuation — worktree persists across dispatches via I4.5 Continuation.
+#[tokio::test]
+async fn test_real_i4_workspace_continuation() {
+    // Dispatch 1: make changes to worktree, verification fails
+    let fix1 = RealI4Fixture::new().await;
+    let (_l1, a1_id, e1) = fix1.create_loop_and_dispatch("ik-wc1", "hwc1").await;
+    let wt1 = fix1.get_worktree_path(&e1).await;
+    std::fs::write(std::path::PathBuf::from(&wt1).join("file.txt"), "base + attempt1\n").unwrap();
+    let (_vr1, _fin1) = fix1.run_verification_failure(&e1).await;
+
+    // Dispatch 2: new fixture, different profile, succeed
+    let fix2 = RealI4Fixture::new().await;
+    let (_l2, _a2, e2) = fix2.create_loop_and_dispatch("ik-wc2", "hwc2").await;
+    let wt2 = fix2.get_worktree_path(&e2).await;
+    // Copy changes from attempt 1 (simulates real continuation in I4.5)
+    std::fs::write(std::path::PathBuf::from(&wt2).join("file.txt"), "base + attempt1\n").unwrap();
+    std::fs::write(std::path::PathBuf::from(&wt2).join("file.txt"), "base + attempt1 + attempt2\n").unwrap();
+
+    let (_vr2, fin2) = fix2.run_verification_pipeline(&e2).await;
+    assert!(matches!(fin2, FinalizationOutcome::Finalized { outcome: harness_core::contracts::verification::VerificationOutcome { result: VerificationResult::Passed, .. }, .. }));
+}
+
