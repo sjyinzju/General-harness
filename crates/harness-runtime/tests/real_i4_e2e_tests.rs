@@ -211,10 +211,13 @@ impl RealI4Fixture {
     async fn new() -> Self {
         let td = tempfile::tempdir().unwrap();
         let db_path = td.path().join("real_i4.db");
-        let db = Database::open(&db_path).await.unwrap();
+        Self::new_at_path(&db_path).await
+    }
+
+    /// Create fixture at a specific DB path (for crash/restart and two-pool tests).
+    async fn new_at_path(p: &std::path::Path) -> Self {
+        let db = Database::open(p).await.unwrap();
         let pool = db.pool.clone();
-        // Drop is deferred — td lives through the fixture lifetime via implicit move.
-        std::mem::forget(td);
 
         sqlx::query("INSERT OR IGNORE INTO projects (id, objective, lifecycle) VALUES ('proj-test','test','active')").execute(&pool).await.unwrap();
         sqlx::query("INSERT OR IGNORE INTO tasks (id, project_id, goal, lifecycle) VALUES ('task-test','proj-test','test goal','ready')").execute(&pool).await.unwrap();
@@ -572,5 +575,50 @@ async fn test_real_i4_workspace_continuation() {
 
     let (_vr2, fin2) = fix2.run_verification_pipeline(&e2).await;
     assert!(matches!(fin2, FinalizationOutcome::Finalized { outcome: harness_core::contracts::verification::VerificationOutcome { result: VerificationResult::Passed, .. }, .. }));
+}
+
+/// Phase 4: True Crash/Restart — durable state survives service/pool destruction.
+#[tokio::test]
+async fn test_real_i4_crash_restart() {
+    let td = tempfile::tempdir().unwrap();
+    let db_path = td.path().join("crash.db");
+
+    // Dispatch, verify, then destroy everything.
+    let e1 = {
+        let fix = RealI4Fixture::new_at_path(&db_path).await;
+        let (_l, _a, e) = fix.create_loop_and_dispatch("ik-cr1", "hcr1").await;
+        fix.run_verification_failure(&e).await;
+        e
+    };
+
+    // Recover from same DB file with fresh pool.
+    let db = Database::open(&db_path).await.unwrap();
+    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM execution_attempts WHERE id=?")
+        .bind(&e1).fetch_one(&db.pool).await.unwrap();
+    assert_eq!(count.0, 1, "execution must survive crash");
+}
+
+/// Phase 5: Real-I4 Two-Pool Full Lifecycle — shared DB, independent pools, one winner.
+#[tokio::test]
+async fn test_real_i4_two_pool_full_lifecycle() {
+    let td = tempfile::tempdir().unwrap();
+    let db_path = td.path().join("twopool.db");
+
+    let fix1 = RealI4Fixture::new_at_path(&db_path).await;
+    let fix2 = RealI4Fixture::new_at_path(&db_path).await;
+
+    // Both try to create the same loop. Exactly one wins.
+    let svc1 = TaskEngineeringLoopService::new(fix1.pool.clone()).with_i4_gateway(fix1.gateway.clone());
+    let svc2 = TaskEngineeringLoopService::new(fix2.pool.clone()).with_i4_gateway(fix2.gateway.clone());
+    let req = loop_req("ik-2p", "h2p");
+    let (cr1, cr2) = tokio::join!(svc1.create_loop(&req), svc2.create_loop(&req));
+    let winner = matches!(cr1, Ok(CreateLoopOutcome::Created { .. })) as u8
+               + matches!(cr2, Ok(CreateLoopOutcome::Created { .. })) as u8;
+    assert_eq!(winner, 1, "exactly one pool wins loop creation");
+
+    // Verify at most 1 execution across both pools.
+    let exec_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM execution_attempts")
+        .fetch_one(&fix1.pool).await.unwrap();
+    assert!(exec_count.0 <= 1, "at most 1 execution — loser creates 0");
 }
 
