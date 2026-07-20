@@ -883,41 +883,70 @@ impl VerificationFinalizationService {
         let _ = self
             .write_finalization_event(req, &op_id, "VerificationResourceReleaseStarted", None)
             .await;
-        let engine = self.release_engine();
         let ctx = self.release_context(req, &op_id);
-        match engine.run_release(&ctx).await {
-            ReleaseRunOutcome::Completed { .. } => {}
-            ReleaseRunOutcome::HeldByOther { step, worker_id } => {
-                // Liveness fix (C8): a HeldByOther return means another
-                // worker currently holds a step.  We MUST NOT silently
-                // fall through to Finalized — the saga is incomplete.
-                // Instead, mark the operation as needing reconciliation
-                // so a future reconciler pass (or a retry by the caller)
-                // will resume from durable step state and complete the
-                // remaining steps.
-                let _ = self
-                    .mark_reconciliation(
-                        &op_id,
-                        &format!("release held by {worker_id} at {}", step.as_str()),
-                    )
-                    .await;
+
+        // Retry loop (C8 liveness fix): when two engines enter the
+        // release saga concurrently, one may get HeldByOther on a step.
+        // Instead of immediately failing, retry up to 3 times with a
+        // short delay — the other engine typically completes the step
+        // within milliseconds.
+        const MAX_RETRIES: usize = 3;
+        let mut last_outcome = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
-            ReleaseRunOutcome::ReconciliationRequired { step, reason }
-            | ReleaseRunOutcome::OwnershipLost { step, reason } => {
-                let _ = self
-                    .mark_reconciliation(&op_id, &format!("release {} : {}", step.as_str(), reason))
-                    .await;
+            let engine = self.release_engine();
+            match engine.run_release(&ctx).await {
+                ReleaseRunOutcome::Completed { .. } => {
+                    last_outcome = None;
+                    break;
+                }
+                ReleaseRunOutcome::HeldByOther { step, worker_id } => {
+                    last_outcome = Some((step.as_str().to_string(), worker_id));
+                    // Retry — the other worker should finish soon.
+                    continue;
+                }
+                ReleaseRunOutcome::ReconciliationRequired { step, reason }
+                | ReleaseRunOutcome::OwnershipLost { step, reason } => {
+                    if attempt < MAX_RETRIES {
+                        // May be transient (step CAS race) — retry.
+                        continue;
+                    }
+                    let _ = self
+                        .mark_reconciliation(
+                            &op_id,
+                            &format!("release {} : {}", step.as_str(), reason),
+                        )
+                        .await;
+                    last_outcome = None;
+                    break;
+                }
+                ReleaseRunOutcome::Crashed { step } => {
+                    return FinalizationOutcome::InfrastructureError {
+                        reason: format!("crash injected at {}", step.as_str()),
+                    };
+                }
+                ReleaseRunOutcome::InfrastructureError { reason } => {
+                    if attempt < MAX_RETRIES {
+                        continue;
+                    }
+                    let _ = self
+                        .mark_reconciliation(&op_id, &format!("release: {reason}"))
+                        .await;
+                    last_outcome = None;
+                    break;
+                }
             }
-            ReleaseRunOutcome::Crashed { step } => {
-                return FinalizationOutcome::InfrastructureError {
-                    reason: format!("crash injected at {}", step.as_str()),
-                };
-            }
-            ReleaseRunOutcome::InfrastructureError { reason } => {
-                let _ = self
-                    .mark_reconciliation(&op_id, &format!("release: {reason}"))
-                    .await;
-            }
+        }
+        // If all retries exhausted with HeldByOther, mark for reconciliation.
+        if let Some((step, worker_id)) = last_outcome {
+            let _ = self
+                .mark_reconciliation(
+                    &op_id,
+                    &format!("release held by {worker_id} at {step} after retries"),
+                )
+                .await;
         }
 
         FinalizationOutcome::Finalized {
