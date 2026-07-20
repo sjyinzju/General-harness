@@ -815,10 +815,12 @@ impl ReleaseEngine {
                         Ok(())
                     }
                     HeartbeatRemoveOutcome::NotFound => {
-                        // Nothing registered — treat as an executed no-op step.
-                        self.counters
-                            .heartbeat_unregister
-                            .fetch_add(1, Ordering::SeqCst);
+                        // Already removed by a concurrent engine (or a
+                        // previous run). Do NOT increment the counter:
+                        // the side effect was already counted by whoever
+                        // performed the actual removal.  When two engines
+                        // race, both would increment here otherwise,
+                        // producing heartbeat_unregister == 2 (N1/C8).
                         Ok(())
                     }
                     HeartbeatRemoveOutcome::IdentityMismatch {
