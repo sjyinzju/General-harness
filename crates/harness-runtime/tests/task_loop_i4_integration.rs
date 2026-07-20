@@ -109,8 +109,21 @@ async fn test_first_attempt_passes() {
     let obs = s.observe_via_gateway(&exec.execution_id).await.unwrap();
     assert_eq!(obs.lifecycle.as_deref(), Some("completed"));
 
-    // Decision: should be CompleteCandidate.
+    // Decision: should be CompleteCandidate (H3: requires eligibility token).
+    let token = CompletionEligibility {
+        execution_terminal: true,
+        outcome_passed: true,
+        verification_terminal: true,
+        required_steps_complete: true,
+        evidence_complete: true,
+        dossier_fingerprint_valid: true,
+        process_inactive: true,
+        reconciliation_clear: true,
+        workspace_valid: true,
+        ownership_valid: true,
+    };
     let input = DecisionInput {
+        eligibility_token: Some(token),
         outcome_result: Some("passed".into()),
         next_action: Some("CompleteCandidate".into()),
         all_required_steps_passed: true,
