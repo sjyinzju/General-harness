@@ -592,6 +592,24 @@ impl VerificationFinalizationService {
                     Some((lc,)) if lc == "completed" => FinalizationOutcome::Duplicate {
                         existing_outcome_summary: "completed by concurrent winner".into(),
                     },
+                    // Liveness fix (C8): when the lifecycle indicates the
+                    // saga is incomplete (outcome_persisted, releasing,
+                    // reconciliation_required), return Blocked so the caller
+                    // retries.  On retry, resume_or_reject_existing at the
+                    // top of finalize() will find the row and correctly
+                    // route to resume_release_only — which resumes from
+                    // durable step state.
+                    Some((lc,))
+                        if lc == "outcome_persisted"
+                            || lc == "releasing_resources"
+                            || lc == "reconciliation_required" =>
+                    {
+                        FinalizationOutcome::Blocked {
+                            reason: format!(
+                                "concurrent finalization at {lc} — retry to resume saga"
+                            ),
+                        }
+                    }
                     _ => FinalizationOutcome::Blocked {
                         reason: "concurrent finalization in progress — retry".into(),
                     },
@@ -613,6 +631,21 @@ impl VerificationFinalizationService {
             .await;
 
         self.run_finalization(req, &op_id).await
+    }
+
+    /// Check whether any release step for this operation is InProgress,
+    /// meaning another worker is actively running the release saga.
+    /// Used to prevent two engines from racing through the saga (C8 fix).
+    async fn has_active_release_worker(&self, op_id: &str) -> bool {
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_release_steps \
+             WHERE finalization_op_id=? AND state='in_progress'",
+        )
+        .bind(op_id)
+        .fetch_one(&self.pool)
+        .await
+        .unwrap_or((0,));
+        count.0 > 0
     }
 
     /// Same-key re-entry policy. Returns None when no operation exists yet.
@@ -645,8 +678,16 @@ impl VerificationFinalizationService {
                 existing_outcome_summary: format!("{op_id}:{lc}"),
             }),
             // Outcome already durable — resume the release saga from the
-            // first unfinished durable step.
+            // first unfinished durable step.  BUT first check whether
+            // another worker is actively running the saga (C8 liveness fix).
+            // If any release step is InProgress, another worker is still
+            // working — return Blocked to avoid a second engine racing.
             "outcome_persisted" | "releasing_resources" | "reconciliation_required" => {
+                if self.has_active_release_worker(&op_id).await {
+                    return Some(FinalizationOutcome::Blocked {
+                        reason: format!("operation {op_id} has active release worker — retry"),
+                    });
+                }
                 Some(self.resume_release_only(req, &op_id).await)
             }
             // Crashed before the outcome was persisted: re-run deterministic
@@ -867,9 +908,20 @@ impl VerificationFinalizationService {
         let ctx = self.release_context(req, &op_id);
         match engine.run_release(&ctx).await {
             ReleaseRunOutcome::Completed { .. } => {}
-            ReleaseRunOutcome::HeldByOther { .. } => {
-                // Another worker holds the saga — it will drive it to
-                // completion. Zero side effects were executed past that step.
+            ReleaseRunOutcome::HeldByOther { step, worker_id } => {
+                // Liveness fix (C8): a HeldByOther return means another
+                // worker currently holds a step.  We MUST NOT silently
+                // fall through to Finalized — the saga is incomplete.
+                // Instead, mark the operation as needing reconciliation
+                // so a future reconciler pass (or a retry by the caller)
+                // will resume from durable step state and complete the
+                // remaining steps.
+                let _ = self
+                    .mark_reconciliation(
+                        &op_id,
+                        &format!("release held by {worker_id} at {}", step.as_str()),
+                    )
+                    .await;
             }
             ReleaseRunOutcome::ReconciliationRequired { step, reason }
             | ReleaseRunOutcome::OwnershipLost { step, reason } => {
@@ -878,8 +930,6 @@ impl VerificationFinalizationService {
                     .await;
             }
             ReleaseRunOutcome::Crashed { step } => {
-                // Simulated crash (fault injection): durable state is left
-                // exactly as the crash point produced it.
                 return FinalizationOutcome::InfrastructureError {
                     reason: format!("crash injected at {}", step.as_str()),
                 };
@@ -966,13 +1016,14 @@ impl VerificationFinalizationService {
                 dossier: Box::new(dossier),
             },
             ReleaseRunOutcome::HeldByOther { step, worker_id } => {
-                // Another live worker is driving the saga — report the
-                // existing operation, execute nothing.
-                FinalizationOutcome::Duplicate {
-                    existing_outcome_summary: format!(
-                        "{op_id}:in_progress:{}:{worker_id}",
-                        step.as_str()
-                    ),
+                // Liveness fix (C8): another worker holds a step.
+                // Return Blocked so the caller retries — do NOT return
+                // Duplicate (which falsely claims the saga is complete).
+                // On retry, resume_or_reject_existing will re-enter
+                // resume_release_only, and if the other worker has
+                // finished, the saga will complete.
+                FinalizationOutcome::Blocked {
+                    reason: format!("{op_id}:held_by_{worker_id}_at_{}", step.as_str()),
                 }
             }
             ReleaseRunOutcome::OwnershipLost { reason, .. } => {
