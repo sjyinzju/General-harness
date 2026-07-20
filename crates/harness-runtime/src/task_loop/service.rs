@@ -810,16 +810,10 @@ impl TaskEngineeringLoopService {
             });
         }
 
-        // Cancel any active Attempt.
-        if let Some(active) = self.repo.load_active_attempt(loop_id).await? {
-            let _ = self
-                .repo
-                .cancel_attempt(&active.attempt_id, active.version)
-                .await;
-        }
-
-        // Transition loop to Cancelled.
-        let _ = self
+        // Transition loop to Cancelled FIRST — validates owner_id,
+        // version, and fencing_token atomically. If 0 rows affected,
+        // the caller is not the current owner (or state changed).
+        let transitioned = self
             .repo
             .transition_loop(
                 loop_id,
@@ -830,6 +824,17 @@ impl TaskEngineeringLoopService {
                 None,
             )
             .await?;
+        if transitioned.is_none() {
+            return Err("cancel rejected: not current owner or state changed".into());
+        }
+
+        // Cancel any active Attempt only AFTER owner validation passes.
+        if let Some(active) = self.repo.load_active_attempt(loop_id).await? {
+            let _ = self
+                .repo
+                .cancel_attempt(&active.attempt_id, active.version)
+                .await;
+        }
 
         // Fault: TerminalTransition response lost (after durable transition)
         if let Some(FaultKind::ResponseLostAfterSuccess) =

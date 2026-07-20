@@ -1384,6 +1384,7 @@ impl VerificationReconciler {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::scheduler::heartbeat_registry::{HeartbeatEntry, HeartbeatStatus, OwnerKind};
 
     struct Ctx {
         rec: VerificationReconciler,
@@ -1404,6 +1405,26 @@ mod tests {
         let p = db.pool.clone();
         seed(&p, wt_dir.path().to_string_lossy().as_ref()).await;
         let hb = Arc::new(HeartbeatRegistry::new());
+        // Register a heartbeat so the release saga's HeartbeatUnregister
+        // step finds it and returns Removed (not NotFound). NotFound no
+        // longer increments the counter (C8 fix — prevents double-count
+        // when two engines race).
+        hb.register(HeartbeatEntry {
+            execution_id: "e1".into(),
+            task_id: "t1".into(),
+            worktree_id: "wt1".into(),
+            lease_id: "l1".into(),
+            claim_group_id: None,
+            fencing_token: 5,
+            owner_kind: OwnerKind::Verification,
+            owner_id: "verify-run-1".into(),
+            status: HeartbeatStatus::Healthy,
+            last_heartbeat_at: Some(chrono::Utc::now()),
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            last_error: None,
+        })
+        .await
+        .unwrap();
         let rec = VerificationReconciler::new(p, hb.clone());
         Ctx {
             rec,

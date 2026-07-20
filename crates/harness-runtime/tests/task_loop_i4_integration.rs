@@ -1154,7 +1154,7 @@ async fn test_cancel_loop_during_active_attempt() {
 
     // Cancellation must not create duplicate attempts.
     let attempt_count: (i64,) =
-        sqlx::query_as("SELECT COUNT(*) FROM task_attempts WHERE loop_id=?")
+        sqlx::query_as("SELECT COUNT(*) FROM task_engineering_attempts WHERE loop_id=?")
             .bind(&loop_id)
             .fetch_one(&db.pool)
             .await
