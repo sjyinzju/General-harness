@@ -6,3 +6,5 @@ target/
 *.pdb
 # Rust build artifacts
 target/
+
+I4.5_FINAL_CERTIFICATION_REPORT.md

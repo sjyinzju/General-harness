@@ -271,13 +271,12 @@ pub async fn cmd_dry_run_decision(
     );
     println!("Budget check: {check:?}");
 
-    // ── Production path: read durable I4 facts through the graph's
-    //    service, which has RealI4OrchestrationGateway wired in (H4). ─
+    // ── Production path: read durable I4 facts through canonical
+    //    eligibility (H4 — zero writes, real durable reads). ──────────
     if let Some(g) = graph {
-        // Use the production service to read durable facts (zero writes).
         let svc = &g.task_loop_service;
         if let Some(info) = svc.inspect_loop(loop_id).await? {
-            // Read execution lifecycle through the durable I4 path.
+            // Read durable execution lifecycle.
             if let Some(ref eid) = info
                 .active_attempt
                 .as_ref()
@@ -294,8 +293,9 @@ pub async fn cmd_dry_run_decision(
                     println!("Execution lifecycle (durable): {lc}");
                 }
             }
-            // Build DecisionInput from durable facts, not lifecycle string.
-            let input = DecisionInput {
+            // Build DecisionInput, then validate eligibility from
+            // durable I4 facts (the canonical path — no fabrication).
+            let mut input = DecisionInput {
                 cancellation_requested: false,
                 i4_reconciliation_required: false,
                 active_process: false,
@@ -348,7 +348,32 @@ pub async fn cmd_dry_run_decision(
                     .active_attempt
                     .as_ref()
                     .and_then(|a| a.outcome_kind.clone()),
+                eligibility_token: None, // set below from durable facts
             };
+            // H4: validate eligibility from durable I4 facts (zero writes).
+            if let Some(ref eid) = info
+                .active_attempt
+                .as_ref()
+                .and_then(|a| a.execution_id.as_ref())
+            {
+                match validate_completion_eligibility(&db.pool, eid).await {
+                    Ok(eligibility) => {
+                        println!(
+                            "Eligibility: {} (failed gates: {:?})",
+                            if eligibility.all_passed() {
+                                "PASSED"
+                            } else {
+                                "FAILED"
+                            },
+                            eligibility.failed_gates()
+                        );
+                        input.eligibility_token = Some(eligibility);
+                    }
+                    Err(e) => {
+                        eprintln!("note: eligibility validation error: {e}");
+                    }
+                }
+            }
             let decision = input.classify();
             println!(
                 "Decision: {} (action: {})",
@@ -359,7 +384,7 @@ pub async fn cmd_dry_run_decision(
         }
     }
 
-    // ── Legacy fallback (no graph, or production path errored) ───────
+    // ── Legacy fallback (no graph) ───────────────────────────────────
     if let Some(ref eid) = active.as_ref().and_then(|a| a.execution_id.as_ref()) {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT lifecycle FROM execution_attempts WHERE id=?")
@@ -370,7 +395,9 @@ pub async fn cmd_dry_run_decision(
                 .flatten();
         if let Some((lc,)) = row {
             println!("Execution lifecycle: {lc}");
-            let input = DecisionInput {
+            // Build input from available facts, then validate eligibility
+            // from durable I4 state.
+            let mut input = DecisionInput {
                 cancellation_requested: false,
                 i4_reconciliation_required: false,
                 active_process: false,
@@ -380,10 +407,12 @@ pub async fn cmd_dry_run_decision(
                 security_blocker: false,
                 outcome_result: active.as_ref().and_then(|a| a.outcome_kind.clone()),
                 next_action: None,
-                all_required_steps_passed: lc == "completed",
-                evidence_complete: lc == "completed",
-                dossier_present: lc == "completed",
-                dossier_fingerprint_matches: lc == "completed",
+                // H4: do NOT fabricate these from lifecycle string.
+                // They will be cross-checked against the eligibility token.
+                all_required_steps_passed: false,
+                evidence_complete: false,
+                dossier_present: false,
+                dossier_fingerprint_matches: false,
                 budget_exhausted_hard: matches!(check, BudgetCheckResult::Exhausted { .. }),
                 no_progress: l.no_progress_streak >= 3,
                 cycle_detected: false,
@@ -395,7 +424,26 @@ pub async fn cmd_dry_run_decision(
                     .unwrap_or(false),
                 task_scope_insufficient: false,
                 primary_failure: active.as_ref().and_then(|a| a.outcome_kind.clone()),
+                eligibility_token: None,
             };
+            // Validate from durable facts.
+            match validate_completion_eligibility(&db.pool, eid).await {
+                Ok(eligibility) => {
+                    println!(
+                        "Eligibility: {} (failed gates: {:?})",
+                        if eligibility.all_passed() {
+                            "PASSED"
+                        } else {
+                            "FAILED"
+                        },
+                        eligibility.failed_gates()
+                    );
+                    input.eligibility_token = Some(eligibility);
+                }
+                Err(e) => {
+                    eprintln!("note: eligibility validation error: {e}");
+                }
+            }
             let decision = input.classify();
             println!(
                 "Decision: {} (action: {})",
