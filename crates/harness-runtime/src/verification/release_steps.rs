@@ -863,14 +863,33 @@ impl ReleaseEngine {
                 }
             }
             ReleaseStepKind::ResourcesReleasedEvent => {
-                let inserted = write_finalization_event(
+                // Write the event (idempotent). The INSERT OR IGNORE return
+                // value can be a false negative under concurrent access
+                // (two engines, same idempotency_key — the second gets
+                // rows_affected=0 even though the side effect IS applied).
+                // Always probe the event table after writing to decide
+                // whether to count.
+                write_finalization_event(
                     &self.pool,
                     ctx,
                     "VerificationResourcesReleased",
                     None,
                 )
                 .await?;
-                if inserted {
+                // Probe: does the event exist durably?
+                let event_exists: bool = sqlx::query_as::<_, (i64,)>(
+                    "SELECT COUNT(*) FROM verification_step_events \
+                     WHERE idempotency_key=?",
+                )
+                .bind(format!(
+                    "final-ev-{}-VerificationResourcesReleased",
+                    ctx.verification_run_id
+                ))
+                .fetch_one(&self.pool)
+                .await
+                .map(|(c,)| c > 0)
+                .unwrap_or(false);
+                if event_exists {
                     self.counters
                         .resources_released_event
                         .fetch_add(1, Ordering::SeqCst);
