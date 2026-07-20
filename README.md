@@ -1,8 +1,8 @@
-# Agent Harness
+# General Harness
 
 > 面向长周期软件工程任务的本地优先、多 Agent、可恢复、可验证执行系统。
 
-Agent Harness 不是一个“把多个模型接在一起聊天”的简单编排器。它的目标是把 Claude Code、Codex CLI、Gemini、DeepSeek、GLM 等本地可调用 Agent，组织成一个能够长期运行、持续修复、可靠恢复、严格验证并最终交付工程结果的执行系统。
+General Harness 不是一个“把多个模型接在一起聊天”的简单编排器。它的目标是把 Claude Code、Codex CLI、Gemini、DeepSeek、GLM 等本地可调用 Agent，组织成一个能够长期运行、持续修复、可靠恢复、严格验证并最终交付工程结果的执行系统。
 
 系统强调：
 
