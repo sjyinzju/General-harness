@@ -567,13 +567,35 @@ impl VerificationFinalizationService {
         match inserted {
             Ok(r) if r.rows_affected() == 1 => {}
             Ok(_) => {
-                // Loser: another worker owns this key. Read the durable truth
-                // — never a bare UNIQUE error, never a fresh finalization.
-                return self.resume_or_reject_existing(req).await.unwrap_or(
-                    FinalizationOutcome::InfrastructureError {
-                        reason: "operation row vanished after conflict".into(),
+                // Loser: another worker owns this key. Do NOT call
+                // resume_or_reject_existing here — that function may enter
+                // run_finalization or resume_release_only, which would create
+                // a second engine racing through the release saga concurrently
+                // with the winner.  A concurrent saga produces spurious
+                // reconciliation markers, counter double-counts, and
+                // operation_completion == 0 races (C8).
+                //
+                // Instead, read the winner's lifecycle and return a simple
+                // terminal-or-retry signal.  If the winner crashed, the next
+                // call to finalize (which takes the pre-INSERT
+                // resume_or_reject_existing path) will resume from durable
+                // state.
+                let existing: Option<(String,)> = sqlx::query_as(
+                    "SELECT lifecycle FROM verification_finalization_operations WHERE idempotency_key=?",
+                )
+                .bind(&req.idempotency_key)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+                return match existing {
+                    Some((lc,)) if lc == "completed" => FinalizationOutcome::Duplicate {
+                        existing_outcome_summary: "completed by concurrent winner".into(),
                     },
-                );
+                    _ => FinalizationOutcome::Blocked {
+                        reason: "concurrent finalization in progress — retry".into(),
+                    },
+                };
             }
             Err(e) => {
                 return FinalizationOutcome::InfrastructureError {
@@ -628,7 +650,16 @@ impl VerificationFinalizationService {
                 Some(self.resume_release_only(req, &op_id).await)
             }
             // Crashed before the outcome was persisted: re-run deterministic
-            // aggregation against the SAME operation row.
+            // aggregation against the SAME operation row.  ONLY enter this
+            // path when the lifecycle is genuinely unknown (not one of the
+            // recognised states above).  When the lifecycle is 'running' the
+            // inserting winner is still working — we return Blocked so the
+            // caller retries instead of running a second release saga
+            // concurrently, which causes spurious reconciliation markers and
+            // counter races (see C8 / two_pool_finalizer_strict_exactly_once).
+            "running" => Some(FinalizationOutcome::Blocked {
+                reason: format!("operation {op_id} still running — retry"),
+            }),
             _ => Some(self.run_finalization(req, &op_id).await),
         }
     }
@@ -1103,15 +1134,32 @@ impl VerificationFinalizationService {
             .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e, ErrorSource::System))
     }
 
+    /// Mark the operation as requiring reconciliation. Uses a lifecycle guard
+    /// to never overwrite 'completed' (a concurrent engine finished the saga).
+    /// Legitimate faults and errors during the release saga (lifecycle
+    /// 'releasing_resources') ARE allowed to transition to
+    /// reconciliation_required — the spurious `complete_step` race that used
+    /// to trigger this path is now handled inside the release engine itself
+    /// (it checks whether the step was completed by a concurrent engine before
+    /// returning ReconciliationRequired).
     async fn mark_reconciliation(&self, op_id: &str, reason: &str) -> Result<(), CoreError> {
         sqlx::query(
-            "UPDATE verification_finalization_operations SET lifecycle='reconciliation_required', outcome_summary=? WHERE finalization_op_id=?",
+            "UPDATE verification_finalization_operations \
+             SET lifecycle='reconciliation_required', outcome_summary=? \
+             WHERE finalization_op_id=? \
+               AND lifecycle != 'completed'",
         )
         .bind(reason)
         .bind(op_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| CoreError::new(ErrorCode::PersistenceError, format!("mark reconciliation: {e}"), ErrorSource::System))?;
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("mark reconciliation: {e}"),
+                ErrorSource::System,
+            )
+        })?;
         Ok(())
     }
 }

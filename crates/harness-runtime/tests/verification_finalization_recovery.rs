@@ -782,73 +782,137 @@ async fn resume_counts_handoff_completed_only_event_and_completion() {
 
 #[tokio::test]
 async fn two_pool_finalizer_strict_exactly_once() {
-    let e = env().await;
-    let db2 = Database::open(&e.db_path).await.unwrap();
+    // Run 200 iterations — the race is intermittent and the fix must hold
+    // for the full 200/200 without a single counter deviation.
+    for iteration in 0..200 {
+        let e = env().await;
+        let db2 = Database::open(&e.db_path).await.unwrap();
 
-    let counters = ReleaseCounters::default();
-    let start = Arc::new(AtomicUsize::new(0));
-    let s1 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
-        .with_counters(counters.clone())
-        .with_start_count(start.clone());
-    let s2 = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
-        .with_counters(counters.clone())
-        .with_start_count(start.clone());
+        let counters = ReleaseCounters::default();
+        let start = Arc::new(AtomicUsize::new(0));
+        let s1 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
+            .with_counters(counters.clone())
+            .with_start_count(start.clone());
+        let s2 = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
+            .with_counters(counters.clone())
+            .with_start_count(start.clone());
 
-    let rq1 = mkreq("tp");
-    let rq2 = mkreq("tp");
-    let (r1, r2) = tokio::join!(s1.finalize(&rq1), s2.finalize(&rq2));
+        let rq1 = mkreq("tp");
+        let rq2 = mkreq("tp");
+        let (r1, r2) = tokio::join!(s1.finalize(&rq1), s2.finalize(&rq2));
 
-    // finalizer_start_count == 1 (atomic insert winner only).
-    assert_eq!(start.load(Ordering::SeqCst), 1, "finalizer_start_count");
-    // Loser never surfaces a bare UNIQUE error.
-    for r in [&r1, &r2] {
-        assert!(
-            !matches!(r, FinalizationOutcome::InfrastructureError { .. }),
-            "loser must not return InfrastructureError: {r:?}"
+        // finalizer_start_count == 1 (atomic insert winner only).
+        assert_eq!(
+            start.load(Ordering::SeqCst),
+            1,
+            "finalizer_start_count at iteration {iteration}"
         );
-    }
-    assert!(
-        [&r1, &r2]
-            .iter()
-            .any(|r| matches!(r, FinalizationOutcome::Finalized { .. })),
-        "one winner finalizes: {r1:?} / {r2:?}"
-    );
+        // Loser never surfaces a bare UNIQUE error.
+        for r in [&r1, &r2] {
+            assert!(
+                !matches!(r, FinalizationOutcome::InfrastructureError { .. }),
+                "loser must not return InfrastructureError at iteration {iteration}: {r:?}"
+            );
+        }
+        assert!(
+            [&r1, &r2]
+                .iter()
+                .any(|r| matches!(r, FinalizationOutcome::Finalized { .. })),
+            "one winner finalizes at iteration {iteration}: {r1:?} / {r2:?}"
+        );
 
-    let p = &e.db.pool;
-    let fo: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM verification_finalization_operations")
+        let p = &e.db.pool;
+        let fo: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM verification_finalization_operations")
+                .fetch_one(p)
+                .await
+                .unwrap();
+        assert_eq!(
+            fo.0, 1,
+            "finalization_operation_count == 1 at iteration {iteration}"
+        );
+        let outcome: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_runs WHERE lifecycle='completed' AND outcome_json IS NOT NULL",
+        )
         .fetch_one(p)
         .await
         .unwrap();
-    assert_eq!(fo.0, 1, "finalization_operation_count == 1");
-    let outcome: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM verification_runs WHERE lifecycle='completed' AND outcome_json IS NOT NULL",
-    )
-    .fetch_one(p)
-    .await
-    .unwrap();
-    assert_eq!(outcome.0, 1, "final_outcome_count == 1");
-    assert_eq!(
-        event_count(p, "VerificationPassed").await,
-        1,
-        "terminal_event_count == 1"
-    );
-    assert_eq!(
-        counters.snapshot(),
-        [1, 1, 1, 1, 1, 1],
-        "claim/lease/heartbeat/handoff/released-event/completion each exactly once"
-    );
-    assert!(!e.hb.exists("e1").await, "heartbeat_unregister_count == 1");
-    assert_eq!(
-        event_count(p, "VerificationResourcesReleased").await,
-        1,
-        "resources_released_event_count == 1"
-    );
-    let dossier: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM verification_finalization_operations WHERE dossier_json IS NOT NULL",
-    )
-    .fetch_one(p)
-    .await
-    .unwrap();
-    assert_eq!(dossier.0, 1, "dossier_count == 1");
-    assert_no_forbidden_mutations(p).await;
+        assert_eq!(
+            outcome.0, 1,
+            "final_outcome_count == 1 at iteration {iteration}"
+        );
+        assert_eq!(
+            event_count(p, "VerificationPassed").await,
+            1,
+            "terminal_event_count == 1 at iteration {iteration}"
+        );
+
+        let snap = counters.snapshot();
+        assert_eq!(
+            snap,
+            [1, 1, 1, 1, 1, 1],
+            "claim/lease/heartbeat/handoff/released-event/completion each exactly once at iteration {iteration}"
+        );
+        // Per-step strict assertions.
+        assert_eq!(
+            snap[0], 1,
+            "claim_release          == 1 at iteration {iteration}"
+        );
+        assert_eq!(
+            snap[1], 1,
+            "lease_release          == 1 at iteration {iteration}"
+        );
+        assert_eq!(
+            snap[2], 1,
+            "heartbeat_release      == 1 at iteration {iteration}"
+        );
+        assert_eq!(
+            snap[3], 1,
+            "handoff_release        == 1 at iteration {iteration}"
+        );
+        assert_eq!(
+            snap[4], 1,
+            "released_event         == 1 at iteration {iteration}"
+        );
+        assert_eq!(
+            snap[5], 1,
+            "operation_completion   == 1 at iteration {iteration}"
+        );
+
+        assert!(
+            !e.hb.exists("e1").await,
+            "heartbeat_unregister_count == 1 at iteration {iteration}"
+        );
+        assert_eq!(
+            event_count(p, "VerificationResourcesReleased").await,
+            1,
+            "resources_released_event_count == 1 at iteration {iteration}"
+        );
+        let dossier: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_finalization_operations WHERE dossier_json IS NOT NULL",
+        )
+        .fetch_one(p)
+        .await
+        .unwrap();
+        assert_eq!(dossier.0, 1, "dossier_count == 1 at iteration {iteration}");
+        assert_no_forbidden_mutations(p).await;
+
+        // duplicate effect == 0: re-run with fresh counters must be all-zero.
+        let c2 = ReleaseCounters::default();
+        let s3 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
+            .with_counters(c2.clone());
+        let r3 = s3.finalize(&mkreq("tp")).await;
+        assert!(
+            matches!(r3, FinalizationOutcome::Duplicate { .. }),
+            "re-finalize must return Duplicate at iteration {iteration}"
+        );
+        assert_eq!(
+            c2.snapshot(),
+            [0, 0, 0, 0, 0, 0],
+            "duplicate effect == 0 at iteration {iteration}"
+        );
+
+        // raw unique error == 0: loser must not surface UNIQUE error.
+        // (already checked above via the !InfrastructureError assertion)
+    }
 }

@@ -734,8 +734,15 @@ impl ReleaseEngine {
                     .map_err(|e| format!("claim release: {e}"))?;
                     released += r.rows_affected() as i64;
                 }
-                if released > 0 || (claims.is_empty() && groups.is_empty()) {
+                if released > 0 {
                     self.counters.claim_release.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                } else if claims.is_empty() && groups.is_empty() {
+                    // Nothing to release — claims were already released by a
+                    // concurrent engine (or never existed). Do NOT count: the
+                    // side effect was counted by whoever performed the actual
+                    // release. When two engines race, both would enter this
+                    // branch and double-count otherwise.
                     Ok(())
                 } else {
                     Err("claim rows changed concurrently".into())
@@ -753,9 +760,13 @@ impl ReleaseEngine {
                 .map_err(|e| format!("lease read: {e}"))?;
                 let (lease_id, lease_fencing) = match lease {
                     Some(l) => l,
-                    // No acquired lease for this execution — nothing to release.
+                    // No acquired lease for this execution — it was already
+                    // released by a concurrent engine (or a previous run).
+                    // Do NOT increment the counter here: the side effect was
+                    // already counted by whoever performed the actual UPDATE.
+                    // When two engines race through this path both would
+                    // increment, producing lease_release == 2.
                     None => {
-                        self.counters.lease_release.fetch_add(1, Ordering::SeqCst);
                         return Ok(());
                     }
                 };
@@ -778,7 +789,13 @@ impl ReleaseEngine {
                     self.counters.lease_release.fetch_add(1, Ordering::SeqCst);
                     Ok(())
                 } else {
-                    Err(format!("lease {lease_id} CAS lost"))
+                    // CAS lost — a concurrent engine released the lease first.
+                    // Probe the actual resource: if it's now 'released' the
+                    // side effect is applied; don't fail the step.
+                    match self.effect_applied(ctx, kind).await {
+                        Ok(true) => Ok(()),
+                        _ => Err(format!("lease {lease_id} CAS lost")),
+                    }
                 }
             }
             ReleaseStepKind::HeartbeatUnregister => {
@@ -861,11 +878,19 @@ impl ReleaseEngine {
                 Ok(())
             }
             ReleaseStepKind::OperationCompletion => {
+                // Accept 'reconciliation_required' in addition to the normal
+                // release-lifecycle states. When two engines race through the
+                // release saga, a spurious mark_reconciliation call by one
+                // engine (triggered by a complete_step CAS that lost to the
+                // other engine) can set the lifecycle to
+                // reconciliation_required while the second engine is about to
+                // execute this step. Accepting that state here lets the second
+                // engine finish the saga instead of failing the step.
                 let r = sqlx::query(
                     "UPDATE verification_finalization_operations \
                      SET lifecycle='completed', terminal_at=datetime('now') \
                      WHERE finalization_op_id=? \
-                       AND lifecycle IN ('releasing_resources','outcome_persisted')",
+                       AND lifecycle IN ('releasing_resources','outcome_persisted','reconciliation_required')",
                 )
                 .bind(&ctx.finalization_op_id)
                 .execute(&self.pool)
@@ -1130,10 +1155,24 @@ impl ReleaseEngine {
                 )
                 .await
             {
-                return ReleaseRunOutcome::ReconciliationRequired {
-                    step: kind,
-                    reason: "completion CAS lost".into(),
-                };
+                // The completion CAS may have lost to a concurrent engine that
+                // took over and completed the step. If the step is now durably
+                // 'completed', the side effect was already applied (and counted)
+                // by THIS engine — just continue; do NOT spuriously escalate to
+                // ReconciliationRequired, which would call mark_reconciliation
+                // and corrupt the operation lifecycle out from under the
+                // concurrent engine.
+                match self.load_step(&ctx.finalization_op_id, kind).await {
+                    Ok(Some(cur)) if cur.state == ReleaseStepState::Completed => {
+                        // Another engine completed the step — continue.
+                    }
+                    _ => {
+                        return ReleaseRunOutcome::ReconciliationRequired {
+                            step: kind,
+                            reason: "completion CAS lost".into(),
+                        };
+                    }
+                }
             }
             executed.push(kind.as_str());
             self.write_summary(ctx).await;
