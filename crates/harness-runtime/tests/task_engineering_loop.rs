@@ -309,7 +309,21 @@ async fn test_response_lost_create_loop() {
 
 #[tokio::test]
 async fn test_decision_complete_candidate() {
+    // H3: CompleteCandidate requires a validated eligibility token.
+    let token = CompletionEligibility {
+        execution_terminal: true,
+        outcome_passed: true,
+        verification_terminal: true,
+        required_steps_complete: true,
+        evidence_complete: true,
+        dossier_fingerprint_valid: true,
+        process_inactive: true,
+        reconciliation_clear: true,
+        workspace_valid: true,
+        ownership_valid: true,
+    };
     let input = DecisionInput {
+        eligibility_token: Some(token),
         outcome_result: Some("passed".into()),
         next_action: Some("CompleteCandidate".into()),
         all_required_steps_passed: true,
