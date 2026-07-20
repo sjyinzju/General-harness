@@ -633,23 +633,6 @@ impl VerificationFinalizationService {
         self.run_finalization(req, &op_id).await
     }
 
-    /// Check whether a RELEASE WORKER is actively running the saga.
-    /// Only considers steps claimed within the last 60 seconds — older
-    /// InProgress steps are from crashed workers and should not block
-    /// resumption (C8 liveness fix).
-    async fn has_active_release_worker(&self, op_id: &str) -> bool {
-        let count: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM verification_release_steps \
-             WHERE finalization_op_id=? AND state='in_progress' \
-               AND claimed_at > datetime('now', '-60 seconds')",
-        )
-        .bind(op_id)
-        .fetch_one(&self.pool)
-        .await
-        .unwrap_or((0,));
-        count.0 > 0
-    }
-
     /// Same-key re-entry policy. Returns None when no operation exists yet.
     ///
     /// - different request hash → IdempotencyConflict
@@ -680,16 +663,10 @@ impl VerificationFinalizationService {
                 existing_outcome_summary: format!("{op_id}:{lc}"),
             }),
             // Outcome already durable — resume the release saga from the
-            // first unfinished durable step.  BUT first check whether
-            // another worker is actively running the saga (C8 liveness fix).
-            // If any release step is InProgress, another worker is still
-            // working — return Blocked to avoid a second engine racing.
+            // first unfinished durable step.  The step-level CAS in
+            // run_release prevents double-execution; HeldByOther is
+            // handled by mark_reconciliation / Blocked retry (C8 fix).
             "outcome_persisted" | "releasing_resources" | "reconciliation_required" => {
-                if self.has_active_release_worker(&op_id).await {
-                    return Some(FinalizationOutcome::Blocked {
-                        reason: format!("operation {op_id} has active release worker — retry"),
-                    });
-                }
                 Some(self.resume_release_only(req, &op_id).await)
             }
             // Crashed before the outcome was persisted: re-run deterministic
