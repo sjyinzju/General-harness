@@ -853,32 +853,6 @@ async fn two_pool_finalizer_strict_exactly_once() {
             [1, 1, 1, 1, 1, 1],
             "claim/lease/heartbeat/handoff/released-event/completion each exactly once at iteration {iteration}"
         );
-        // Per-step strict assertions.
-        assert_eq!(
-            snap[0], 1,
-            "claim_release          == 1 at iteration {iteration}"
-        );
-        assert_eq!(
-            snap[1], 1,
-            "lease_release          == 1 at iteration {iteration}"
-        );
-        assert_eq!(
-            snap[2], 1,
-            "heartbeat_release      == 1 at iteration {iteration}"
-        );
-        assert_eq!(
-            snap[3], 1,
-            "handoff_release        == 1 at iteration {iteration}"
-        );
-        assert_eq!(
-            snap[4], 1,
-            "released_event         == 1 at iteration {iteration}"
-        );
-        assert_eq!(
-            snap[5], 1,
-            "operation_completion   == 1 at iteration {iteration}"
-        );
-
         assert!(
             !e.hb.exists("e1").await,
             "heartbeat_unregister_count == 1 at iteration {iteration}"
@@ -898,16 +872,16 @@ async fn two_pool_finalizer_strict_exactly_once() {
         assert_no_forbidden_mutations(p).await;
 
         // duplicate effect == 0: re-run with fresh counters must be all-zero.
-        let c2 = ReleaseCounters::default();
+        let c3 = ReleaseCounters::default();
         let s3 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
-            .with_counters(c2.clone());
+            .with_counters(c3.clone());
         let r3 = s3.finalize(&mkreq("tp")).await;
         assert!(
             matches!(r3, FinalizationOutcome::Duplicate { .. }),
             "re-finalize must return Duplicate at iteration {iteration}"
         );
         assert_eq!(
-            c2.snapshot(),
+            c3.snapshot(),
             [0, 0, 0, 0, 0, 0],
             "duplicate effect == 0 at iteration {iteration}"
         );
