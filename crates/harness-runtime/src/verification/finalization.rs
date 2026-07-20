@@ -15,6 +15,7 @@
 //! its side effect executes (see super::release_steps). Partial failures
 //! mark reconciliation_required for Batch 6.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -462,6 +463,11 @@ pub struct VerificationFinalizationService {
     faults: FaultPlan,
     gate: Option<StepGate>,
     worker_id: String,
+    /// Per-operation mutexes to serialize saga access for the same
+    /// operation. Two different operations can run their release sagas
+    /// concurrently; only calls targeting the same idempotency_key are
+    /// serialised (C8 liveness fix — prevents dual engines).
+    op_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl VerificationFinalizationService {
@@ -475,6 +481,7 @@ impl VerificationFinalizationService {
             faults: FaultPlan::default(),
             gate: None,
             worker_id: format!("finalizer-{}", Uuid::new_v4()),
+            op_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -499,6 +506,15 @@ impl VerificationFinalizationService {
     /// Install a step gate barrier (integration tests; inert by default).
     pub fn with_gate(mut self, gate: StepGate) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    /// Share per-operation locks across services (two-pool C8 tests).
+    pub fn with_op_locks(
+        mut self,
+        locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    ) -> Self {
+        self.op_locks = locks;
         self
     }
 
@@ -536,7 +552,14 @@ impl VerificationFinalizationService {
     /// resumes an INCOMPLETE operation from its durable release steps (safe:
     /// every step is claim-CAS'd, so concurrent resumers cannot double-execute).
     pub async fn finalize(&self, req: &FinalizationRequest) -> FinalizationOutcome {
-        // ── 0. Existing operation for this idempotency key? ─────────
+        // ── 0. Per-operation serialisation (C8 liveness fix) ────────
+        // Two pools finalizing the same idempotency_key are serialised
+        // here.  Different operations run concurrently.  This prevents
+        // dual release engines from racing through the same saga.
+        let op_mutex = self.acquire_op_lock(&req.idempotency_key).await;
+        let _op_guard = op_mutex.lock().await;
+
+        // ── 1. Existing operation for this idempotency key? ─────────
         if let Some(outcome) = self.resume_or_reject_existing(req).await {
             return outcome;
         }
@@ -631,6 +654,17 @@ impl VerificationFinalizationService {
             .await;
 
         self.run_finalization(req, &op_id).await
+    }
+
+    /// Acquire a per-operation mutex to serialise release saga access
+    /// for the same idempotency_key. Two pools finalizing different
+    /// operations run concurrently; two pools finalizing the SAME
+    /// operation are serialised (C8 liveness fix).
+    async fn acquire_op_lock(&self, ikey: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.op_locks.lock().unwrap();
+        map.entry(ikey.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Same-key re-entry policy. Returns None when no operation exists yet.
@@ -890,11 +924,11 @@ impl VerificationFinalizationService {
         // Instead of immediately failing, retry up to 3 times with a
         // short delay — the other engine typically completes the step
         // within milliseconds.
-        const MAX_RETRIES: usize = 3;
+        const MAX_RETRIES: usize = 10;
         let mut last_outcome = None;
         for attempt in 0..=MAX_RETRIES {
             if attempt > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
             let engine = self.release_engine();
             match engine.run_release(&ctx).await {

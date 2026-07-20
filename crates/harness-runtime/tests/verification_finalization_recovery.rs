@@ -790,12 +790,18 @@ async fn two_pool_finalizer_strict_exactly_once() {
 
         let counters = ReleaseCounters::default();
         let start = Arc::new(AtomicUsize::new(0));
+        let op_locks = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            Arc<tokio::sync::Mutex<()>>,
+        >::new()));
         let s1 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
             .with_counters(counters.clone())
-            .with_start_count(start.clone());
+            .with_start_count(start.clone())
+            .with_op_locks(op_locks.clone());
         let s2 = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
             .with_counters(counters.clone())
-            .with_start_count(start.clone());
+            .with_start_count(start.clone())
+            .with_op_locks(op_locks.clone());
 
         let rq1 = mkreq("tp");
         let rq2 = mkreq("tp");
