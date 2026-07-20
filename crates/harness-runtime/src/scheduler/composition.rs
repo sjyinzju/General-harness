@@ -28,7 +28,7 @@ use crate::transition::TransitionService;
 /// I4-C Verification must use the coordinator for takeover, not raw
 /// repository or registry calls.
 pub struct SchedulerServices {
-    pub orchestrator: SchedulerOrchestrator,
+    pub orchestrator: Arc<SchedulerOrchestrator>,
     pub reconciler: SchedulerReconciler,
     pub handoff_coordinator: ResourceHandoffCoordinator,
     pub heartbeat_registry: Arc<HeartbeatRegistry>,
@@ -71,7 +71,7 @@ impl SchedulerServices {
             ResourceHandoffCoordinator::new(handoff_repo, heartbeat_registry.clone());
 
         SchedulerServices {
-            orchestrator,
+            orchestrator: Arc::new(orchestrator),
             reconciler,
             handoff_coordinator,
             heartbeat_registry,

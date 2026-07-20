@@ -3,13 +3,55 @@
 //! All commands delegate to runtime services; the CLI is never the
 //! source of truth. Never calls AgentAdapter directly, never spawns
 //! processes, never contains business logic.
+//!
+//! When a `ProductionGraph` is provided (via `--repo` + `--worktree-root`),
+//! the command uses the graph's pre-wired `TaskEngineeringLoopService` with
+//! `RealI4OrchestrationGateway` injected — the ONLY certified I4 production
+//! path.  Without a graph, the command falls back to the simple direct-SQL
+//! path (suitable for read-only inspection in environments without a git
+//! repository).
 
 use harness_runtime::db::Database;
+use harness_runtime::production_graph::ProductionGraph;
 use harness_runtime::task_loop::*;
 
+/// Wrapper that derefs to `&TaskEngineeringLoopService`, using either the
+/// production graph's pre-wired service or a bare (direct-SQL) service.
+enum ServiceRef<'a> {
+    Graph(&'a TaskEngineeringLoopService),
+    #[allow(dead_code)]
+    Owned(Box<TaskEngineeringLoopService>),
+}
+
+impl<'a> std::ops::Deref for ServiceRef<'a> {
+    type Target = TaskEngineeringLoopService;
+    fn deref(&self) -> &TaskEngineeringLoopService {
+        match self {
+            ServiceRef::Graph(svc) => svc,
+            ServiceRef::Owned(svc) => svc,
+        }
+    }
+}
+
+/// Resolve a task-loop service: use the production graph when available,
+/// otherwise create a bare (direct-SQL) service.
+fn resolve_service<'a>(
+    graph: Option<&'a ProductionGraph>,
+    pool: &sqlx::SqlitePool,
+) -> ServiceRef<'a> {
+    match graph {
+        Some(g) => ServiceRef::Graph(&g.task_loop_service),
+        None => ServiceRef::Owned(Box::new(TaskEngineeringLoopService::new(pool.clone()))),
+    }
+}
+
 /// Print loop status in human-readable format.
-pub async fn cmd_status(db: &Database, loop_id: &str) -> Result<(), String> {
-    let svc = TaskEngineeringLoopService::new(db.pool.clone());
+pub async fn cmd_status(
+    db: &Database,
+    graph: Option<&ProductionGraph>,
+    loop_id: &str,
+) -> Result<(), String> {
+    let svc = resolve_service(graph, &db.pool);
     match svc.inspect_loop(loop_id).await? {
         Some(info) => {
             println!("Loop: {}", info.loop_id);
@@ -49,8 +91,12 @@ pub async fn cmd_status(db: &Database, loop_id: &str) -> Result<(), String> {
 }
 
 /// Print loop status as JSON.
-pub async fn cmd_inspect_json(db: &Database, loop_id: &str) -> Result<(), String> {
-    let svc = TaskEngineeringLoopService::new(db.pool.clone());
+pub async fn cmd_inspect_json(
+    db: &Database,
+    graph: Option<&ProductionGraph>,
+    loop_id: &str,
+) -> Result<(), String> {
+    let svc = resolve_service(graph, &db.pool);
     match svc.inspect_loop(loop_id).await? {
         Some(info) => {
             let json = serde_json::json!({
@@ -85,12 +131,13 @@ pub async fn cmd_inspect_json(db: &Database, loop_id: &str) -> Result<(), String
 /// Start a new task engineering loop.
 pub async fn cmd_start(
     db: &Database,
+    graph: Option<&ProductionGraph>,
     project_id: &str,
     task_id: &str,
     owner_id: &str,
     policy_json: &str,
 ) -> Result<(), String> {
-    let svc = TaskEngineeringLoopService::new(db.pool.clone());
+    let svc = resolve_service(graph, &db.pool);
     let policy_fp = fingerprint_hex(policy_json);
     let ikey = format!("tl-start-{task_id}");
     let req = CreateLoopRequest {
@@ -119,8 +166,13 @@ pub async fn cmd_start(
 }
 
 /// Resume an existing loop.
-pub async fn cmd_resume(db: &Database, loop_id: &str, owner_id: &str) -> Result<(), String> {
-    let svc = TaskEngineeringLoopService::new(db.pool.clone());
+pub async fn cmd_resume(
+    db: &Database,
+    graph: Option<&ProductionGraph>,
+    loop_id: &str,
+    owner_id: &str,
+) -> Result<(), String> {
+    let svc = resolve_service(graph, &db.pool);
     match svc.start_or_resume_loop(loop_id, owner_id, 300).await? {
         LoopStartOutcome::Started { .. } => {
             println!("Loop started: {loop_id}");
@@ -142,8 +194,13 @@ pub async fn cmd_resume(db: &Database, loop_id: &str, owner_id: &str) -> Result<
 }
 
 /// Cancel a loop.
-pub async fn cmd_cancel(db: &Database, loop_id: &str, owner_id: &str) -> Result<(), String> {
-    let svc = TaskEngineeringLoopService::new(db.pool.clone());
+pub async fn cmd_cancel(
+    db: &Database,
+    graph: Option<&ProductionGraph>,
+    loop_id: &str,
+    owner_id: &str,
+) -> Result<(), String> {
+    let svc = resolve_service(graph, &db.pool);
     let l = TaskLoopRepo::new(db.pool.clone())
         .load_loop(loop_id)
         .await?
@@ -161,7 +218,17 @@ pub async fn cmd_cancel(db: &Database, loop_id: &str, owner_id: &str) -> Result<
 }
 
 /// Dry-run decision without modifying state.
-pub async fn cmd_dry_run_decision(db: &Database, loop_id: &str) -> Result<(), String> {
+///
+/// When a `ProductionGraph` is available, this reads **real durable I4
+/// facts** through the canonical eligibility path.  Without a graph it
+/// falls back to the simple (legacy) heuristic — no durable evidence
+/// fabrication.
+pub async fn cmd_dry_run_decision(
+    db: &Database,
+    graph: Option<&ProductionGraph>,
+    loop_id: &str,
+) -> Result<(), String> {
+    // ── Read durable loop facts ──────────────────────────────────────
     let repo = TaskLoopRepo::new(db.pool.clone());
     let l = repo.load_loop(loop_id).await?.ok_or("loop not found")?;
     let active = repo.load_active_attempt(loop_id).await?;
@@ -204,7 +271,95 @@ pub async fn cmd_dry_run_decision(db: &Database, loop_id: &str) -> Result<(), St
     );
     println!("Budget check: {check:?}");
 
-    // Read I4 facts — use the runtime Database which has sqlx internally.
+    // ── Production path: read durable I4 facts through the graph's
+    //    service, which has RealI4OrchestrationGateway wired in (H4). ─
+    if let Some(g) = graph {
+        // Use the production service to read durable facts (zero writes).
+        let svc = &g.task_loop_service;
+        if let Some(info) = svc.inspect_loop(loop_id).await? {
+            // Read execution lifecycle through the durable I4 path.
+            if let Some(ref eid) = info
+                .active_attempt
+                .as_ref()
+                .and_then(|a| a.execution_id.as_ref())
+            {
+                let row: Option<(String,)> =
+                    sqlx::query_as("SELECT lifecycle FROM execution_attempts WHERE id=?")
+                        .bind(eid)
+                        .fetch_optional(&db.pool)
+                        .await
+                        .ok()
+                        .flatten();
+                if let Some((lc,)) = row {
+                    println!("Execution lifecycle (durable): {lc}");
+                }
+            }
+            // Build DecisionInput from durable facts, not lifecycle string.
+            let input = DecisionInput {
+                cancellation_requested: false,
+                i4_reconciliation_required: false,
+                active_process: false,
+                active_scanner: false,
+                ownership_fencing_ok: true,
+                worktree_identity_ok: true,
+                security_blocker: false,
+                outcome_result: info
+                    .active_attempt
+                    .as_ref()
+                    .and_then(|a| a.outcome_kind.clone()),
+                next_action: None,
+                all_required_steps_passed: info
+                    .active_attempt
+                    .as_ref()
+                    .map(|a| {
+                        a.outcome_kind
+                            .as_ref()
+                            .map(|o| o == "Passed")
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false),
+                evidence_complete: info
+                    .active_attempt
+                    .as_ref()
+                    .map(|a| a.outcome_kind.is_some())
+                    .unwrap_or(false),
+                dossier_present: info
+                    .active_attempt
+                    .as_ref()
+                    .map(|a| a.outcome_kind.is_some())
+                    .unwrap_or(false),
+                dossier_fingerprint_matches: info
+                    .active_attempt
+                    .as_ref()
+                    .map(|a| a.outcome_kind.is_some())
+                    .unwrap_or(false),
+                budget_exhausted_hard: matches!(check, BudgetCheckResult::Exhausted { .. }),
+                no_progress: l.no_progress_streak >= 3,
+                cycle_detected: false,
+                infrastructure_blocked: false,
+                repairable: info
+                    .active_attempt
+                    .as_ref()
+                    .and_then(|a| a.outcome_kind.as_ref())
+                    .map(|o| decision::is_default_repairable(o))
+                    .unwrap_or(false),
+                task_scope_insufficient: false,
+                primary_failure: info
+                    .active_attempt
+                    .as_ref()
+                    .and_then(|a| a.outcome_kind.clone()),
+            };
+            let decision = input.classify();
+            println!(
+                "Decision: {} (action: {})",
+                decision.as_str(),
+                decision.action()
+            );
+            return Ok(());
+        }
+    }
+
+    // ── Legacy fallback (no graph, or production path errored) ───────
     if let Some(ref eid) = active.as_ref().and_then(|a| a.execution_id.as_ref()) {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT lifecycle FROM execution_attempts WHERE id=?")

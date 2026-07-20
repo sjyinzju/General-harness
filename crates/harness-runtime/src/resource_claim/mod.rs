@@ -16,6 +16,7 @@
 #![allow(clippy::explicit_auto_deref)]
 
 pub mod adapter;
+pub mod lease_adapter;
 mod reconciler;
 mod repo;
 pub mod service;
