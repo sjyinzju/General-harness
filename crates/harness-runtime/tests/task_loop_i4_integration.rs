@@ -1078,3 +1078,120 @@ async fn test_prepare_attempt_rejects_invalid_continuation() {
         r
     );
 }
+
+// ── Cancellation During Agent (C7) ───────────────────────────────
+
+#[tokio::test]
+async fn test_cancel_loop_during_active_attempt() {
+    let (db, gw) = setup_with_gateway().await;
+    let s = svc_with_gw(&db, gw.clone());
+
+    let CreateLoopOutcome::Created { loop_id } = s
+        .create_loop(&loop_req("ik-cancel", "hcancel"))
+        .await
+        .unwrap()
+    else {
+        panic!("not created")
+    };
+
+    let LoopStartOutcome::Started { version } = s
+        .start_or_resume_loop(&loop_id, "owner1", 300)
+        .await
+        .unwrap()
+    else {
+        panic!("not started")
+    };
+    let v = version.unwrap();
+    let l = TaskLoopRepo::new(db.pool.clone())
+        .load_loop(&loop_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Prepare an attempt.
+    let r = s
+        .prepare_next_attempt(
+            &loop_id,
+            "owner1",
+            v,
+            l.fencing_token,
+            "prof-1",
+            AttemptWorkspaceSource::InitialTaskWorkspace {
+                repository_path: "/tmp/repo".into(),
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    let PrepareAttemptOutcome::Prepared { attempt_id: _, .. } = r else {
+        panic!("{r:?}")
+    };
+
+    // Cancel the loop while an attempt is active.
+    let l2 = TaskLoopRepo::new(db.pool.clone())
+        .load_loop(&loop_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let cancel_result = s
+        .cancel_loop(&loop_id, "owner1", l2.version, l2.fencing_token)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            cancel_result,
+            CancelLoopOutcome::Cancelled | CancelLoopOutcome::AlreadyTerminal { .. }
+        ),
+        "cancel must succeed: {cancel_result:?}"
+    );
+
+    // Verify the loop is terminal.
+    let info = s.inspect_loop(&loop_id).await.unwrap().unwrap();
+    assert!(
+        info.lifecycle.is_terminal(),
+        "loop must be terminal after cancel"
+    );
+
+    // Cancellation must not create duplicate attempts.
+    let attempt_count: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM task_attempts WHERE loop_id=?")
+            .bind(&loop_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(attempt_count.0, 1, "cancel must not create extra attempts");
+}
+
+#[tokio::test]
+async fn test_cancel_wrong_owner_rejected() {
+    let (db, gw) = setup_with_gateway().await;
+    let s = svc_with_gw(&db, gw.clone());
+
+    let CreateLoopOutcome::Created { loop_id } = s
+        .create_loop(&loop_req("ik-cancel2", "hcancel2"))
+        .await
+        .unwrap()
+    else {
+        panic!("not created")
+    };
+
+    let LoopStartOutcome::Started { version } = s
+        .start_or_resume_loop(&loop_id, "owner1", 300)
+        .await
+        .unwrap()
+    else {
+        panic!("not started")
+    };
+
+    let l = TaskLoopRepo::new(db.pool.clone())
+        .load_loop(&loop_id)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Wrong owner tries to cancel — must be rejected.
+    let result = s
+        .cancel_loop(&loop_id, "wrong-owner", version.unwrap(), l.fencing_token)
+        .await;
+    assert!(result.is_err(), "wrong owner cancel must be rejected");
+}
