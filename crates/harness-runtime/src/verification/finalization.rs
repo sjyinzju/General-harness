@@ -633,13 +633,15 @@ impl VerificationFinalizationService {
         self.run_finalization(req, &op_id).await
     }
 
-    /// Check whether any release step for this operation is InProgress,
-    /// meaning another worker is actively running the release saga.
-    /// Used to prevent two engines from racing through the saga (C8 fix).
+    /// Check whether a RELEASE WORKER is actively running the saga.
+    /// Only considers steps claimed within the last 60 seconds — older
+    /// InProgress steps are from crashed workers and should not block
+    /// resumption (C8 liveness fix).
     async fn has_active_release_worker(&self, op_id: &str) -> bool {
         let count: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM verification_release_steps \
-             WHERE finalization_op_id=? AND state='in_progress'",
+             WHERE finalization_op_id=? AND state='in_progress' \
+               AND claimed_at > datetime('now', '-60 seconds')",
         )
         .bind(op_id)
         .fetch_one(&self.pool)
