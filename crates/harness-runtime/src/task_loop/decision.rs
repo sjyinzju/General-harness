@@ -850,31 +850,3 @@ mod tests {
         );
     }
 }
-
-/// Compute a decision fingerprint from input facts.
-pub fn decision_fingerprint(input: &DecisionInput) -> String {
-    let s = format!(
-        "cancel={}|rec={}|proc={}|scan={}|owner={}|wt={}|outcome={}|next={}|steps={}|ev={}|dos={}|dospel={}|sec={}|budget={}|noprog={}|cycle={}|infra={}|repair={}|scope={}|fail={}",
-        input.cancellation_requested,
-        input.i4_reconciliation_required,
-        input.active_process,
-        input.active_scanner,
-        input.ownership_fencing_ok,
-        input.worktree_identity_ok,
-        input.outcome_result.as_deref().unwrap_or("-"),
-        input.next_action.as_deref().unwrap_or("-"),
-        input.all_required_steps_passed,
-        input.evidence_complete,
-        input.dossier_present,
-        input.dossier_fingerprint_matches,
-        input.security_blocker,
-        input.budget_exhausted_hard,
-        input.no_progress,
-        input.cycle_detected,
-        input.infrastructure_blocked,
-        input.repairable,
-        input.task_scope_insufficient,
-        input.primary_failure.as_deref().unwrap_or("-"),
-    );
-    fingerprint_hex(&s)
-}
