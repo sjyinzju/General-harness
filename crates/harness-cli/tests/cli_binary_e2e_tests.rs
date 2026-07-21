@@ -32,15 +32,13 @@ fn run(args: &[&str], db: &str) -> std::process::Output {
 }
 
 fn setup() -> (tempfile::TempDir, String, String) {
-    let root = std::path::PathBuf::from(
-        std::env::var("HARNESS_E2E_TEMP").unwrap_or_else(|_| {
-            if cfg!(windows) {
-                "C:\\harness-e2e-temp".into()
-            } else {
-                "/tmp/harness-e2e-temp".into()
-            }
-        }),
-    );
+    let root = std::path::PathBuf::from(std::env::var("HARNESS_E2E_TEMP").unwrap_or_else(|_| {
+        if cfg!(windows) {
+            "C:\\harness-e2e-temp".into()
+        } else {
+            "/tmp/harness-e2e-temp".into()
+        }
+    }));
     std::fs::create_dir_all(&root).unwrap();
     let dir = tempfile::tempdir_in(&root).unwrap();
     let db = dir.path().join("t.db").to_string_lossy().to_string();
@@ -116,19 +114,47 @@ async fn binary_start_and_status() {
     let w = wt(&d);
     let o = run(
         &[
-            "task-loop", "start", "--project", "p", "--task", "t", "--owner", "ci",
-            "--policy", "{}", "--repo", &rp, "--worktree-root", &w,
+            "task-loop",
+            "start",
+            "--project",
+            "p",
+            "--task",
+            "t",
+            "--owner",
+            "ci",
+            "--policy",
+            "{}",
+            "--repo",
+            &rp,
+            "--worktree-root",
+            &w,
         ],
         &db,
     );
-    assert!(o.status.success(), "start failed: {}", String::from_utf8_lossy(&o.stderr));
+    assert!(
+        o.status.success(),
+        "start failed: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
     let l = lid(&o);
     assert!(!l.is_empty(), "no loop_id in output");
     let o2 = run(
-        &["task-loop", "status", &l, "--repo", &rp, "--worktree-root", &w],
+        &[
+            "task-loop",
+            "status",
+            &l,
+            "--repo",
+            &rp,
+            "--worktree-root",
+            &w,
+        ],
         &db,
     );
-    assert!(o2.status.success(), "status failed: {}", String::from_utf8_lossy(&o2.stderr));
+    assert!(
+        o2.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&o2.stderr)
+    );
 }
 
 #[tokio::test]
@@ -137,8 +163,20 @@ async fn binary_start_replay_idempotent() {
     init_db(&db).await;
     let w = wt(&d);
     let a: &[&str] = &[
-        "task-loop", "start", "--project", "p", "--task", "t", "--owner", "ci",
-        "--policy", "{}", "--repo", &rp, "--worktree-root", &w,
+        "task-loop",
+        "start",
+        "--project",
+        "p",
+        "--task",
+        "t",
+        "--owner",
+        "ci",
+        "--policy",
+        "{}",
+        "--repo",
+        &rp,
+        "--worktree-root",
+        &w,
     ];
     assert!(run(a, &db).status.success());
     assert!(run(a, &db).status.success());
@@ -151,14 +189,34 @@ async fn binary_resume_idempotent() {
     let w = wt(&d);
     let o = run(
         &[
-            "task-loop", "start", "--project", "p", "--task", "t", "--owner", "ci",
-            "--policy", "{}", "--repo", &rp, "--worktree-root", &w,
+            "task-loop",
+            "start",
+            "--project",
+            "p",
+            "--task",
+            "t",
+            "--owner",
+            "ci",
+            "--policy",
+            "{}",
+            "--repo",
+            &rp,
+            "--worktree-root",
+            &w,
         ],
         &db,
     );
     let l = lid(&o);
     let ra: &[&str] = &[
-        "task-loop", "resume", &l, "--owner", "ci", "--repo", &rp, "--worktree-root", &w,
+        "task-loop",
+        "resume",
+        &l,
+        "--owner",
+        "ci",
+        "--repo",
+        &rp,
+        "--worktree-root",
+        &w,
     ];
     assert!(run(ra, &db).status.success());
     assert!(run(ra, &db).status.success());
@@ -171,13 +229,27 @@ async fn binary_cancel() {
     let w = wt(&d);
     let o = run(
         &[
-            "task-loop", "start", "--project", "p", "--task", "t", "--owner", "ci",
-            "--policy", "{}", "--repo", &rp, "--worktree-root", &w,
+            "task-loop",
+            "start",
+            "--project",
+            "p",
+            "--task",
+            "t",
+            "--owner",
+            "ci",
+            "--policy",
+            "{}",
+            "--repo",
+            &rp,
+            "--worktree-root",
+            &w,
         ],
         &db,
     );
     let l = lid(&o);
-    assert!(run(&["task-loop", "cancel", &l, "--owner", "ci"], &db).status.success());
+    assert!(run(&["task-loop", "cancel", &l, "--owner", "ci"], &db)
+        .status
+        .success());
 }
 
 #[tokio::test]
@@ -187,8 +259,20 @@ async fn binary_inspect_json() {
     let w = wt(&d);
     let o = run(
         &[
-            "task-loop", "start", "--project", "p", "--task", "t", "--owner", "ci",
-            "--policy", "{}", "--repo", &rp, "--worktree-root", &w,
+            "task-loop",
+            "start",
+            "--project",
+            "p",
+            "--task",
+            "t",
+            "--owner",
+            "ci",
+            "--policy",
+            "{}",
+            "--repo",
+            &rp,
+            "--worktree-root",
+            &w,
         ],
         &db,
     );
@@ -206,21 +290,44 @@ async fn binary_dry_run_zero_writes() {
     let w = wt(&d);
     let o = run(
         &[
-            "task-loop", "start", "--project", "p", "--task", "t", "--owner", "ci",
-            "--policy", "{}", "--repo", &rp, "--worktree-root", &w,
+            "task-loop",
+            "start",
+            "--project",
+            "p",
+            "--task",
+            "t",
+            "--owner",
+            "ci",
+            "--policy",
+            "{}",
+            "--repo",
+            &rp,
+            "--worktree-root",
+            &w,
         ],
         &db,
     );
     let l = lid(&o);
     let before = std::fs::metadata(&db).unwrap().len();
     assert!(run(
-        &["task-loop", "dry-run-decision", &l, "--repo", &rp, "--worktree-root", &w],
+        &[
+            "task-loop",
+            "dry-run-decision",
+            &l,
+            "--repo",
+            &rp,
+            "--worktree-root",
+            &w
+        ],
         &db,
     )
     .status
     .success());
     let after = std::fs::metadata(&db).unwrap().len();
-    assert!(after <= before + 4096, "dry-run DB growth: {before} -> {after}");
+    assert!(
+        after <= before + 4096,
+        "dry-run DB growth: {before} -> {after}"
+    );
 }
 
 #[tokio::test]
@@ -241,8 +348,20 @@ async fn binary_secret_redaction() {
     let w = wt(&d);
     let o = run(
         &[
-            "task-loop", "start", "--project", "p", "--task", "t", "--owner", "ci",
-            "--policy", "{}", "--repo", &rp, "--worktree-root", &w,
+            "task-loop",
+            "start",
+            "--project",
+            "p",
+            "--task",
+            "t",
+            "--owner",
+            "ci",
+            "--policy",
+            "{}",
+            "--repo",
+            &rp,
+            "--worktree-root",
+            &w,
         ],
         &db,
     );
