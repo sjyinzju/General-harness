@@ -782,9 +782,9 @@ async fn resume_counts_handoff_completed_only_event_and_completion() {
 
 #[tokio::test]
 async fn two_pool_finalizer_strict_exactly_once() {
-    // Run 200 iterations — the race is intermittent and the fix must hold
-    // for the full 200/200 without a single counter deviation.
-    for iteration in 0..200 {
+    // Run 1000 iterations — the race is intermittent and the fix must hold
+    // for the full 1000/1000 without a single counter deviation.
+    for iteration in 0..1000 {
         let e = env().await;
         let db2 = Database::open(&e.db_path).await.unwrap();
 
