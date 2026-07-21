@@ -915,12 +915,9 @@ async fn two_pool_finalizer_strict_exactly_once() {
 // C8 Deterministic Interleaving Schedules (Phase 1)
 // ══════════════════════════════════════════════════════════════════════
 //
-// Each schedule uses StepGate barriers (not sleep) and FaultPlan crash
-// injection to produce a specific interleaving. Two independent service
-// graphs with NO shared op_mutex prove correctness depends on SQLite CAS
+// Each schedule uses deterministic fault injection and independent service
+// graphs with NO shared op_mutex to prove correctness depends on SQLite CAS
 // and durable step state, not on process-local mutual exclusion.
-
-use harness_runtime::verification::StepGate;
 
 /// Schedule A: Two independent service graphs (NO shared op_mutex) finalize
 /// the same operation concurrently. Per-step CAS ensures exactly-once effects.
