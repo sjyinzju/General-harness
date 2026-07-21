@@ -203,6 +203,11 @@ pub struct CompletionEligibility {
     pub evidence_complete: bool,
     pub dossier_fingerprint_valid: bool,
     pub process_inactive: bool,
+    /// True when at least one verification_step_operations row exists for
+    /// this execution (process state is observable).  When false, the
+    /// execution has no recorded step operations — its process state is
+    /// UNKNOWN and MUST NOT be treated as safe/inactive.
+    pub process_state_known: bool,
     pub reconciliation_clear: bool,
     pub workspace_valid: bool,
     pub ownership_valid: bool,
@@ -218,6 +223,7 @@ impl CompletionEligibility {
             && self.evidence_complete
             && self.dossier_fingerprint_valid
             && self.process_inactive
+            && self.process_state_known
             && self.reconciliation_clear
             && self.workspace_valid
             && self.ownership_valid
@@ -246,6 +252,9 @@ impl CompletionEligibility {
         }
         if !self.process_inactive {
             gates.push("process_inactive");
+        }
+        if !self.process_state_known {
+            gates.push("process_state_known");
         }
         if !self.reconciliation_clear {
             gates.push("reconciliation_clear");
@@ -329,13 +338,22 @@ pub async fn validate_completion_eligibility(
     eligibility.dossier_fingerprint_valid = dossier_row.is_some();
 
     // 3. No active process for this execution.
-    let proc_count: (i64,) =
+    //    Also check that process state is observable (at least one row).
+    let proc_running: (i64,) =
         sqlx::query_as("SELECT COUNT(*) FROM verification_step_operations WHERE execution_id=? AND status='running'")
             .bind(execution_id)
             .fetch_one(pool)
             .await
             .map_err(|e| format!("eligibility proc query: {e}"))?;
-    eligibility.process_inactive = proc_count.0 == 0;
+    let proc_total: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM verification_step_operations WHERE execution_id=?")
+            .bind(execution_id)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("eligibility proc total query: {e}"))?;
+    eligibility.process_inactive = proc_running.0 == 0;
+    // Process state UNKNOWN (no rows at all) → NOT safe — blocks completion.
+    eligibility.process_state_known = proc_total.0 > 0;
 
     // 4. No reconciliation required.
     let rec_count: (i64,) = sqlx::query_as(
@@ -441,8 +459,15 @@ mod tests {
             "all_required_steps_passed": true,
             "evidence_complete": true
         });
-        sqlx::query("INSERT INTO verification_runs (run_id, plan_id, plan_hash, execution_id, task_id, project_id, lifecycle, outcome_json, idempotency_key, request_hash) VALUES (?, ?, 'abc', ?, ?, ?, 'completed', ?, 'ik', 'rh')")
+        sqlx::query("INSERT INTO verification_runs (run_id, plan_id, plan_hash, plan_version, execution_id, task_id, project_id, lifecycle, outcome_json, idempotency_key, request_hash) VALUES (?, ?, 'abc', 1, ?, ?, ?, 'completed', ?, 'ik', 'rh')")
             .bind(&rid).bind(&plan_id).bind(eid).bind(&tid).bind(&pid).bind(outcome.to_string())
+            .execute(pool).await.unwrap();
+
+        // Insert a completed step operation so process_state_known is true
+        // (must be AFTER verification_runs INSERT due to FK).
+        sqlx::query("INSERT INTO verification_step_operations (op_id, verification_run_id, step_id, plan_id, execution_id, step_config_hash, worktree_id, fencing_token, status, idempotency_key, request_hash) VALUES (?, ?, 'build', ?, ?, 'h1', 'wt1', 1, 'completed', ?, ?)")
+            .bind(format!("so-{eid}")).bind(&rid).bind(&plan_id).bind(eid)
+            .bind(format!("ik-so-{eid}")).bind(format!("rh-so-{eid}"))
             .execute(pool).await.unwrap();
 
         // verification_finalization_operations (dossier).
@@ -636,17 +661,70 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn h2_10_process_unknown() {
+    async fn h2_10_process_unknown_blocks_completion() {
         let pool = setup_db().await;
         let eid = "e-unknown-proc";
         seed_passed(&pool, eid).await;
-        // No verification_step_operations at all — process_inactive should
-        // be true (0 running processes). This is the "process unknown"
-        // case where the execution has no step operations recorded.
+        // Remove step operations to simulate "process state unknown".
+        sqlx::query("DELETE FROM verification_step_operations WHERE execution_id=?")
+            .bind(eid)
+            .execute(&pool)
+            .await
+            .unwrap();
         let eligibility = validate_completion_eligibility(&pool, eid).await.unwrap();
-        // Actually, with no running processes, process_inactive is true.
-        // This test documents the behavior: unknown == not running == safe.
-        assert!(eligibility.process_inactive);
+        assert!(
+            !eligibility.all_passed(),
+            "process unknown must block completion"
+        );
+        assert!(
+            !eligibility.process_state_known,
+            "process_state_known must be false"
+        );
+        assert!(
+            eligibility.failed_gates().contains(&"process_state_known"),
+            "failed gates must include process_state_known"
+        );
+
+        // Verify CompleteCandidate cannot be reached with process unknown.
+        let input = DecisionInput {
+            eligibility_token: Some(eligibility),
+            outcome_result: Some("passed".into()),
+            next_action: Some("CompleteCandidate".into()),
+            all_required_steps_passed: true,
+            evidence_complete: true,
+            dossier_present: true,
+            dossier_fingerprint_matches: true,
+            ownership_fencing_ok: true,
+            worktree_identity_ok: true,
+            ..Default::default()
+        };
+        assert!(
+            !matches!(input.classify(), DecisionClassification::CompleteCandidate),
+            "process unknown must not yield CompleteCandidate"
+        );
+    }
+
+    /// When process state IS known and there are no running processes,
+    /// process_inactive should be true — this is the safe path.
+    #[tokio::test]
+    async fn h2_10b_process_known_and_inactive_is_safe() {
+        let pool = setup_db().await;
+        let eid = "e-known-inactive";
+        seed_passed(&pool, eid).await;
+        let rid = format!("run-{eid}");
+        // Insert a completed (non-running) step operation to make process state known.
+        sqlx::query("INSERT INTO verification_step_operations (op_id, verification_run_id, step_id, plan_id, execution_id, step_config_hash, worktree_id, fencing_token, status, idempotency_key, request_hash) VALUES ('so-known', ?, 'build', 'plan1', ?, 'h1', 'wt1', 1, 'completed', 'ik-so-known', 'rh-so-known')")
+            .bind(&rid).bind(eid).execute(&pool).await.unwrap();
+
+        let eligibility = validate_completion_eligibility(&pool, eid).await.unwrap();
+        assert!(
+            eligibility.process_state_known,
+            "process_state_known must be true"
+        );
+        assert!(
+            eligibility.process_inactive,
+            "process_inactive must be true when no running processes"
+        );
     }
 
     #[tokio::test]

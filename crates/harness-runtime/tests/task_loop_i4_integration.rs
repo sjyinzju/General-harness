@@ -118,6 +118,7 @@ async fn test_first_attempt_passes() {
         evidence_complete: true,
         dossier_fingerprint_valid: true,
         process_inactive: true,
+        process_state_known: true,
         reconciliation_clear: true,
         workspace_valid: true,
         ownership_valid: true,
@@ -724,6 +725,9 @@ async fn test_completion_eligibility_all_gates_pass() {
     sqlx::query("INSERT INTO worktrees (id, project_id, task_id, execution_id, repository_root, repository_identity, worktree_path, branch_name, base_commit, owner_supervisor_id, operation_id, status) VALUES ('wt-c1','p1','t1','exec-c1','/tmp','/tmp/.git','/tmp/wt1','br1','abc','sv1','op1','active')")
         .execute(&db.pool).await.unwrap();
     sqlx::query("INSERT INTO resource_handoffs (handoff_id, project_id, task_id, execution_id, worktree_id, lease_id, fencing_token, owner_kind, owner_id, status) VALUES ('ho-c1','p1','t1','exec-c1','wt-c1','l1',1,'verification','v1','verification_owned')")
+        .execute(&db.pool).await.unwrap();
+    // Insert a completed step operation so process_state_known is true.
+    sqlx::query("INSERT INTO verification_step_operations (op_id, verification_run_id, step_id, plan_id, execution_id, step_config_hash, worktree_id, fencing_token, status, idempotency_key, request_hash) VALUES ('so-c1','vr-c1','build','plan-c1','exec-c1','h1','wt-c1',1,'completed','ik-so-c1','rh-so-c1')")
         .execute(&db.pool).await.unwrap();
 
     let eligibility =

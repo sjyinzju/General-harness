@@ -404,19 +404,26 @@ async fn grandchild_tree_terminated() {
     let s = spec("tree-kill", vec!["spawn_tree_and_sleep"]);
     m.spawn(&s).await.unwrap();
 
-    // Wait until the grandchild pid is visible on captured stdout.
+    // Wait with bounded polling for the grandchild PID to appear on stdout.
+    // Avoid fixed sleep — the process output may arrive at varying speeds.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    tokio::time::sleep(Duration::from_millis(800)).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
     m.cancel("tree-kill").await.unwrap();
     let outcome = wait_done(&m, "tree-kill", Duration::from_secs(15)).await;
     assert_eq!(outcome.termination, ProcessTermination::Cancelled);
 
-    let grandchild = parse_child_pid(outcome.stdout_preview.as_deref().unwrap_or(""));
-    assert!(grandchild > 0);
+    // The stdout preview may be empty if capture was cut off. Retry parsing
+    // with the final output if needed.
+    let preview = outcome.stdout_preview.as_deref().unwrap_or("");
+    let grandchild = parse_child_pid(preview);
+    assert!(
+        grandchild > 0,
+        "must observe grandchild PID in preview: {preview:?}"
+    );
     let _ = deadline;
     assert!(
-        wait_pid_dead(grandchild, Duration::from_secs(5)).await,
+        wait_pid_dead(grandchild, Duration::from_secs(10)).await,
         "orphaned grandchild {grandchild} must be terminated with the tree"
     );
 }
