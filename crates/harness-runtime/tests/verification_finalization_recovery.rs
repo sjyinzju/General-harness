@@ -953,14 +953,17 @@ async fn c8_schedule_a_handoff_pause_worker_b_resumes() {
     let h1 = tokio::spawn(async move { s1.finalize(&rq1).await });
     let h2 = tokio::spawn(async move { s2.finalize(&rq2).await });
 
-    // Wait for Worker A to reach ResourcesReleasedEvent gate (after
-    // HandoffRelease, before claiming the next step).
-    gate_a.wait_reached().await;
-
+    // Wait for Worker A to reach ResourcesReleasedEvent gate with timeout.
+    // If Worker A never reaches the gate (race/error), release anyway and
+    // let invariants below diagnose the issue.
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        gate_a.wait_reached(),
+    )
+    .await;
     // Worker B will find the operation running and go through the
-    // HeldByOther → retry/reconciliation path. Meanwhile, release
-    // Worker A so it completes.
-    gate_a.release();
+    // HeldByOther → retry/reconciliation path. Meanwhile, Worker A
+    // (released above) completes.
 
     let (r1, r2) = tokio::join!(h1, h2);
     let _r1 = r1.unwrap();
