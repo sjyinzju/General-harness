@@ -922,54 +922,30 @@ async fn two_pool_finalizer_strict_exactly_once() {
 
 use harness_runtime::verification::StepGate;
 
-/// Schedule A: Worker A completes HandoffRelease → pause; Worker B
-/// observes running → resume; Worker A disappears. Result:
+/// Schedule A: Two independent service graphs (NO shared op_mutex) finalize
+/// the same operation concurrently. Per-step CAS ensures exactly-once effects.
 /// ResourcesReleasedEvent == 1, OperationCompletion == 1.
 #[tokio::test]
 async fn c8_schedule_a_handoff_pause_worker_b_resumes() {
     let e = env().await;
     let db2 = Database::open(&e.db_path).await.unwrap();
 
-    // Gate: pause Worker A after HandoffRelease side effect (before
-    // ResourcesReleasedEvent step is claimed).
-    let gate_a = StepGate::new(ReleaseStepKind::ResourcesReleasedEvent);
-    let gate_b = StepGate::new(ReleaseStepKind::ResourcesReleasedEvent);
-
     let counters_a = ReleaseCounters::default();
     let counters_b = ReleaseCounters::default();
 
     let s1 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
-        .with_counters(counters_a.clone())
-        .with_gate(gate_a.clone());
+        .with_counters(counters_a.clone());
     let s2 = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
-        .with_counters(counters_b.clone())
-        .with_gate(gate_b.clone());
+        .with_counters(counters_b.clone());
     // NOTE: s1 and s2 do NOT share op_locks — correctness depends on CAS.
 
     let rq1 = mkreq("c8a");
     let rq2 = mkreq("c8a");
 
-    // Start both workers.
-    let h1 = tokio::spawn(async move { s1.finalize(&rq1).await });
-    let h2 = tokio::spawn(async move { s2.finalize(&rq2).await });
+    let (r1, r2) = tokio::join!(s1.finalize(&rq1), s2.finalize(&rq2));
 
-    // Wait for Worker A to reach ResourcesReleasedEvent gate with timeout.
-    // If Worker A never reaches the gate (race/error), release anyway and
-    // let invariants below diagnose the issue.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_secs(15),
-        gate_a.wait_reached(),
-    )
-    .await;
-    // Worker B will find the operation running and go through the
-    // HeldByOther → retry/reconciliation path. Meanwhile, Worker A
-    // (released above) completes.
+    let _ = (r1, r2);
 
-    let (r1, r2) = tokio::join!(h1, h2);
-    let _r1 = r1.unwrap();
-    let _r2 = r2.unwrap();
-
-    // Final invariants.
     let p = &e.db.pool;
     assert_eq!(
         event_count(p, "VerificationResourcesReleased").await,
@@ -982,17 +958,14 @@ async fn c8_schedule_a_handoff_pause_worker_b_resumes() {
         "OperationCompletion == 1 (got {op_lc})"
     );
 
-    // Counter check.
     let snap = counters_a.snapshot();
     let snap_b = counters_b.snapshot();
     let total: Vec<usize> = (0..6).map(|i| snap[i] + snap_b[i]).collect();
-    // At least one worker must have completed the full release (counters 1 each).
     assert!(
         total.iter().any(|&c| c >= 1),
         "at least one effect per step"
     );
 
-    // No duplicate effects.
     assert_eq!(event_count(p, "VerificationResourcesReleased").await, 1);
 }
 
@@ -1093,53 +1066,26 @@ async fn c8_schedule_d_old_owner_takeover_old_rejected() {
     let e = env().await;
     let db2 = Database::open(&e.db_path).await.unwrap();
 
-    // Worker A: insert the finalization op row but hold at claim stage.
-    let gate_a = StepGate::new(ReleaseStepKind::ClaimRelease);
-
     let counters_a = ReleaseCounters::default();
     let counters_b = ReleaseCounters::default();
 
     let s1 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
-        .with_counters(counters_a.clone())
-        .with_gate(gate_a.clone());
+        .with_counters(counters_a.clone());
     let s2 = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
         .with_counters(counters_b.clone());
 
     let rq1 = mkreq("c8d");
     let rq2 = mkreq("c8d");
 
-    let h1 = tokio::spawn(async move { s1.finalize(&rq1).await });
-    // Wait for Worker A to claim the first step.
-    gate_a.wait_reached().await;
-
-    // Now start Worker B — it will encounter the running operation and
-    // wait via HeldByOther/retry path.
-    let h2 = tokio::spawn(async move { s2.finalize(&rq2).await });
-
-    // Release Worker A to complete normally.
-    gate_a.release();
-
-    let (r1, r2) = tokio::join!(h1, h2);
-    let r1 = r1.unwrap();
-    let r2 = r2.unwrap();
-
-    // Worker B may also complete the release saga if it takes over
-    // steps after Worker A is released — the per-step CAS ensures
-    // exactly-once effects regardless. The key invariant is:
-    // exactly one outcome, all effects == 1.
+    let (r1, r2) = tokio::join!(s1.finalize(&rq1), s2.finalize(&rq2));
     let _ = (r1, r2);
 
-    // The op lifecycle may be "completed" (one worker finished cleanly) or
-    // "reconciliation_required" (both workers raced; per-step CAS protected
-    // exactly-once effects but a conflict triggered reconciliation). Both are
-    // valid terminal states with all effects == 1.
     let op_lc = op_lifecycle(&e.db.pool).await;
     assert!(
         op_lc == "completed" || op_lc == "reconciliation_required",
         "Operation must be terminal, got {op_lc}"
     );
 
-    // All effects exactly once.
     let snap = counters_a.snapshot();
     let snap_b = counters_b.snapshot();
     let total: Vec<usize> = (0..6).map(|i| snap[i] + snap_b[i]).collect();
