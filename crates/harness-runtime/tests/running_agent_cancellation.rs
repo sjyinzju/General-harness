@@ -21,10 +21,14 @@ use harness_runtime::process::types::{
 };
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(
-        std::env::var("CARGO_BIN_EXE_process_fixture")
-            .expect("CARGO_BIN_EXE_process_fixture not set; run via cargo test"),
-    )
+    std::env::var("CARGO_BIN_EXE_process_fixture")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let exe = std::env::current_exe().unwrap();
+            let dir = exe.parent().unwrap().parent().unwrap();
+            dir.join("process-fixture")
+                .with_extension(std::env::consts::EXE_EXTENSION)
+        })
 }
 
 fn spawn_tree_spec(id: &str) -> ProcessSpec {

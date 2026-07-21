@@ -10,8 +10,17 @@
 use std::process::Command;
 
 fn binary() -> String {
-    std::env::var("CARGO_BIN_EXE_harness_cli")
-        .unwrap_or_else(|_| panic!("harness-cli binary not compiled; run via cargo test"))
+    std::env::var("CARGO_BIN_EXE_harness_cli").unwrap_or_else(|_| {
+        // Fallback: navigate from the test binary directory to the harness-cli binary.
+        // Test:  target/debug/deps/cli_binary_e2e_tests-xxx.exe
+        // Binary: target/debug/harness-cli.exe
+        let exe = std::env::current_exe().unwrap();
+        let dir = exe.parent().unwrap().parent().unwrap();
+        dir.join("harness-cli")
+            .with_extension(std::env::consts::EXE_EXTENSION)
+            .to_string_lossy()
+            .to_string()
+    })
 }
 
 fn run(args: &[&str], db: &str) -> std::process::Output {
