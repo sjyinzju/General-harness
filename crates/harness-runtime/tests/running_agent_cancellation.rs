@@ -20,25 +20,17 @@ use harness_runtime::process::types::{
     CapturePolicy, ProcessSpec, ProcessState, ProcessTermination, StdinMode,
 };
 
-fn process_fixture_binary() -> Option<PathBuf> {
-    std::env::var("CARGO_BIN_EXE_process_fixture")
-        .ok()
-        .map(PathBuf::from)
-}
-
-macro_rules! need_fixture {
-    () => {
-        if process_fixture_binary().is_none() {
-            eprintln!("SKIP: CARGO_BIN_EXE_process_fixture not set");
-            return;
-        }
-    };
+fn fixture_path() -> PathBuf {
+    PathBuf::from(
+        std::env::var("CARGO_BIN_EXE_process_fixture")
+            .expect("CARGO_BIN_EXE_process_fixture not set; run via cargo test"),
+    )
 }
 
 fn spawn_tree_spec(id: &str) -> ProcessSpec {
     ProcessSpec {
         execution_id: id.to_string(),
-        executable: process_fixture_binary().expect("missing process-fixture binary"),
+        executable: fixture_path(),
         args: vec!["spawn_tree_and_sleep".to_string()],
         working_directory: std::env::temp_dir(),
         env_overrides: HashMap::new(),
@@ -116,7 +108,7 @@ fn parse_child_pid(preview: &str) -> u32 {
 // ══════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn cancel_running_agent_terminates_process_tree() { need_fixture!();
+async fn cancel_running_agent_terminates_process_tree() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
     let start_count = Arc::new(AtomicUsize::new(0));
@@ -161,7 +153,7 @@ async fn cancel_running_agent_terminates_process_tree() { need_fixture!();
 }
 
 #[tokio::test]
-async fn duplicate_cancel_request_idempotent() { need_fixture!();
+async fn duplicate_cancel_request_idempotent() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
 
@@ -179,7 +171,7 @@ async fn duplicate_cancel_request_idempotent() { need_fixture!();
 }
 
 #[tokio::test]
-async fn cancel_response_lost_retry_still_cancelled() { need_fixture!();
+async fn cancel_response_lost_retry_still_cancelled() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
 
@@ -214,7 +206,7 @@ async fn cancel_nonexistent_is_noop() {
 }
 
 #[tokio::test]
-async fn grandchild_tree_terminated_certification() { need_fixture!();
+async fn grandchild_tree_terminated_certification() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
 
