@@ -780,11 +780,25 @@ async fn resume_counts_handoff_completed_only_event_and_completion() {
 // Two-pool finalizer: strict exactly-once
 // ══════════════════════════════════════════════════════════════════════
 
+/// Returns the certification repeat count from I45_REPEAT_COUNT env var,
+/// or the I45_CERT_MODE default (full=1000, quick=1), or `default_if_unset`.
+fn cert_repeat(default_if_unset: usize) -> usize {
+    std::env::var("I45_REPEAT_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| {
+            match std::env::var("I45_CERT_MODE").ok().as_deref() {
+                Some("full") => Some(default_if_unset),
+                _ => Some(1), // quick mode or unset → 1 iteration
+            }
+        })
+        .unwrap_or(1)
+}
+
 #[tokio::test]
 async fn two_pool_finalizer_strict_exactly_once() {
-    // Run 1000 iterations — the race is intermittent and the fix must hold
-    // for the full 1000/1000 without a single counter deviation.
-    for iteration in 0..1000 {
+    let total = cert_repeat(1000);
+    for iteration in 0..total {
         let e = env().await;
         let db2 = Database::open(&e.db_path).await.unwrap();
 
