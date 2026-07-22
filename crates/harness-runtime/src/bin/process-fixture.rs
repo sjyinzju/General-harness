@@ -79,12 +79,17 @@ fn main() {
             // Write grandchild PID to grandchild.txt in the readiness dir.
             // Uses READY_DIR if set, otherwise current directory (set by
             // ProcessManager as the working_directory).
-            let rd = env::var("READY_DIR").unwrap_or_else(|_| {
-                env::current_dir()
-                    .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default()
-            });
-            let _ = std::fs::write(format!("{rd}/grandchild.txt"), pid.to_string());
+            // Best-effort: write grandchild PID to grandchild.txt for
+            // the deterministic readiness protocol. Ignore errors for
+            // backward compat with spawn_grandchild mode.
+            if let Ok(rd) = env::var("READY_DIR") {
+                let _ = std::fs::write(format!("{rd}/grandchild.txt"), pid.to_string());
+            } else if let Ok(cwd) = env::current_dir() {
+                let _ = std::fs::write(
+                    cwd.join("grandchild.txt"),
+                    pid.to_string(),
+                );
+            }
         }
         "spawn_grandchild" => {
             let exe = env::current_exe().unwrap();
