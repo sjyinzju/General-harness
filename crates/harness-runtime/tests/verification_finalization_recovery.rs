@@ -17,7 +17,7 @@ use harness_runtime::scheduler::heartbeat_registry::{
 };
 use harness_runtime::verification::{
     FaultMode, FaultPlan, FinalizationOutcome, FinalizationRequest, ReleaseCounters,
-    ReleaseStepKind, VerificationFinalizationService,
+    ReleaseStepKind, StepGate, VerificationFinalizationService,
 };
 use sqlx::SqlitePool;
 
@@ -912,16 +912,29 @@ async fn two_pool_finalizer_strict_exactly_once() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// C8 Deterministic Interleaving Schedules (Phase 1)
+// C8 Deterministic Interleaving Schedules
 // ══════════════════════════════════════════════════════════════════════
 //
-// Each schedule uses deterministic fault injection and independent service
+// Each schedule uses DETERMINISTIC control (StepGate with timeout, fault
+// injection, or explicit worker orchestration) and independent service
 // graphs with NO shared op_mutex to prove correctness depends on SQLite CAS
-// and durable step state, not on process-local mutual exclusion.
+// and durable step state, not on process-local mutual exclusion or random
+// tokio scheduling.
 
-/// Schedule A: Two independent service graphs (NO shared op_mutex) finalize
-/// the same operation concurrently. Per-step CAS ensures exactly-once effects.
-/// ResourcesReleasedEvent == 1, OperationCompletion == 1.
+/// Schedule A: Worker A completes ClaimRelease → LeaseRelease →
+/// HeartbeatUnregister → HandoffRelease (steps 1-4), then PAUSES at the
+/// ResourcesReleasedEvent StepGate BEFORE the side effect. The test waits
+/// for A to park, then SPAWNS Worker B with an independent pool+service.
+/// Worker A is ABORTED while parked — it never executes steps 5/6. Worker
+/// B probes durable state, takes over the in_progress step 5, executes the
+/// ResourcesReleasedEvent, then OperationCompletion.
+///
+/// Asserted invariants:
+///   ResourcesReleasedEvent  == 1   (Worker B)
+///   OperationCompletion     == 1   (Worker B)
+///   Worker A steps 5,6      == 0   (never executed)
+///   DuplicateEffect         == 0   (re-finalize all-zero)
+///   OrphanRunningOperation  == 0   (lifecycle=completed)
 #[tokio::test]
 async fn c8_schedule_a_handoff_pause_worker_b_resumes() {
     let e = env().await;
@@ -930,40 +943,96 @@ async fn c8_schedule_a_handoff_pause_worker_b_resumes() {
     let counters_a = ReleaseCounters::default();
     let counters_b = ReleaseCounters::default();
 
+    // Gate at ResourcesReleasedEvent: Worker A will park here.
+    let gate_a = StepGate::with_timeout(
+        ReleaseStepKind::ResourcesReleasedEvent,
+        std::time::Duration::from_secs(15),
+    );
+
     let s1 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
-        .with_counters(counters_a.clone());
+        .with_counters(counters_a.clone())
+        .with_gate(gate_a.clone());
     let s2 = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
         .with_counters(counters_b.clone());
     // NOTE: s1 and s2 do NOT share op_locks — correctness depends on CAS.
 
     let rq1 = mkreq("c8a");
+
+    // Spawn Worker A. It will run steps 1-4, then park at the gate.
+    let handle_a = tokio::spawn(async move { s1.finalize(&rq1).await });
+
+    // Wait until Worker A is parked at the ResourcesReleasedEvent gate.
+    gate_a.wait_reached().await;
+
+    // Verify Worker A completed steps 1-4 before parking.
+    let snap_pre = counters_a.snapshot();
+    assert_eq!(snap_pre[0], 1, "Worker A: ClaimRelease == 1");
+    assert_eq!(snap_pre[1], 1, "Worker A: LeaseRelease == 1");
+    assert_eq!(snap_pre[2], 1, "Worker A: HeartbeatUnregister == 1");
+    assert_eq!(snap_pre[3], 1, "Worker A: HandoffRelease == 1");
+    assert_eq!(snap_pre[4], 0, "Worker A: not yet ResourcesReleasedEvent");
+    assert_eq!(snap_pre[5], 0, "Worker A: not yet OperationCompletion");
+
+    // Abort Worker A while it is parked at the gate. It never executes
+    // steps 5 or 6. The aborted task drops its op_lock, releasing the
+    // operation for Worker B.
+    handle_a.abort();
+    let _ = handle_a.await;
+
+    // Worker B starts with an independent pool. It probes durable state,
+    // sees step 5 in_progress (effect not applied), takes over, executes
+    // steps 5-6.
     let rq2 = mkreq("c8a");
-
-    let (r1, r2) = tokio::join!(s1.finalize(&rq1), s2.finalize(&rq2));
-
-    let _ = (r1, r2);
+    let r2 = s2.finalize(&rq2).await;
+    assert!(
+        matches!(r2, FinalizationOutcome::Finalized { .. }),
+        "Worker B must finalize, got {r2:?}"
+    );
 
     let p = &e.db.pool;
+    // ── Core invariants ─────────────────────────────────────────
     assert_eq!(
         event_count(p, "VerificationResourcesReleased").await,
         1,
         "ResourcesReleasedEvent == 1"
     );
     let op_lc = op_lifecycle(p).await;
-    assert!(
-        op_lc == "completed",
-        "OperationCompletion == 1 (got {op_lc})"
-    );
+    assert_eq!(op_lc, "completed", "OperationCompletion == 1");
 
-    let snap = counters_a.snapshot();
+    // Worker A never executed steps 5/6.
+    let snap_a = counters_a.snapshot();
+    assert_eq!(
+        snap_a[4], 0,
+        "Worker A never executed ResourcesReleasedEvent"
+    );
+    assert_eq!(snap_a[5], 0, "Worker A never executed OperationCompletion");
+
+    // Worker B executed steps 5/6.
     let snap_b = counters_b.snapshot();
-    let total: Vec<usize> = (0..6).map(|i| snap[i] + snap_b[i]).collect();
-    assert!(
-        total.iter().any(|&c| c >= 1),
-        "at least one effect per step"
-    );
+    assert_eq!(snap_b[4], 1, "Worker B: ResourcesReleasedEvent == 1");
+    assert_eq!(snap_b[5], 1, "Worker B: OperationCompletion == 1");
 
-    assert_eq!(event_count(p, "VerificationResourcesReleased").await, 1);
+    // Total exactly-once: ClaimRelease=1, LeaseRelease=1,
+    // HeartbeatUnregister=1, HandoffRelease=1, ResourcesReleasedEvent=1,
+    // OperationCompletion=1.
+    let total: Vec<usize> = (0..6).map(|i| snap_a[i] + snap_b[i]).collect();
+    assert_eq!(total[0], 1, "ClaimRelease total == 1");
+    assert_eq!(total[1], 1, "LeaseRelease total == 1");
+    assert_eq!(total[2], 1, "HeartbeatUnregister total == 1");
+    assert_eq!(total[3], 1, "HandoffRelease total == 1");
+    assert_eq!(total[4], 1, "ResourcesReleasedEvent total == 1");
+    assert_eq!(total[5], 1, "OperationCompletion total == 1");
+
+    // DuplicateEffect == 0.
+    let c3 = ReleaseCounters::default();
+    let s3 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
+        .with_counters(c3.clone());
+    let r3 = s3.finalize(&mkreq("c8a")).await;
+    assert!(
+        matches!(r3, FinalizationOutcome::Duplicate { .. }),
+        "re-finalize must return Duplicate"
+    );
+    assert_eq!(c3.snapshot(), [0, 0, 0, 0, 0, 0], "DuplicateEffect == 0");
 }
 
 /// Schedule B: ResourcesReleasedEvent inserted → crash before completion
@@ -1056,42 +1125,86 @@ async fn c8_schedule_c_released_event_done_crash_before_completion() {
     );
 }
 
-/// Schedule D: Old owner/fencing → new Worker takeover → old Worker
-/// attempts write → rejected; new Worker completes.
+/// Schedule D: Ownership/fencing takeover — old worker REJECTED.
+///
+/// Worker A is parked at ClaimRelease StepGate. Ownership changes to
+/// scheduler (hostile takeover). Worker A released: ClaimRelease effect
+/// executes (authorised before gate), then LeaseRelease verify_ownership
+/// FAILS — only 1 of 6 effects executed (ClaimRelease); operation
+/// lifecycle != "completed". Old worker REJECTED.
+///
+/// Ownership rejection correctness proved here. New-worker completion
+/// is covered by Schedules A, B, C, E (all complete the saga).
 #[tokio::test]
 async fn c8_schedule_d_old_owner_takeover_old_rejected() {
     let e = env().await;
-    let db2 = Database::open(&e.db_path).await.unwrap();
 
-    let counters_a = ReleaseCounters::default();
-    let counters_b = ReleaseCounters::default();
+    let counters_old = ReleaseCounters::default();
 
-    let s1 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
-        .with_counters(counters_a.clone());
-    let s2 = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
-        .with_counters(counters_b.clone());
-
-    let rq1 = mkreq("c8d");
-    let rq2 = mkreq("c8d");
-
-    let (r1, r2) = tokio::join!(s1.finalize(&rq1), s2.finalize(&rq2));
-    let _ = (r1, r2);
-
-    let op_lc = op_lifecycle(&e.db.pool).await;
-    assert!(
-        op_lc == "completed" || op_lc == "reconciliation_required",
-        "Operation must be terminal, got {op_lc}"
+    let gate_d = StepGate::with_timeout(
+        ReleaseStepKind::ClaimRelease,
+        std::time::Duration::from_secs(15),
     );
 
-    let snap = counters_a.snapshot();
-    let snap_b = counters_b.snapshot();
-    let total: Vec<usize> = (0..6).map(|i| snap[i] + snap_b[i]).collect();
-    assert_eq!(total[0], 1, "ClaimRelease == 1");
-    assert_eq!(total[1], 1, "LeaseRelease == 1");
-    assert_eq!(total[2], 1, "HeartbeatUnregister == 1");
-    assert_eq!(total[3], 1, "HandoffRelease == 1");
-    assert_eq!(total[4], 1, "ResourcesReleasedEvent == 1");
-    assert_eq!(total[5], 1, "OperationCompletion == 1");
+    let s_old = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
+        .with_counters(counters_old.clone())
+        .with_gate(gate_d.clone());
+
+    let rq_old = mkreq("c8d");
+    let handle_old = tokio::spawn(async move { s_old.finalize(&rq_old).await });
+    gate_d.wait_reached().await;
+
+    // Hostile takeover: change to scheduler ownership while A parked.
+    sqlx::query(
+        "UPDATE resource_handoffs SET owner_kind='scheduler', owner_id='evil-takeover', fencing_token=99, version=version+1 WHERE handoff_id='ho-1'",
+    )
+    .execute(&e.db.pool).await.unwrap();
+
+    gate_d.release();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle_old).await;
+
+    // Old worker: ClaimRelease executed (1 effect), rest blocked.
+    let snap_old = counters_old.snapshot();
+    assert_eq!(
+        snap_old[0], 1,
+        "ClaimRelease executed before ownership check"
+    );
+    assert_eq!(snap_old[1], 0, "LeaseRelease blocked by ownership change");
+    assert_eq!(snap_old[2], 0, "HeartbeatUnregister blocked");
+    assert_eq!(snap_old[3], 0, "HandoffRelease blocked");
+    assert_eq!(snap_old[4], 0, "ResourcesReleasedEvent blocked");
+    assert_eq!(snap_old[5], 0, "OperationCompletion blocked");
+
+    // Operation NOT completed — old worker was REJECTED.
+    let op_lc = op_lifecycle(&e.db.pool).await;
+    assert_ne!(
+        op_lc, "completed",
+        "old worker rejected (lifecycle={op_lc})"
+    );
+
+    // ── Resource invariants after rejection ───────────────────────
+    // ClaimRelease effect DID run → claims released.
+    let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'")
+        .fetch_one(&e.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(cs.0, "released", "claim released by old worker");
+
+    // LeaseRelease was BLOCKED → lease still acquired.
+    let ls: (String,) = sqlx::query_as("SELECT lifecycle FROM workspace_leases WHERE id='l1'")
+        .fetch_one(&e.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(ls.0, "acquired", "lease retained (not released)");
+
+    // Handoff still verification_owned (scheduler takeover changed owner
+    // but the old worker didn't reach HandoffRelease to release it).
+    // Heartbeat still registered (old worker didn't reach that step).
+    assert!(e.hb.exists("e1").await, "heartbeat not unregistered");
+
+    // Duplicate run proves exactly-once: even though resources are
+    // partially released, re-running with correct ownership succeeds.
+    // (That path is covered by Schedules A/B/C/E.)
 }
 
 /// Schedule E: OperationCompletion succeeds → response lost → retry →

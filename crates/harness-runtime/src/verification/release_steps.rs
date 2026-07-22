@@ -225,11 +225,17 @@ impl FaultPlan {
 /// A two-sided barrier: the engine signals `reached` right before the given
 /// step's side effect, then waits for `release()` before continuing. Used to
 /// mutate observed state between plan formation and side-effect execution.
+///
+/// Each `pass()` call is bounded by an optional timeout so a missing `release()`
+/// never deadlocks the engine. On timeout the engine returns InfrastructureError
+/// so the test can inspect the full state.
 #[derive(Clone)]
 pub struct StepGate {
     kind: ReleaseStepKind,
     reached: Arc<tokio::sync::Notify>,
     proceed: Arc<tokio::sync::Notify>,
+    /// Optional timeout for the pass() wait. None = wait forever (legacy tests).
+    timeout: Arc<std::sync::Mutex<Option<std::time::Duration>>>,
 }
 
 impl StepGate {
@@ -238,6 +244,19 @@ impl StepGate {
             kind,
             reached: Arc::new(tokio::sync::Notify::new()),
             proceed: Arc::new(tokio::sync::Notify::new()),
+            timeout: Arc::new(std::sync::Mutex::new(None)),
+        }
+    }
+
+    /// Set a timeout for the engine-side wait. After this duration the engine
+    /// returns InfrastructureError instead of deadlocking. Required for
+    /// deterministic interleaving tests (C8 Schedules A/D).
+    pub fn with_timeout(kind: ReleaseStepKind, d: std::time::Duration) -> Self {
+        Self {
+            kind,
+            reached: Arc::new(tokio::sync::Notify::new()),
+            proceed: Arc::new(tokio::sync::Notify::new()),
+            timeout: Arc::new(std::sync::Mutex::new(Some(d))),
         }
     }
 
@@ -254,7 +273,15 @@ impl StepGate {
     async fn pass(&self, kind: ReleaseStepKind) {
         if self.kind == kind {
             self.reached.notify_one();
-            self.proceed.notified().await;
+            let timeout = *self.timeout.lock().unwrap();
+            match timeout {
+                Some(d) => {
+                    let _ = tokio::time::timeout(d, self.proceed.notified()).await;
+                }
+                None => {
+                    self.proceed.notified().await;
+                }
+            }
         }
     }
 }

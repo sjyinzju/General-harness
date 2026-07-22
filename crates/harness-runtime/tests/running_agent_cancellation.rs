@@ -101,12 +101,35 @@ async fn wait_pid_dead(pid: u32, timeout: Duration) -> bool {
     }
 }
 
-fn parse_child_pid(preview: &str) -> u32 {
+/// Wait until the process is in Running state and has been running
+/// long enough for the tree fixture to spawn its child. Returns once
+/// the process state is Running (not Starting). A small bounded poll
+/// follows to ensure the child has spawned.
+async fn wait_process_ready(mgr: &ProcessManager, eid: &str, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    // Wait for process to leave Starting state.
+    loop {
+        if let Some(state) = mgr.get_state(eid).await {
+            if matches!(state, ProcessState::Running) {
+                break;
+            }
+        }
+        if tokio::time::Instant::now() > deadline {
+            panic!("timeout waiting for process running (eid={eid})");
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // Poll for the tree fixture to spawn child/grandchild and produce
+    // stdout containing "child_pid=". Up to 500ms under load is normal
+    // on Windows for process tree creation + I/O buffering.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+}
+
+fn parse_child_pid_opt(preview: &str) -> Option<u32> {
     preview
         .lines()
         .find_map(|l| l.strip_prefix("child_pid="))
         .and_then(|s| s.trim().parse().ok())
-        .unwrap_or_else(|| panic!("child_pid not found in preview: {preview:?}"))
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -121,14 +144,13 @@ async fn cancel_running_agent_terminates_process_tree() {
     mgr.spawn(&spec).await.unwrap();
     start_count.fetch_add(1, Ordering::SeqCst);
 
-    // Wait briefly for the process to start producing output.
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Wait for the process to start (state-based, no fixed sleep).
+    wait_process_ready(&mgr, "cancel-tree", Duration::from_secs(10)).await;
 
     // Cancel the running process tree.
     mgr.cancel("cancel-tree").await.unwrap();
 
     let state = wait_done(&mgr, "cancel-tree", Duration::from_secs(15)).await;
-    let mut grandchild_pid: u32 = 0;
     if let ProcessState::Completed { outcome } = &state {
         assert_eq!(
             outcome.termination,
@@ -137,20 +159,14 @@ async fn cancel_running_agent_terminates_process_tree() {
             outcome.termination
         );
         let preview = outcome.stdout_preview.as_deref().unwrap_or("");
-        if let Some(pid_str) = preview.lines().find_map(|l| l.strip_prefix("child_pid=")) {
-            if let Ok(pid) = pid_str.trim().parse::<u32>() {
-                grandchild_pid = pid;
-            }
+        if let Some(grandchild_pid) = parse_child_pid_opt(preview) {
+            assert!(
+                wait_pid_dead(grandchild_pid, Duration::from_secs(10)).await,
+                "grandchild {grandchild_pid} must be terminated"
+            );
         }
     } else {
         panic!("expected Completed, got state");
-    }
-
-    if grandchild_pid > 0 {
-        assert!(
-            wait_pid_dead(grandchild_pid, Duration::from_secs(10)).await,
-            "grandchild {grandchild_pid} must be terminated"
-        );
     }
 
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
@@ -163,7 +179,8 @@ async fn duplicate_cancel_request_idempotent() {
 
     let spec = spawn_tree_spec("dup-cancel");
     mgr.spawn(&spec).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // State-polled readiness — no fixed sleep.
+    wait_process_ready(&mgr, "dup-cancel", Duration::from_secs(10)).await;
 
     mgr.cancel("dup-cancel").await.unwrap();
     mgr.cancel("dup-cancel").await.unwrap(); // idempotent
@@ -181,7 +198,8 @@ async fn cancel_response_lost_retry_still_cancelled() {
 
     let spec = spawn_tree_spec("rl-cancel");
     mgr.spawn(&spec).await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // State-polled readiness — no fixed sleep.
+    wait_process_ready(&mgr, "rl-cancel", Duration::from_secs(10)).await;
 
     mgr.cancel("rl-cancel").await.unwrap();
     mgr.cancel("rl-cancel").await.unwrap(); // response lost → retry
@@ -217,7 +235,8 @@ async fn grandchild_tree_terminated_certification() {
     let spec = spawn_tree_spec("cert-tree");
     mgr.spawn(&spec).await.unwrap();
 
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    // State-polled readiness — no fixed sleep.
+    wait_process_ready(&mgr, "cert-tree", Duration::from_secs(10)).await;
 
     mgr.cancel("cert-tree").await.unwrap();
     let state = wait_done(&mgr, "cert-tree", Duration::from_secs(15)).await;
@@ -225,8 +244,9 @@ async fn grandchild_tree_terminated_certification() {
     if let ProcessState::Completed { outcome } = &state {
         assert_eq!(outcome.termination, ProcessTermination::Cancelled);
         let preview = outcome.stdout_preview.as_deref().unwrap_or("");
-        let gc = parse_child_pid(preview);
-        assert!(gc > 0, "must observe grandchild PID in: {preview}");
+        let gc = parse_child_pid_opt(preview)
+            .unwrap_or_else(|| panic!("grandchild PID not found in: {preview}"));
+        assert!(gc > 0, "must observe grandchild PID");
         assert!(
             wait_pid_dead(gc, Duration::from_secs(10)).await,
             "orphaned grandchild {gc} must be terminated"

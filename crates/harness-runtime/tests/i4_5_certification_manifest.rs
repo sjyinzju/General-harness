@@ -384,7 +384,7 @@ pub fn build_manifest() -> I45CertificationManifest {
                 id: "rg06".into(), name: "Two-Pool Attempt Creation".into(),
                 test_target: "task_loop_fault_tests::test_repeat_two_pool_attempt_creation_100".into(),
                 repeat_count: 100, timeout_secs: 5,
-                evidence_level: EvidenceLevel::RealI4Executed,
+                evidence_level: EvidenceLevel::DeterministicConcurrency,
                 expected_counters: vec![],
                 forbidden_shortcuts: vec![],
             },
