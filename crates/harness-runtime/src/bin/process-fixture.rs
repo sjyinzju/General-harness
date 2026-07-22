@@ -73,9 +73,17 @@ fn main() {
         "spawn_child" => {
             let exe = env::current_exe().unwrap();
             let child_pid = process::Command::new(&exe).arg("sleep").arg("10").spawn();
-            // "child_pid=" prefix is the canonical format consumed by
-            // process_capture tests and running_agent_cancellation tests.
-            println!("child_pid={}", child_pid.unwrap().id());
+            let pid = child_pid.unwrap().id();
+            // Print to stdout for diagnostics / backward compat.
+            println!("child_pid={pid}");
+            // Write grandchild PID to grandchild.txt in the readiness dir.
+            // Uses READY_DIR if set, otherwise current directory (set by
+            // ProcessManager as the working_directory).
+            let rd = env::var("READY_DIR")
+                .unwrap_or_else(|_| env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default());
+            let _ = std::fs::write(format!("{rd}/grandchild.txt"), pid.to_string());
         }
         "spawn_grandchild" => {
             let exe = env::current_exe().unwrap();
@@ -86,29 +94,69 @@ fn main() {
             let _ = child.wait_with_output();
         }
         "spawn_tree_and_sleep" => {
-            // Spawn intermediate that creates an orphaned grandchild (sleep 10)
-            // and exits, then stay alive 60s. The child INHERITS root's stdout,
-            // so its "child_pid=<grandchild_pid>" line goes to the root's stdout
-            // pipe (captured by ProcessManager). The root then prints its own
-            // root_pid and child_pid, then flushes BEFORE sleeping.
-            //
-            // Three PIDs appear in the captured stdout:
-            //   child_pid=<grandchild>   (from spawn_child mode, inherits stdout)
-            //   root_pid=<root>          (from println below)
-            //   child_pid=<child>        (from println below — same prefix, different value)
+            // Write startup marker IMMEDIATELY to verify process starts.
+            let start_marker = env::var("READY_DIR")
+                .unwrap_or_else(|_| env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default());
+            let _ = std::fs::write(format!("{start_marker}/started.txt"),
+                format!("pid={} time={:?}", process::id(), std::time::Instant::now()));
+            // Deterministic readiness via JSON file with atomic rename.
+            // READY_DIR env var → ready.json.tmp → fsync → rename → ready.json.
+            // Contains root/child/grandchild PIDs.
             let exe = env::current_exe().unwrap();
-            let child = process::Command::new(&exe)
+            let ready_dir = env::var("READY_DIR")
+                .unwrap_or_else(|_| env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| env::temp_dir().to_string_lossy().to_string()));
+            let root_pid = process::id();
+
+            // Spawn child. Child spawns grandchild (sleep 10), writes
+            // grandchild PID to READY_DIR/grandchild.txt, prints
+            // "child_pid=<grandchild>" to inherited stdout, then exits.
+            let mut child = process::Command::new(&exe)
                 .arg("spawn_child")
                 .spawn()
                 .unwrap();
             let child_pid = child.id();
-            let _ = child.wait_with_output();
-            // Print root PID and intermediate child PID. Grandchild PID
-            // was already printed by the child process as "child_pid=<...>"
-            // to root's stdout via inheritance. "mid_pid=" avoids ambiguity.
-            println!("root_pid={}", process::id());
+            child.wait().unwrap();
+
+            // Read grandchild PID from file written by spawn_child.
+            let gc_path = format!("{ready_dir}/grandchild.txt");
+            let grandchild_pid = std::fs::read_to_string(&gc_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+
+            // Write ready.json with atomic rename.
+            let ready_json = format!(
+                concat!(
+                    r#"{{"run_id":"{}","root_pid":{},"#,
+                    r#""child_pid":{},"grandchild_pid":{},"#,
+                    r#""tree_ready":true}}"#
+                ),
+                ready_dir.rsplit(['\\', '/']).next().unwrap_or("unknown"),
+                root_pid,
+                child_pid,
+                grandchild_pid,
+            );
+            let tmp = format!("{ready_dir}/ready.json.tmp");
+            let final_path = format!("{ready_dir}/ready.json");
+            if let Ok(mut f) = std::fs::File::create(&tmp) {
+                use std::io::Write;
+                let _ = f.write_all(ready_json.as_bytes());
+                let _ = f.sync_all();
+                drop(f);
+                let _ = std::fs::rename(&tmp, &final_path);
+            }
+
+            // Print PIDs to root stdout for diagnostics.
+            println!("root_pid={root_pid}");
             println!("mid_pid={child_pid}");
+            println!("child_pid={grandchild_pid}");
             let _ = io::stdout().flush();
+            // Write sleeping marker to confirm sleep reached.
+            let _ = std::fs::write(format!("{ready_dir}/sleeping.txt"), "1");
             thread::sleep(Duration::from_secs(60));
         }
         "ignore_graceful_shutdown" => {

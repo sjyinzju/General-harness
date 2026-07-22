@@ -1,18 +1,8 @@
 //! I4.5 Running Agent Cancellation — Certification E2E Tests.
 //!
-//! These tests exercise real OS process cancellation through the production
-//! ProcessManager. A long-running child process (process-fixture with
-//! spawn_tree_and_sleep) is started, then cancelled via the production
-//! cancellation API. The entire process tree is verified terminated.
-//!
-//! The process fixture prints root/child/grandchild PIDs to stdout and
-//! flushes BEFORE sleeping. ProcessManager captures this via Pipe
-//! capture policy. The test reads PIDs from ProcessOutcome after
-//! cancellation and verifies all three are dead.
-//!
-//! Readiness is state-polled: wait for ProcessState::Running, then a
-//! short bounded delay for tree spawning. After cancel, PIDs are parsed
-//! from the captured stdout preview (always present because of flush).
+//! File-based deterministic readiness: fixture writes ready.json + sleeping.txt
+//! to its working directory (set by ProcessManager). Test polls for files.
+//! No fixed sleep. No stdout as control flow.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -37,12 +27,12 @@ fn fixture_path() -> PathBuf {
         })
 }
 
-fn spawn_tree_spec(id: &str) -> ProcessSpec {
+fn spawn_tree_spec(id: &str, ready_dir: &std::path::Path) -> ProcessSpec {
     ProcessSpec {
         execution_id: id.to_string(),
         executable: fixture_path(),
         args: vec!["spawn_tree_and_sleep".to_string()],
-        working_directory: std::env::temp_dir(),
+        working_directory: ready_dir.to_path_buf(),
         env_overrides: HashMap::new(),
         env_removals: vec![],
         stdin_mode: StdinMode::Closed,
@@ -55,6 +45,33 @@ fn spawn_tree_spec(id: &str) -> ProcessSpec {
         allowed_env_var_names: vec![],
         known_secrets: vec![],
         runtime_profile_id: "test-profile".into(),
+    }
+}
+
+struct TreeReadiness {
+    root_pid: u32,
+    child_pid: u32,
+    grandchild_pid: u32,
+}
+
+fn poll_ready_json(ready_dir: &std::path::Path, timeout: Duration) -> TreeReadiness {
+    let deadline = std::time::Instant::now() + timeout;
+    let ready_path = ready_dir.join("ready.json");
+    loop {
+        if let Ok(content) = std::fs::read_to_string(&ready_path) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {
+                let root = v["root_pid"].as_u64().unwrap_or(0) as u32;
+                let child = v["child_pid"].as_u64().unwrap_or(0) as u32;
+                let gc = v["grandchild_pid"].as_u64().unwrap_or(0) as u32;
+                if v["tree_ready"].as_bool().unwrap_or(false) && root > 0 && child > 0 && gc > 0 {
+                    return TreeReadiness { root_pid: root, child_pid: child, grandchild_pid: gc };
+                }
+            }
+        }
+        if std::time::Instant::now() > deadline {
+            panic!("timeout waiting for ready.json in {}", ready_dir.display());
+        }
+        std::thread::sleep(Duration::from_millis(30));
     }
 }
 
@@ -73,52 +90,33 @@ async fn wait_done(mgr: &ProcessManager, eid: &str, timeout: Duration) -> Proces
     }
 }
 
-/// Wait for the process to reach Running state, then a short bounded
-/// poll for the tree fixture to spawn child/grandchild and flush PIDs.
-async fn wait_ready(mgr: &ProcessManager, eid: &str) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(state) = mgr.get_state(eid).await {
-            if matches!(state, ProcessState::Running) {
-                break;
+async fn pid_alive(pid: u32) -> bool {
+    let pid_s = pid.to_string();
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        #[cfg(windows)]
+        let result = {
+            use std::os::windows::process::CommandExt;
+            match std::process::Command::new("cmd")
+                .args(["/c", &format!("tasklist /FI \"PID eq {pid_s}\" 2>NUL")])
+                .creation_flags(0x08000000)
+                .output()
+            {
+                Ok(o) => String::from_utf8_lossy(&o.stdout).contains(&pid_s),
+                Err(_) => false,
             }
-        }
-        if tokio::time::Instant::now() > deadline {
-            panic!("timeout waiting for {eid} Running state");
-        }
-        tokio::time::sleep(Duration::from_millis(30)).await;
-    }
-    // Bounded poll after Running: fixture spawns child → child spawns
-    // grandchild → child exits → root reads child stdout, prints PIDs,
-    // flushes. This takes ~100-500ms depending on system load.
-    tokio::time::sleep(Duration::from_millis(1000)).await;
-}
-
-#[cfg(windows)]
-fn pid_alive(pid: u32) -> bool {
-    use std::os::windows::process::CommandExt;
-    let output = std::process::Command::new("cmd")
-        .args(["/c", &format!("tasklist /FI \"PID eq {pid}\" 2>NUL")])
-        .creation_flags(0x08000000)
-        .output();
-    match output {
-        Ok(o) => {
-            let s = String::from_utf8_lossy(&o.stdout);
-            s.contains(&pid.to_string())
-        }
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(windows))]
-fn pid_alive(pid: u32) -> bool {
-    std::path::Path::new(&format!("/proc/{pid}")).exists()
+        };
+        #[cfg(not(windows))]
+        let result = std::path::Path::new(&format!("/proc/{pid_s}")).exists();
+        let _ = tx.send(result);
+    });
+    rx.await.unwrap_or(false)
 }
 
 async fn wait_pid_dead(pid: u32, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if !pid_alive(pid) {
+        if !pid_alive(pid).await {
             return true;
         }
         if tokio::time::Instant::now() > deadline {
@@ -128,146 +126,92 @@ async fn wait_pid_dead(pid: u32, timeout: Duration) -> bool {
     }
 }
 
-/// Parse tree PIDs from the process stdout preview (written + flushed
-/// by the fixture BEFORE sleeping).
-fn parse_tree_pids(preview: &str) -> (u32, u32, u32) {
-    let mut root = 0u32;
-    let mut child = 0u32;
-    let mut grandchild = 0u32;
-    for line in preview.lines() {
-        if let Some(v) = line.strip_prefix("root_pid=") {
-            root = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = line.strip_prefix("mid_pid=") {
-            child = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = line.strip_prefix("child_pid=") {
-            grandchild = v.trim().parse().unwrap_or(0);
-        }
-    }
-    (root, child, grandchild)
-}
-
 async fn assert_tree_dead(root: u32, child: u32, grandchild: u32, label: &str) {
-    assert!(
-        wait_pid_dead(root, Duration::from_secs(15)).await,
-        "{label}: root {root} must be dead"
-    );
-    assert!(
-        wait_pid_dead(child, Duration::from_secs(15)).await,
-        "{label}: child {child} must be dead"
-    );
-    assert!(
-        wait_pid_dead(grandchild, Duration::from_secs(15)).await,
-        "{label}: grandchild {grandchild} must be dead"
-    );
+    assert!(wait_pid_dead(root, Duration::from_secs(15)).await, "{label}: root {root} dead");
+    assert!(wait_pid_dead(child, Duration::from_secs(15)).await, "{label}: child {child} dead");
+    assert!(wait_pid_dead(grandchild, Duration::from_secs(15)).await, "{label}: grandchild {grandchild} dead");
 }
 
 // ══════════════════════════════════════════════════════════════════════
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn cancel_running_agent_terminates_process_tree() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
     let start_count = Arc::new(AtomicUsize::new(0));
+    let ready_dir = tempfile::tempdir().unwrap();
 
-    let spec = spawn_tree_spec("cancel-tree");
-    mgr.spawn(&spec).await.unwrap();
+    mgr.spawn(&spawn_tree_spec("cancel-tree", ready_dir.path())).await.unwrap();
     start_count.fetch_add(1, Ordering::SeqCst);
+    let ready = poll_ready_json(ready_dir.path(), Duration::from_secs(20));
+    assert!(ready.root_pid > 0 && ready.child_pid > 0 && ready.grandchild_pid > 0);
 
-    wait_ready(&mgr, "cancel-tree").await;
     mgr.cancel("cancel-tree").await.unwrap();
-
     let state = wait_done(&mgr, "cancel-tree", Duration::from_secs(20)).await;
-    if let ProcessState::Completed { outcome } = &state {
-        assert_eq!(
-            outcome.termination,
-            ProcessTermination::Cancelled,
-            "must be Cancelled"
-        );
-        let preview = outcome.stdout_preview.as_deref().unwrap_or("");
-        let (root, child, grandchild) = parse_tree_pids(preview);
-        assert!(root > 0, "must capture root PID from stdout");
-        assert!(child > 0, "must capture child PID from stdout");
-        assert!(grandchild > 0, "must capture grandchild PID from stdout");
-        assert_tree_dead(root, child, grandchild, "cancel-tree").await;
-    } else {
-        panic!("expected Completed, got state");
-    }
+    assert!(matches!(&state, ProcessState::Completed { outcome } if outcome.termination == ProcessTermination::Cancelled));
+
+    assert_tree_dead(ready.root_pid, ready.child_pid, ready.grandchild_pid, "cancel-tree").await;
     assert_eq!(start_count.load(Ordering::SeqCst), 1);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn duplicate_cancel_request_idempotent() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
+    let ready_dir = tempfile::tempdir().unwrap();
 
-    let spec = spawn_tree_spec("dup-cancel");
-    mgr.spawn(&spec).await.unwrap();
-    wait_ready(&mgr, "dup-cancel").await;
+    mgr.spawn(&spawn_tree_spec("dup-cancel", ready_dir.path())).await.unwrap();
+    let ready = poll_ready_json(ready_dir.path(), Duration::from_secs(20));
+    assert!(ready.root_pid > 0);
 
     mgr.cancel("dup-cancel").await.unwrap();
     mgr.cancel("dup-cancel").await.unwrap();
-
     let state = wait_done(&mgr, "dup-cancel", Duration::from_secs(20)).await;
-    if let ProcessState::Completed { outcome } = &state {
-        assert_eq!(outcome.termination, ProcessTermination::Cancelled);
-    }
+    assert!(matches!(&state, ProcessState::Completed { outcome } if outcome.termination == ProcessTermination::Cancelled));
+    assert!(wait_pid_dead(ready.root_pid, Duration::from_secs(10)).await);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn cancel_response_lost_retry_still_cancelled() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
+    let ready_dir = tempfile::tempdir().unwrap();
 
-    let spec = spawn_tree_spec("rl-cancel");
-    mgr.spawn(&spec).await.unwrap();
-    wait_ready(&mgr, "rl-cancel").await;
+    mgr.spawn(&spawn_tree_spec("rl-cancel", ready_dir.path())).await.unwrap();
+    let ready = poll_ready_json(ready_dir.path(), Duration::from_secs(20));
+    assert!(ready.root_pid > 0);
 
     mgr.cancel("rl-cancel").await.unwrap();
     mgr.cancel("rl-cancel").await.unwrap();
-
     let state = wait_done(&mgr, "rl-cancel", Duration::from_secs(20)).await;
-    if let ProcessState::Completed { outcome } = &state {
-        assert_eq!(outcome.termination, ProcessTermination::Cancelled);
-    }
-    let still_terminal = matches!(
-        mgr.get_state("rl-cancel").await,
-        Some(ProcessState::Completed { .. })
-    );
-    assert!(still_terminal, "must remain terminal after retry");
+    assert!(matches!(&state, ProcessState::Completed { outcome } if outcome.termination == ProcessTermination::Cancelled));
+    assert!(matches!(mgr.get_state("rl-cancel").await, Some(ProcessState::Completed { .. })));
+    assert!(wait_pid_dead(ready.root_pid, Duration::from_secs(10)).await);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn cancel_nonexistent_is_noop() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
-    let result = mgr.cancel("no-such-execution").await;
-    let _ = result;
+    let _ = mgr.cancel("no-such-execution").await;
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn grandchild_tree_terminated_certification() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
+    let ready_dir = tempfile::tempdir().unwrap();
 
-    let spec = spawn_tree_spec("cert-tree");
-    mgr.spawn(&spec).await.unwrap();
+    mgr.spawn(&spawn_tree_spec("cert-tree", ready_dir.path())).await.unwrap();
+    let ready = poll_ready_json(ready_dir.path(), Duration::from_secs(20));
 
-    wait_ready(&mgr, "cert-tree").await;
+    assert!(ready_dir.path().join("ready.json").exists());
+    assert!(ready_dir.path().join("sleeping.txt").exists(), "sleeping.txt confirms 60s sleep reached");
+    assert!(ready.root_pid > 0 && ready.child_pid > 0 && ready.grandchild_pid > 0);
+
     mgr.cancel("cert-tree").await.unwrap();
-
     let state = wait_done(&mgr, "cert-tree", Duration::from_secs(20)).await;
-    if let ProcessState::Completed { outcome } = &state {
-        assert_eq!(outcome.termination, ProcessTermination::Cancelled);
-        let preview = outcome.stdout_preview.as_deref().unwrap_or("");
-        let (root, child, grandchild) = parse_tree_pids(preview);
-        assert!(
-            root > 0,
-            "must capture root PID from stdout preview: {preview}"
-        );
-        assert!(child > 0, "must capture child PID from stdout");
-        assert!(grandchild > 0, "must capture grandchild PID from stdout");
-        assert_tree_dead(root, child, grandchild, "cert-tree").await;
-    } else {
-        panic!("expected Completed state");
-    }
+    assert!(matches!(&state, ProcessState::Completed { outcome } if outcome.termination == ProcessTermination::Cancelled));
+
+    assert_tree_dead(ready.root_pid, ready.child_pid, ready.grandchild_pid, "cert-tree").await;
 }
