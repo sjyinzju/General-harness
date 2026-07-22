@@ -83,10 +83,7 @@ fn main() {
             if let Ok(rd) = env::var("READY_DIR") {
                 let _ = std::fs::write(format!("{rd}/grandchild.txt"), pid.to_string());
             } else if let Ok(cwd) = env::current_dir() {
-                let _ = std::fs::write(
-                    cwd.join("grandchild.txt"),
-                    pid.to_string(),
-                );
+                let _ = std::fs::write(cwd.join("grandchild.txt"), pid.to_string());
             }
         }
         "spawn_grandchild" => {
