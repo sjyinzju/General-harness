@@ -74,6 +74,8 @@ fn main() {
             let exe = env::current_exe().unwrap();
             let child_pid = process::Command::new(&exe).arg("sleep").arg("10").spawn();
             let pid = child_pid.unwrap().id();
+            // Print to stdout for backward compat with process_capture tests.
+            println!("child_pid={pid}");
             // Write grandchild PID to grandchild.txt in the readiness dir.
             // Uses READY_DIR if set, otherwise current directory (set by
             // ProcessManager as the working_directory).
