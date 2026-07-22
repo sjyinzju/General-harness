@@ -73,7 +73,9 @@ fn main() {
         "spawn_child" => {
             let exe = env::current_exe().unwrap();
             let child_pid = process::Command::new(&exe).arg("sleep").arg("10").spawn();
-            println!("grandchild_pid={}", child_pid.unwrap().id());
+            // "child_pid=" prefix is the canonical format consumed by
+            // process_capture tests and running_agent_cancellation tests.
+            println!("child_pid={}", child_pid.unwrap().id());
         }
         "spawn_grandchild" => {
             let exe = env::current_exe().unwrap();
@@ -101,11 +103,11 @@ fn main() {
                 .unwrap();
             let child_pid = child.id();
             let _ = child.wait_with_output();
-            // Print root and child PIDs to root's stdout + flush.
-            // Grandchild PID was already printed by the child process
-            // (child_pid=<grandchild>) to root's stdout via inheritance.
+            // Print root PID and intermediate child PID. Grandchild PID
+            // was already printed by the child process as "child_pid=<...>"
+            // to root's stdout via inheritance. "mid_pid=" avoids ambiguity.
             println!("root_pid={}", process::id());
-            println!("child_pid={child_pid}");
+            println!("mid_pid={child_pid}");
             let _ = io::stdout().flush();
             thread::sleep(Duration::from_secs(60));
         }

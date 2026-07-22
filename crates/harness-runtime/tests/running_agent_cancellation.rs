@@ -137,9 +137,9 @@ fn parse_tree_pids(preview: &str) -> (u32, u32, u32) {
     for line in preview.lines() {
         if let Some(v) = line.strip_prefix("root_pid=") {
             root = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = line.strip_prefix("child_pid=") {
+        } else if let Some(v) = line.strip_prefix("mid_pid=") {
             child = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = line.strip_prefix("grandchild_pid=") {
+        } else if let Some(v) = line.strip_prefix("child_pid=") {
             grandchild = v.trim().parse().unwrap_or(0);
         }
     }
