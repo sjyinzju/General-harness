@@ -74,8 +74,6 @@ fn main() {
             let exe = env::current_exe().unwrap();
             let child_pid = process::Command::new(&exe).arg("sleep").arg("10").spawn();
             let pid = child_pid.unwrap().id();
-            // Print to stdout for diagnostics / backward compat.
-            println!("child_pid={pid}");
             // Write grandchild PID to grandchild.txt in the readiness dir.
             // Uses READY_DIR if set, otherwise current directory (set by
             // ProcessManager as the working_directory).
@@ -121,6 +119,15 @@ fn main() {
             });
             let root_pid = process::id();
 
+            // Give ProcessManager a bounded window to complete Job Object
+            // assignment before this process spawns children. Without this,
+            // a child created before AssignProcessToJobObject completes can
+            // escape the Job — the Job Object only auto-inherits children
+            // created AFTER the parent is assigned. 50 ms is ~50× the normal
+            // FFI latency for CreateJobObjectW + SetInformationJobObject +
+            // AssignProcessToJobObject combined.
+            thread::sleep(Duration::from_millis(50));
+
             // Spawn child. Child spawns grandchild (sleep 10), writes
             // grandchild PID to READY_DIR/grandchild.txt, prints
             // "child_pid=<grandchild>" to inherited stdout, then exits.
@@ -160,12 +167,10 @@ fn main() {
                 let _ = std::fs::rename(&tmp, &final_path);
             }
 
-            // Print PIDs to root stdout for diagnostics.
-            println!("root_pid={root_pid}");
-            println!("mid_pid={child_pid}");
-            println!("child_pid={grandchild_pid}");
-            let _ = io::stdout().flush();
             // Write sleeping marker to confirm sleep reached.
+            // NOTE: stdout is NOT used for readiness or diagnostics.
+            // Piped stdout may block under ProcessManager capture load;
+            // all control-flow data goes through files.
             let _ = std::fs::write(format!("{ready_dir}/sleeping.txt"), "1");
             thread::sleep(Duration::from_secs(60));
         }

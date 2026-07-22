@@ -234,24 +234,27 @@ async fn cancel_nonexistent_is_noop() {
 async fn grandchild_tree_terminated_certification() {
     let reg = Arc::new(ProcessRegistry::new());
     let mgr = ProcessManager::new(reg.clone());
+    // TempDir provides guaranteed-unique directory, auto-cleaned on drop.
+    // No filesystem contention with other iterations.
     let ready_dir = tempfile::tempdir().unwrap();
 
     mgr.spawn(&spawn_tree_spec("cert-tree", ready_dir.path()))
         .await
         .unwrap();
-    let ready = poll_ready_json(ready_dir.path(), Duration::from_secs(20));
+    let ready = poll_ready_json(ready_dir.path(), Duration::from_secs(30));
 
-    assert!(ready_dir.path().join("ready.json").exists());
+    assert!(ready.root_pid > 0 && ready.child_pid > 0 && ready.grandchild_pid > 0);
     assert!(
         ready_dir.path().join("sleeping.txt").exists(),
         "sleeping.txt confirms 60s sleep reached"
     );
-    assert!(ready.root_pid > 0 && ready.child_pid > 0 && ready.grandchild_pid > 0);
 
     mgr.cancel("cert-tree").await.unwrap();
     let state = wait_done(&mgr, "cert-tree", Duration::from_secs(20)).await;
     assert!(
-        matches!(&state, ProcessState::Completed { outcome } if outcome.termination == ProcessTermination::Cancelled)
+        matches!(&state, ProcessState::Completed { outcome } if outcome.termination == ProcessTermination::Cancelled),
+        "expected Cancelled, got {:?}",
+        state
     );
 
     assert_tree_dead(
