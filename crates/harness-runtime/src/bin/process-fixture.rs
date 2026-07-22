@@ -79,10 +79,11 @@ fn main() {
             // Write grandchild PID to grandchild.txt in the readiness dir.
             // Uses READY_DIR if set, otherwise current directory (set by
             // ProcessManager as the working_directory).
-            let rd = env::var("READY_DIR")
-                .unwrap_or_else(|_| env::current_dir()
+            let rd = env::var("READY_DIR").unwrap_or_else(|_| {
+                env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default());
+                    .unwrap_or_default()
+            });
             let _ = std::fs::write(format!("{rd}/grandchild.txt"), pid.to_string());
         }
         "spawn_grandchild" => {
@@ -95,20 +96,24 @@ fn main() {
         }
         "spawn_tree_and_sleep" => {
             // Write startup marker IMMEDIATELY to verify process starts.
-            let start_marker = env::var("READY_DIR")
-                .unwrap_or_else(|_| env::current_dir()
+            let start_marker = env::var("READY_DIR").unwrap_or_else(|_| {
+                env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_default());
-            let _ = std::fs::write(format!("{start_marker}/started.txt"),
-                format!("pid={} time={:?}", process::id(), std::time::Instant::now()));
+                    .unwrap_or_default()
+            });
+            let _ = std::fs::write(
+                format!("{start_marker}/started.txt"),
+                format!("pid={} time={:?}", process::id(), std::time::Instant::now()),
+            );
             // Deterministic readiness via JSON file with atomic rename.
             // READY_DIR env var → ready.json.tmp → fsync → rename → ready.json.
             // Contains root/child/grandchild PIDs.
             let exe = env::current_exe().unwrap();
-            let ready_dir = env::var("READY_DIR")
-                .unwrap_or_else(|_| env::current_dir()
+            let ready_dir = env::var("READY_DIR").unwrap_or_else(|_| {
+                env::current_dir()
                     .map(|p| p.to_string_lossy().to_string())
-                    .unwrap_or_else(|_| env::temp_dir().to_string_lossy().to_string()));
+                    .unwrap_or_else(|_| env::temp_dir().to_string_lossy().to_string())
+            });
             let root_pid = process::id();
 
             // Spawn child. Child spawns grandchild (sleep 10), writes
