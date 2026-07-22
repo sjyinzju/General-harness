@@ -1140,6 +1140,7 @@ async fn c8_schedule_d_old_owner_takeover_old_rejected() {
     let e = env().await;
 
     let counters_old = ReleaseCounters::default();
+    let counters_new = ReleaseCounters::default();
 
     let gate_d = StepGate::with_timeout(
         ReleaseStepKind::ClaimRelease,
@@ -1150,7 +1151,7 @@ async fn c8_schedule_d_old_owner_takeover_old_rejected() {
         .with_counters(counters_old.clone())
         .with_gate(gate_d.clone());
 
-    let rq_old = mkreq("c8d");
+    let rq_old = mkreq("c8d-old");
     let handle_old = tokio::spawn(async move { s_old.finalize(&rq_old).await });
     gate_d.wait_reached().await;
 
@@ -1163,48 +1164,78 @@ async fn c8_schedule_d_old_owner_takeover_old_rejected() {
     gate_d.release();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle_old).await;
 
-    // Old worker: ClaimRelease executed (1 effect), rest blocked.
     let snap_old = counters_old.snapshot();
-    assert_eq!(
-        snap_old[0], 1,
-        "ClaimRelease executed before ownership check"
-    );
-    assert_eq!(snap_old[1], 0, "LeaseRelease blocked by ownership change");
-    assert_eq!(snap_old[2], 0, "HeartbeatUnregister blocked");
-    assert_eq!(snap_old[3], 0, "HandoffRelease blocked");
-    assert_eq!(snap_old[4], 0, "ResourcesReleasedEvent blocked");
-    assert_eq!(snap_old[5], 0, "OperationCompletion blocked");
+    assert_eq!(snap_old[0], 1, "old worker: ClaimRelease executed");
+    assert_eq!(snap_old[1], 0, "old worker: LeaseRelease blocked");
+    assert_eq!(snap_old[2], 0, "old worker: HeartbeatUnregister blocked");
+    assert_eq!(snap_old[3], 0, "old worker: HandoffRelease blocked");
+    assert_eq!(snap_old[4], 0, "old worker: ResourcesReleasedEvent blocked");
+    assert_eq!(snap_old[5], 0, "old worker: OperationCompletion blocked");
 
-    // Operation NOT completed — old worker was REJECTED.
-    let op_lc = op_lifecycle(&e.db.pool).await;
+    let op_lc_old = op_lifecycle(&e.db.pool).await;
     assert_ne!(
-        op_lc, "completed",
-        "old worker rejected (lifecycle={op_lc})"
+        op_lc_old, "completed",
+        "old worker rejected (lifecycle={op_lc_old})"
     );
 
-    // ── Resource invariants after rejection ───────────────────────
-    // ClaimRelease effect DID run → claims released.
-    let cs: (String,) = sqlx::query_as("SELECT status FROM resource_claims WHERE id='c1'")
-        .fetch_one(&e.db.pool)
+    // ── Phase 2: New worker COMPLETES (separate run) ─────────────
+    // Seed a fresh verification run so old worker's DB state doesn't
+    // interfere. Restore shared resources (handoff/lease/claims).
+    sqlx::query(
+        "UPDATE resource_handoffs SET owner_kind='verification', owner_id='verify-run-1', fencing_token=5, version=version+1 WHERE handoff_id='ho-1'",
+    )
+    .execute(&e.db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO verification_runs(run_id,plan_id,plan_hash,plan_version,execution_id,task_id,project_id,lifecycle,idempotency_key,request_hash) VALUES('run-d2','plan-1','ha',1,'e1','t1','p1','running','ik-rd2','hr-rd2')",
+    )
+    .execute(&e.db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-d2','run-d2','step-1','plan-1','passed',datetime('now'))",
+    )
+    .execute(&e.db.pool).await.unwrap();
+    sqlx::query("UPDATE resource_claims SET status='active' WHERE id='c1'")
+        .execute(&e.db.pool)
         .await
         .unwrap();
-    assert_eq!(cs.0, "released", "claim released by old worker");
-
-    // LeaseRelease was BLOCKED → lease still acquired.
-    let ls: (String,) = sqlx::query_as("SELECT lifecycle FROM workspace_leases WHERE id='l1'")
-        .fetch_one(&e.db.pool)
+    sqlx::query("UPDATE workspace_leases SET lifecycle='acquired' WHERE id='l1'")
+        .execute(&e.db.pool)
         .await
         .unwrap();
-    assert_eq!(ls.0, "acquired", "lease retained (not released)");
 
-    // Handoff still verification_owned (scheduler takeover changed owner
-    // but the old worker didn't reach HandoffRelease to release it).
-    // Heartbeat still registered (old worker didn't reach that step).
-    assert!(e.hb.exists("e1").await, "heartbeat not unregistered");
+    let db2 = Database::open(&e.db_path).await.unwrap();
+    let s_new = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
+        .with_counters(counters_new.clone());
+    let mut rq_new = mkreq("c8d-new");
+    rq_new.verification_run_id = "run-d2".into();
+    let r_new = s_new.finalize(&rq_new).await;
+    assert!(
+        matches!(r_new, FinalizationOutcome::Finalized { .. }),
+        "new worker must finalize, got {r_new:?}"
+    );
 
-    // Duplicate run proves exactly-once: even though resources are
-    // partially released, re-running with correct ownership succeeds.
-    // (That path is covered by Schedules A/B/C/E.)
+    let fo_new: (String,) = sqlx::query_as(
+        "SELECT lifecycle FROM verification_finalization_operations WHERE idempotency_key='c8d-new'",
+    )
+    .fetch_one(&db2.pool).await.unwrap();
+    assert_eq!(fo_new.0, "completed", "new worker: operation completed");
+
+    let snap_new = counters_new.snapshot();
+    assert_eq!(
+        snap_new,
+        [1, 1, 1, 1, 1, 1],
+        "new worker: all 6 effects == 1"
+    );
+
+    // DuplicateEffect == 0.
+    let c3 = ReleaseCounters::default();
+    let s3 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
+        .with_counters(c3.clone());
+    let r3 = s3.finalize(&rq_new).await;
+    assert!(
+        matches!(r3, FinalizationOutcome::Duplicate { .. }),
+        "re-finalize must return Duplicate, got {r3:?}"
+    );
+    assert_eq!(c3.snapshot(), [0, 0, 0, 0, 0, 0], "DuplicateEffect == 0");
 }
 
 /// Schedule E: OperationCompletion succeeds → response lost → retry →

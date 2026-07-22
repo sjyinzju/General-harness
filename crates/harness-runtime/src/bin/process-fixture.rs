@@ -73,7 +73,7 @@ fn main() {
         "spawn_child" => {
             let exe = env::current_exe().unwrap();
             let child_pid = process::Command::new(&exe).arg("sleep").arg("10").spawn();
-            println!("child_pid={}", child_pid.unwrap().id());
+            println!("grandchild_pid={}", child_pid.unwrap().id());
         }
         "spawn_grandchild" => {
             let exe = env::current_exe().unwrap();
@@ -84,15 +84,29 @@ fn main() {
             let _ = child.wait_with_output();
         }
         "spawn_tree_and_sleep" => {
-            // Spawn an intermediate that creates an orphaned grandchild
-            // (sleep 10) and exits, then stay alive. Used to verify that
-            // killing the root also kills the orphaned grandchild.
+            // Spawn intermediate that creates an orphaned grandchild (sleep 10)
+            // and exits, then stay alive 60s. The child INHERITS root's stdout,
+            // so its "child_pid=<grandchild_pid>" line goes to the root's stdout
+            // pipe (captured by ProcessManager). The root then prints its own
+            // root_pid and child_pid, then flushes BEFORE sleeping.
+            //
+            // Three PIDs appear in the captured stdout:
+            //   child_pid=<grandchild>   (from spawn_child mode, inherits stdout)
+            //   root_pid=<root>          (from println below)
+            //   child_pid=<child>        (from println below — same prefix, different value)
             let exe = env::current_exe().unwrap();
             let child = process::Command::new(&exe)
                 .arg("spawn_child")
                 .spawn()
                 .unwrap();
+            let child_pid = child.id();
             let _ = child.wait_with_output();
+            // Print root and child PIDs to root's stdout + flush.
+            // Grandchild PID was already printed by the child process
+            // (child_pid=<grandchild>) to root's stdout via inheritance.
+            println!("root_pid={}", process::id());
+            println!("child_pid={child_pid}");
+            let _ = io::stdout().flush();
             thread::sleep(Duration::from_secs(60));
         }
         "ignore_graceful_shutdown" => {
