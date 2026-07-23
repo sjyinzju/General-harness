@@ -12,7 +12,7 @@ param(
     [switch]$Quick  # reduced repeat counts for development
 )
 
-$ErrorActionPreference = "Stop"
+$ErrorActionPreference = "Continue"
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepoRoot = Resolve-Path "$ScriptDir\.."
 $OutputDir = "$RepoRoot\target\i4-5-certification"
@@ -27,7 +27,7 @@ $Results = @()
 
 function Write-Result {
     param($Group, $Test, $RequiredRuns, $ActualRuns, $Passed, $Failed, $ExitCode, $DurationMs, $FirstFailure)
-    $Results += @{
+    $script:Results += [PSCustomObject]@{
         candidate_head = $CandidateHead
         group = $Group
         test = $Test
@@ -58,7 +58,7 @@ function Invoke-CargoTest {
     }
     $sw.Stop()
     Write-Result -Group $Group -Test $TestName -RequiredRuns $Count -ActualRuns ($passed + $failed) `
-        -Passed $passed -Failed $failed -ExitCode (if ($failed -gt 0) { 1 } else { 0 }) `
+        -Passed $passed -Failed $failed -ExitCode $(if ($failed -gt 0) { 1 } else { 0 }) `
         -DurationMs $sw.ElapsedMilliseconds -FirstFailure $firstFailure
     return $failed -eq 0
 }
@@ -69,7 +69,13 @@ function Invoke-SpecificTest {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     for ($i = 1; $i -le $Count; $i++) {
         if ($ExtraArgs) {
-            $output = cargo test -p harness-runtime $ExtraArgs $TestName -- --nocapture 2>&1
+            # Support both array and string forms for backward compat.
+            if ($ExtraArgs -is [array]) {
+                $output = cargo test -p harness-runtime @ExtraArgs $TestName -- --nocapture 2>&1
+            } else {
+                $parts = -split $ExtraArgs
+                $output = cargo test -p harness-runtime @parts $TestName -- --nocapture 2>&1
+            }
         } else {
             $output = cargo test -p harness-runtime --lib -- $TestName --nocapture 2>&1
         }
@@ -83,8 +89,9 @@ function Invoke-SpecificTest {
         }
     }
     $sw.Stop()
+    $exitCode = if ($failed -gt 0) { 1 } else { 0 }
     Write-Result -Group $Group -Test $TestName -RequiredRuns $Count -ActualRuns ($passed + $failed) `
-        -Passed $passed -Failed $failed -ExitCode (if ($failed -gt 0) { 1 } else { 0 }) `
+        -Passed $passed -Failed $failed -ExitCode $exitCode `
         -DurationMs $sw.ElapsedMilliseconds -FirstFailure $firstFailure
     return $failed -eq 0
 }
@@ -100,11 +107,12 @@ $TotalFailed = 0
 if (-not $SkipFmt) {
     Write-Host "=== fmt ===" -ForegroundColor Cyan
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    cargo fmt --all --check 2>&1
+    cargo fmt --all --check 2>&1 | Out-Null
     $ok = ($LASTEXITCODE -eq 0)
     $sw.Stop()
+    $p = if ($ok) { 1 } else { 0 }; $f = if ($ok) { 0 } else { 1 }
     Write-Result -Group "fmt" -Test "cargo fmt --all --check" -RequiredRuns 1 -ActualRuns 1 `
-        -Passed (if ($ok) { 1 } else { 0 }) -Failed (if ($ok) { 0 } else { 1 }) `
+        -Passed $p -Failed $f `
         -ExitCode $LASTEXITCODE -DurationMs $sw.ElapsedMilliseconds
     if (-not $ok) { $AllPassed = $false; Write-Host "FAIL: fmt" -ForegroundColor Red }
     else { Write-Host "PASS: fmt" -ForegroundColor Green }
@@ -116,11 +124,12 @@ if (-not $SkipFmt) {
 if (-not $SkipClippy) {
     Write-Host "=== clippy ===" -ForegroundColor Cyan
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    cargo clippy --workspace --all-targets -- -D warnings 2>&1
+    cargo clippy --workspace --all-targets -- -D warnings 2>&1 | Out-Null
     $ok = ($LASTEXITCODE -eq 0)
     $sw.Stop()
+    $p = if ($ok) { 1 } else { 0 }; $f = if ($ok) { 0 } else { 1 }
     Write-Result -Group "clippy" -Test "cargo clippy --workspace --all-targets -- -D warnings" -RequiredRuns 1 -ActualRuns 1 `
-        -Passed (if ($ok) { 1 } else { 0 }) -Failed (if ($ok) { 0 } else { 1 }) `
+        -Passed $p -Failed $f `
         -ExitCode $LASTEXITCODE -DurationMs $sw.ElapsedMilliseconds
     if (-not $ok) { $AllPassed = $false; Write-Host "FAIL: clippy" -ForegroundColor Red }
     else { Write-Host "PASS: clippy" -ForegroundColor Green }
@@ -155,62 +164,71 @@ foreach ($fc in $faultCases) {
     if ($LASTEXITCODE -ne 0) { $fc_failed++ }
 }
 $sw.Stop()
+$fcExit = if ($fc_failed -gt 0) { 1 } else { 0 }
 Write-Result -Group "fault_cases" -Test "all 30 fault cases" -RequiredRuns 30 -ActualRuns 30 `
-    -Passed (30 - $fc_failed) -Failed $fc_failed -ExitCode (if ($fc_failed -gt 0) { 1 } else { 0 }) `
+    -Passed (30 - $fc_failed) -Failed $fc_failed -ExitCode $fcExit `
     -DurationMs $sw.ElapsedMilliseconds
 $TotalTests += 30; $TotalPassed += (30 - $fc_failed); $TotalFailed += $fc_failed
 if ($fc_failed -gt 0) { $AllPassed = $false; Write-Host "FAIL: $fc_failed fault cases failed" -ForegroundColor Red }
 else { Write-Host "PASS: 30/30 fault cases" -ForegroundColor Green }
 
 # ═══════════════════════════════════════════════════════════════════════
-# 4. Certification Scenarios (27)
+# 4. Certification Scenarios (27) — each run individually
 # ═══════════════════════════════════════════════════════════════════════
-$scenarioTests = @(
-    "test_gp01_first_attempt_passes", "test_gp02_one_repair_then_pass",
-    "test_gp03_progressive_repairs_budget_allows", "test_gp04_no_progress_stop",
-    "test_gp05_cycle_detection", "test_gp06_hard_attempt_budget",
-    "test_gp07_unknown_token_usage", "test_gp08_hard_token_budget",
-    "test_gp09_hard_tool_call_budget", "test_gp10_hard_cost_budget",
-    "test_gp11_infrastructure_blocked", "test_gp12_reconciliation_required",
-    "test_gp13_awaiting_human", "test_gp14_project_escalation",
-    "test_gp15_cancellation_classification", "test_gp16_cancellation_overrides",
-    "test_gp23_two_pool_full_controller", "test_gp26_profile_selection_all_scenarios",
-    "test_gp27_context_security"
+$allScenarios = @(
+    @{id="gp01"; test="test_gp01_first_attempt_passes";                 binary="task_loop_fault_tests"},
+    @{id="gp02"; test="test_gp02_one_repair_then_pass";                  binary="task_loop_fault_tests"},
+    @{id="gp03"; test="test_gp03_progressive_repairs_budget_allows";     binary="task_loop_fault_tests"},
+    @{id="gp04"; test="test_gp04_no_progress_stop";                      binary="task_loop_fault_tests"},
+    @{id="gp05"; test="test_gp05_cycle_detection";                       binary="task_loop_fault_tests"},
+    @{id="gp06"; test="test_gp06_hard_attempt_budget";                   binary="task_loop_fault_tests"},
+    @{id="gp07"; test="test_gp07_unknown_token_usage";                   binary="task_loop_fault_tests"},
+    @{id="gp08"; test="test_gp08_hard_token_budget";                    binary="task_loop_fault_tests"},
+    @{id="gp09"; test="test_gp09_hard_tool_call_budget";                binary="task_loop_fault_tests"},
+    @{id="gp10"; test="test_gp10_hard_cost_budget";                     binary="task_loop_fault_tests"},
+    @{id="gp11"; test="test_gp11_infrastructure_blocked";                binary="task_loop_fault_tests"},
+    @{id="gp12"; test="test_gp12_reconciliation_required";               binary="task_loop_fault_tests"},
+    @{id="gp13"; test="test_gp13_awaiting_human";                       binary="task_loop_fault_tests"},
+    @{id="gp14"; test="test_gp14_project_escalation";                   binary="task_loop_fault_tests"},
+    @{id="gp15"; test="test_gp15_cancellation_classification";           binary="task_loop_fault_tests"},
+    @{id="gp16"; test="test_gp16_cancellation_overrides";               binary="task_loop_fault_tests"},
+    @{id="gp23"; test="test_gp23_two_pool_full_controller";            binary="task_loop_fault_tests"},
+    @{id="gp26"; test="test_gp26_profile_selection_all_scenarios";      binary="task_loop_fault_tests"},
+    @{id="gp27"; test="test_gp27_context_security";                    binary="task_loop_fault_tests"},
+    @{id="ri01"; test="test_real_i4_first_attempt_pass";                binary="real_i4_e2e_tests"},
+    @{id="ri02"; test="test_real_i4_repair_then_pass";                  binary="real_i4_e2e_tests"},
+    @{id="ri03"; test="test_real_i4_crash_restart";                     binary="real_i4_e2e_tests"},
+    @{id="ri04"; test="test_real_i4_workspace_continuation";            binary="real_i4_e2e_tests"},
+    @{id="ri05"; test="test_real_i4_two_pool_full_lifecycle";           binary="real_i4_e2e_tests"},
+    @{id="ii01"; test="test_first_attempt_passes";                      binary="task_loop_i4_integration"},
+    @{id="ii02"; test="test_one_repair_then_pass";                      binary="task_loop_i4_integration"},
+    @{id="ii03"; test="test_two_pool_full_lifecycle_one_winner";        binary="task_loop_i4_integration"}
 )
 
-Write-Host "=== Scenarios ===" -ForegroundColor Cyan
-$sc_ok = Invoke-SpecificTest -TestName "" -Count 1 -Group "scenarios" `
-    -ExtraArgs "--test task_loop_fault_tests"
-if (-not $sc_ok) { $AllPassed = $false }
-
-# Also run the real I4 E2E scenarios
-$realI4Tests = @(
-    "test_real_i4_first_attempt_pass", "test_real_i4_repair_then_pass",
-    "test_real_i4_crash_restart", "test_real_i4_workspace_continuation",
-    "test_real_i4_two_pool_full_lifecycle"
-)
-Write-Host "=== Real I4 E2E Scenarios ===" -ForegroundColor Cyan
-$sw = [System.Diagnostics.Stopwatch]::StartNew()
-$rie4_failed = 0
-foreach ($t in $realI4Tests) {
-    $output = cargo test -p harness-runtime --test real_i4_e2e_tests $t -- --nocapture 2>&1
-    if ($LASTEXITCODE -ne 0) { $rie4_failed++ }
+Write-Host "=== Scenarios (27 individual) ===" -ForegroundColor Cyan
+$scPassed = 0; $scFailed = 0; $scFirstFailure = ""
+$scSw = [System.Diagnostics.Stopwatch]::StartNew()
+foreach ($s in $allScenarios) {
+    $output = cargo test -p harness-runtime --test $s.binary $s.test -- --nocapture 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        $scPassed++
+    } else {
+        $scFailed++
+        if (-not $scFirstFailure) {
+            $scFirstFailure = "$($s.id): $($output | Select-Object -Last 3 | Out-String)"
+        }
+    }
 }
-$sw.Stop()
-Write-Result -Group "real_i4_scenarios" -Test "all 5 real I4 E2E" -RequiredRuns 5 -ActualRuns 5 `
-    -Passed (5 - $rie4_failed) -Failed $rie4_failed -ExitCode (if ($rie4_failed -gt 0) { 1 } else { 0 }) `
-    -DurationMs $sw.ElapsedMilliseconds
-if ($rie4_failed -gt 0) { $AllPassed = $false }
-
-# Additional scenario tests from integration files
-Write-Host "=== Scenario Integration Tests ===" -ForegroundColor Cyan
-$sc_int_ok = Invoke-SpecificTest -TestName "" -Count 1 -Group "scenario_integration" `
-    -ExtraArgs "--test task_loop_i4_integration"
-if (-not $sc_int_ok) { $AllPassed = $false }
-
-# Verdict: 27 scenarios
-Write-Result -Group "scenarios_summary" -Test "all 27 certification scenarios" -RequiredRuns 27 -ActualRuns 27 `
-    -Passed 27 -Failed 0 -ExitCode 0 -DurationMs 0
+$scSw.Stop()
+$scExit = if ($scFailed -gt 0) { 1 } else { 0 }
+Write-Result -Group "certification_scenarios" -Test "all 27 scenarios" `
+    -RequiredRuns 27 -ActualRuns ($scPassed + $scFailed) `
+    -Passed $scPassed -Failed $scFailed `
+    -ExitCode $scExit `
+    -DurationMs $scSw.ElapsedMilliseconds -FirstFailure $scFirstFailure
+$TotalTests += 27; $TotalPassed += $scPassed; $TotalFailed += $scFailed
+if ($scFailed -gt 0) { $AllPassed = $false; Write-Host "FAIL: $scFailed scenarios failed" -ForegroundColor Red }
+else { Write-Host "PASS: 27/27 scenarios" -ForegroundColor Green }
 
 # ═══════════════════════════════════════════════════════════════════════
 # 5. Repeat Groups (18)
@@ -249,13 +267,13 @@ foreach ($rg in $repeatGroups) {
 }
 
 # ═══════════════════════════════════════════════════════════════════════
-# 6. C8 Schedules (5 × 100)
+# 6. C8 Schedules (5 x 100)
 # ═══════════════════════════════════════════════════════════════════════
 if ($Quick) {
     Write-Host "=== C8 Schedules (QUICK MODE — 1 each) ===" -ForegroundColor Yellow
     $c8Count = 1
 } else {
-    Write-Host "=== C8 Schedules (5 × 100) ===" -ForegroundColor Cyan
+    Write-Host "=== C8 Schedules (5 x 100) ===" -ForegroundColor Cyan
     $c8Count = 100
 }
 
@@ -279,7 +297,7 @@ if ($Quick) {
     Write-Host "=== Crash Prefix (QUICK MODE — 1 each) ===" -ForegroundColor Yellow
     $cpCount = 1
 } else {
-    Write-Host "=== Crash Prefix (8 × 50) ===" -ForegroundColor Cyan
+    Write-Host "=== Crash Prefix (8 x 50) ===" -ForegroundColor Cyan
     $cpCount = 50
 }
 
@@ -320,11 +338,12 @@ Write-Host "=== Workspace Runs (3) ===" -ForegroundColor Cyan
 for ($run = 1; $run -le 3; $run++) {
     Write-Host "--- Run $run/3 ---" -ForegroundColor Yellow
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    cargo test --workspace 2>&1
+    cargo test --workspace 2>&1 | Out-Null
     $ok = ($LASTEXITCODE -eq 0)
     $sw.Stop()
+    $wp = if ($ok) { 1 } else { 0 }; $wf = if ($ok) { 0 } else { 1 }
     Write-Result -Group "workspace" -Test "cargo test --workspace (run $run)" -RequiredRuns 3 -ActualRuns $run `
-        -Passed (if ($ok) { 1 } else { 0 }) -Failed (if ($ok) { 0 } else { 1 }) `
+        -Passed $wp -Failed $wf `
         -ExitCode $LASTEXITCODE -DurationMs $sw.ElapsedMilliseconds
     if (-not $ok) {
         $AllPassed = $false
@@ -374,7 +393,7 @@ $mdSummary += @"
 
 "@
 foreach ($r in $Results) {
-    $status = if ($r.failed -eq 0) { "✅" } else { "❌" }
+    $status = if ($r.failed -eq 0) { "[PASS]" } else { "[FAIL]" }
     $mdSummary += "- $status **$($r.group)** / $($r.test): $($r.passed)/$($r.required_runs) passed"
     if ($r.first_failure) {
         $mdSummary += " (first failure: $($r.first_failure.Substring(0, [Math]::Min(120, $r.first_failure.Length))))"

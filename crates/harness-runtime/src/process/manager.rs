@@ -144,23 +144,46 @@ impl ProcessManager {
             "process_tree_guard_attached"
         );
 
-        // I4.5 structural fix: now that the Job Object is assigned, resume
-        // the primary thread. The process begins executing user code only
-        // after this point — already contained by the Job.
+        // I4.5 structural fix: on Windows the process was created with
+        // CREATE_SUSPENDED so it cannot execute user code before Job
+        // assignment.  Per ADR-007 Contract B (Degraded Fallback):
+        //
+        //   - Resume unconditionally — the process MUST be resumed.
+        //   - If Job creation succeeded → Job containment.
+        //   - If Job creation failed → taskkill /T /F fallback
+        //     (ProcessTreeGuard already handles both paths).
+        //   - Resume failure → kill + return error (no orphan).
         #[cfg(windows)]
-        if tree_guard.job_object_active() {
-            if let Err(e) = super::job_object::resume_suspended_process(pid) {
-                // If resume fails, the process is stuck suspended. Kill it
-                // via the job and return an error.
-                tracing::error!(pid, error = %e, "resume_suspended_process_failed");
-                tree_guard.kill_tree();
-                return Err(CoreError::new(
-                    ErrorCode::ProcessSpawnFailed,
-                    format!("resume suspended process {pid}: {e}"),
-                    ErrorSource::System,
-                ));
+        {
+            match super::job_object::resume_suspended_process(pid) {
+                Ok(()) => {
+                    if tree_guard.job_object_active() {
+                        tracing::debug!(pid, "process_resumed_with_job_containment");
+                    } else {
+                        tracing::warn!(
+                            pid,
+                            "job_unavailable_process_resumed_with_taskkill_fallback"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Resume failed — the process cannot execute.  Kill it
+                    // (via Job if available, else taskkill) and return error.
+                    // No ProcessHandle is returned → no orphan.
+                    tracing::error!(pid, error = %e, "resume_suspended_process_failed");
+                    tree_guard.kill_tree();
+                    // Bounded wait to confirm the process is dead before
+                    // returning (TerminateJobObject is synchronous, but
+                    // taskkill fallback benefits from the wait).
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+                    return Err(CoreError::new(
+                        ErrorCode::ProcessSpawnFailed,
+                        format!("resume suspended process {pid}: {e}"),
+                        ErrorSource::System,
+                    ));
+                }
             }
-            tracing::debug!(pid, "process_resumed_after_job_assignment");
         }
 
         // Independent capture pipelines per stream.
