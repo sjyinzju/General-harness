@@ -107,9 +107,16 @@ fn main() {
                 format!("{start_marker}/started.txt"),
                 format!("pid={} time={:?}", process::id(), std::time::Instant::now()),
             );
-            // Deterministic readiness via JSON file with atomic rename.
-            // READY_DIR env var → ready.json.tmp → fsync → rename → ready.json.
-            // Contains root/child/grandchild PIDs.
+
+            // ── I4.5 structural fix ──────────────────────────────
+            // No more 50ms sleep! The ProcessManager now creates this
+            // process with CREATE_SUSPENDED and resumes it only AFTER
+            // Job Object assignment is complete. Children created here
+            // are born directly into the Job — no escape window.
+            //
+            // Previously: thread::sleep(Duration::from_millis(50));
+            // This was a race mitigation, not a structural fix.
+
             let exe = env::current_exe().unwrap();
             let ready_dir = env::var("READY_DIR").unwrap_or_else(|_| {
                 env::current_dir()
@@ -118,18 +125,10 @@ fn main() {
             });
             let root_pid = process::id();
 
-            // Give ProcessManager a bounded window to complete Job Object
-            // assignment before this process spawns children. Without this,
-            // a child created before AssignProcessToJobObject completes can
-            // escape the Job — the Job Object only auto-inherits children
-            // created AFTER the parent is assigned. 50 ms is ~50× the normal
-            // FFI latency for CreateJobObjectW + SetInformationJobObject +
-            // AssignProcessToJobObject combined.
-            thread::sleep(Duration::from_millis(50));
-
             // Spawn child. Child spawns grandchild (sleep 10), writes
             // grandchild PID to READY_DIR/grandchild.txt, prints
             // "child_pid=<grandchild>" to inherited stdout, then exits.
+            // No delay before spawning — the Job Object is already assigned.
             let mut child = process::Command::new(&exe)
                 .arg("spawn_child")
                 .spawn()
@@ -144,18 +143,44 @@ fn main() {
                 .and_then(|s| s.trim().parse::<u32>().ok())
                 .unwrap_or(0);
 
-            // Write ready.json with atomic rename.
+            // ── I4.5 TCP readiness channel ──────────────────────
+            // Primary control protocol: connect to the test's TCP
+            // listener, send structured TreeReady JSON, disconnect.
+            // The test blocks on accept() — no polling, no race.
+            let run_id = env::var("READY_RUN_ID").unwrap_or_else(|_| {
+                ready_dir
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
             let ready_json = format!(
                 concat!(
                     r#"{{"run_id":"{}","root_pid":{},"#,
                     r#""child_pid":{},"grandchild_pid":{},"#,
                     r#""tree_ready":true}}"#
                 ),
-                ready_dir.rsplit(['\\', '/']).next().unwrap_or("unknown"),
-                root_pid,
-                child_pid,
-                grandchild_pid,
+                run_id, root_pid, child_pid, grandchild_pid,
             );
+
+            // TCP readiness (primary): send to test's listener.
+            if let Ok(port_str) = env::var("READY_TCP_PORT") {
+                if let Ok(port) = port_str.parse::<u16>() {
+                    use std::io::Write;
+                    use std::net::TcpStream;
+                    let addr = format!("127.0.0.1:{port}");
+                    if let Ok(mut stream) = TcpStream::connect(&addr) {
+                        let _ = stream.write_all(ready_json.as_bytes());
+                        let _ = stream.flush();
+                        // Don't close immediately — let the test read.
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+
+            // Diagnostic backup: atomic file-based ready.json.
+            // NOT used as primary readiness signal — only for post-mortem
+            // diagnostics. The test uses TCP, not file polling.
             let tmp = format!("{ready_dir}/ready.json.tmp");
             let final_path = format!("{ready_dir}/ready.json");
             if let Ok(mut f) = std::fs::File::create(&tmp) {
@@ -167,9 +192,6 @@ fn main() {
             }
 
             // Write sleeping marker to confirm sleep reached.
-            // NOTE: stdout is NOT used for readiness or diagnostics.
-            // Piped stdout may block under ProcessManager capture load;
-            // all control-flow data goes through files.
             let _ = std::fs::write(format!("{ready_dir}/sleeping.txt"), "1");
             thread::sleep(Duration::from_secs(60));
         }
