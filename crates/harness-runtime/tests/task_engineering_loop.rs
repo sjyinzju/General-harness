@@ -319,6 +319,7 @@ async fn test_decision_complete_candidate() {
         dossier_fingerprint_valid: true,
         process_inactive: true,
         process_state_known: true,
+        process_termination_confirmed: true,
         reconciliation_clear: true,
         workspace_valid: true,
         ownership_valid: true,

@@ -21,20 +21,58 @@ $SummaryFile = "$OutputDir\summary.md"
 
 New-Item -ItemType Directory -Force -Path $OutputDir | Out-Null
 
-$CandidateHead = (git -C $RepoRoot rev-parse HEAD)
+$ExecutionHead = (git -C $RepoRoot rev-parse HEAD)
+# CODE_CANDIDATE_HEAD is the frozen implementation commit. It MUST differ
+# from REPORT_HEAD.  The runner reads it from the I4.5 final certification
+# report or falls back to the env var / git tag.
+$CodeCandidateHead = if ($env:I45_CODE_CANDIDATE_HEAD) {
+    $env:I45_CODE_CANDIDATE_HEAD
+} else {
+    # Fallback: use the parent of REPORT_HEAD if REPORT_HEAD only modified
+    # I4.5_FINAL_CERTIFICATION_REPORT.md; otherwise equals execution HEAD.
+    $reportDiff = git -C $RepoRoot diff --name-only HEAD~1 HEAD 2>$null
+    if ($reportDiff -eq "I4.5_FINAL_CERTIFICATION_REPORT.md") {
+        (git -C $RepoRoot rev-parse HEAD~1)
+    } else {
+        $ExecutionHead
+    }
+}
 $StartTime = Get-Date
 $Results = @()
 
 function Write-Result {
     param($Group, $Test, $RequiredRuns, $ActualRuns, $Passed, $Failed, $ExitCode, $DurationMs, $FirstFailure)
     $script:Results += [PSCustomObject]@{
-        candidate_head = $CandidateHead
+        code_candidate_head = $CodeCandidateHead
+        execution_head = $ExecutionHead
         group = $Group
         test = $Test
         required_runs = $RequiredRuns
         actual_runs = $ActualRuns
         passed = $Passed
         failed = $Failed
+        skipped = 0
+        exit_code = $ExitCode
+        duration_ms = $DurationMs
+        first_failure = if ($FirstFailure) { $FirstFailure } else { "" }
+    }
+}
+
+function Write-ScenarioResult {
+    param($ScenarioId, $TestName, $Binary, $Passed, $Failed, $ExitCode, $DurationMs, $FirstFailure)
+    $script:Results += [PSCustomObject]@{
+        code_candidate_head = $CodeCandidateHead
+        execution_head = $ExecutionHead
+        group = "scenario"
+        category = "scenario"
+        scenario_id = $ScenarioId
+        test_target = $Binary
+        test_name = $TestName
+        required_runs = 1
+        actual_runs = 1
+        passed = $Passed
+        failed = $Failed
+        skipped = 0
         exit_code = $ExitCode
         duration_ms = $DurationMs
         first_failure = if ($FirstFailure) { $FirstFailure } else { "" }
@@ -209,23 +247,30 @@ Write-Host "=== Scenarios (27 individual) ===" -ForegroundColor Cyan
 $scPassed = 0; $scFailed = 0; $scFirstFailure = ""
 $scSw = [System.Diagnostics.Stopwatch]::StartNew()
 foreach ($s in $allScenarios) {
+    $sSw = [System.Diagnostics.Stopwatch]::StartNew()
     $output = cargo test -p harness-runtime --test $s.binary $s.test -- --nocapture 2>&1
-    if ($LASTEXITCODE -eq 0) {
+    $sSw.Stop()
+    $sOk = ($LASTEXITCODE -eq 0)
+    $sFailFirst = ""
+    if ($sOk) {
         $scPassed++
     } else {
         $scFailed++
+        $sFailFirst = "$($s.id): $($output | Select-Object -Last 3 | Out-String)"
         if (-not $scFirstFailure) {
-            $scFirstFailure = "$($s.id): $($output | Select-Object -Last 3 | Out-String)"
+            $scFirstFailure = $sFailFirst
         }
     }
+    Write-ScenarioResult -ScenarioId $s.id -TestName $s.test -Binary $s.binary `
+        -Passed $(if ($sOk) { 1 } else { 0 }) `
+        -Failed $(if ($sOk) { 0 } else { 1 }) `
+        -ExitCode $(if ($sOk) { 0 } else { 1 }) `
+        -DurationMs $sSw.ElapsedMilliseconds `
+        -FirstFailure $sFailFirst
 }
 $scSw.Stop()
 $scExit = if ($scFailed -gt 0) { 1 } else { 0 }
-Write-Result -Group "certification_scenarios" -Test "all 27 scenarios" `
-    -RequiredRuns 27 -ActualRuns ($scPassed + $scFailed) `
-    -Passed $scPassed -Failed $scFailed `
-    -ExitCode $scExit `
-    -DurationMs $scSw.ElapsedMilliseconds -FirstFailure $scFirstFailure
+# Total from 27 individual detail rows (no separate summary row — no double counting).
 $TotalTests += 27; $TotalPassed += $scPassed; $TotalFailed += $scFailed
 if ($scFailed -gt 0) { $AllPassed = $false; Write-Host "FAIL: $scFailed scenarios failed" -ForegroundColor Red }
 else { Write-Host "PASS: 27/27 scenarios" -ForegroundColor Green }
@@ -356,8 +401,12 @@ for ($run = 1; $run -le 3; $run++) {
 # ═══════════════════════════════════════════════════════════════════════
 # Output results
 # ═══════════════════════════════════════════════════════════════════════
+$reportOnlyDiff = (git -C $RepoRoot diff --name-only $CodeCandidateHead $ExecutionHead 2>$null)
+$reportOnlyVerified = ($reportOnlyDiff -eq "I4.5_FINAL_CERTIFICATION_REPORT.md") -or ($CodeCandidateHead -eq $ExecutionHead)
 $resultsJson = @{
-    candidate_head = $CandidateHead
+    code_candidate_head = $CodeCandidateHead
+    execution_head = $ExecutionHead
+    report_only_diff_verified = $reportOnlyVerified
     completed_at = (Get-Date -Format "o")
     total_duration_ms = ((Get-Date) - $StartTime).TotalMilliseconds
     all_passed = $AllPassed
@@ -370,7 +419,9 @@ $resultsJson | Set-Content -Path $ResultsFile -Encoding UTF8
 $mdSummary = @"
 # I4.5 Certification Results
 
-**Candidate HEAD:** `$CandidateHead`
+**Code Candidate HEAD:** `$CodeCandidateHead`
+**Execution HEAD:** `$ExecutionHead`
+**Report-only diff verified:** $reportOnlyVerified
 **Completed:** $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")
 **Overall:** $(if ($AllPassed) { "**PASS**" } else { "**FAIL**" })
 

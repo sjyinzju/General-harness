@@ -208,6 +208,11 @@ pub struct CompletionEligibility {
     /// execution has no recorded step operations — its process state is
     /// UNKNOWN and MUST NOT be treated as safe/inactive.
     pub process_state_known: bool,
+    /// True when no step operation has status='process_unknown'.
+    /// When false, process termination was attempted but could not be
+    /// confirmed — the OS may still be running the process tree.
+    /// Completion MUST be blocked.
+    pub process_termination_confirmed: bool,
     pub reconciliation_clear: bool,
     pub workspace_valid: bool,
     pub ownership_valid: bool,
@@ -224,6 +229,7 @@ impl CompletionEligibility {
             && self.dossier_fingerprint_valid
             && self.process_inactive
             && self.process_state_known
+            && self.process_termination_confirmed
             && self.reconciliation_clear
             && self.workspace_valid
             && self.ownership_valid
@@ -255,6 +261,9 @@ impl CompletionEligibility {
         }
         if !self.process_state_known {
             gates.push("process_state_known");
+        }
+        if !self.process_termination_confirmed {
+            gates.push("process_termination_confirmed");
         }
         if !self.reconciliation_clear {
             gates.push("reconciliation_clear");
@@ -354,6 +363,18 @@ pub async fn validate_completion_eligibility(
     eligibility.process_inactive = proc_running.0 == 0;
     // Process state UNKNOWN (no rows at all) → NOT safe — blocks completion.
     eligibility.process_state_known = proc_total.0 > 0;
+
+    // Process termination confirmed: any step operation with status
+    // 'process_unknown' means termination was attempted but could not
+    // be confirmed — the OS may still be running the process tree.
+    let proc_unknown: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM verification_step_operations WHERE execution_id=? AND status='process_unknown'",
+    )
+    .bind(execution_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("eligibility proc unknown query: {e}"))?;
+    eligibility.process_termination_confirmed = proc_unknown.0 == 0;
 
     // 4. No reconciliation required.
     let rec_count: (i64,) = sqlx::query_as(

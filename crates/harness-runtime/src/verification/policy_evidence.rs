@@ -924,6 +924,7 @@ impl VerificationPolicyEvidenceService {
             VerificationStepStatus::Blocked => "policy_blocked",
             VerificationStepStatus::Error => "policy_error",
             VerificationStepStatus::Skipped => "policy_skipped",
+            VerificationStepStatus::ProcessUnknown => "process_unknown",
         };
         let eid = format!("evt-policy-terminal-{}", Uuid::new_v4());
         let ikey = format!("policy-ev-{}-{}", req.step_id, event_type);
@@ -1217,6 +1218,7 @@ fn step_status_key(s: &VerificationStepStatus) -> &'static str {
         VerificationStepStatus::Blocked => "blocked",
         VerificationStepStatus::Skipped => "skipped",
         VerificationStepStatus::Error => "error",
+        VerificationStepStatus::ProcessUnknown => "process_unknown",
     }
 }
 

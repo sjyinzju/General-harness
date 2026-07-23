@@ -18,7 +18,7 @@ use tokio::sync::RwLock;
 use tokio::time::timeout as tokio_timeout;
 
 use super::capture::{spawn_stream_capture, StreamCaptureConfig, StreamCaptureHandle};
-use super::job_object::ProcessTreeGuard;
+use super::job_object::{ProcessTreeGuard, ProcessTreeTermination};
 use super::redactor::ProcessEventRedactor;
 use super::registry::ProcessRegistry;
 use super::types::*;
@@ -238,22 +238,51 @@ impl ProcessManager {
                 Timeout,
                 Cancelled,
                 WaitFailed,
+                /// Termination could not be confirmed — the OS may still be
+                /// running the process tree.  Maps to ProcessUnknown.
+                ProcessUnknown {
+                    reason: String,
+                },
             }
 
             let end = tokio::select! {
                 _ = cancel2.cancelled() => {
-                    tree_guard.kill_tree();
+                    let term = tree_guard.kill_tree();
                     let _ = tokio_timeout(reap_timeout, child.wait()).await;
-                    End::Cancelled
+                    match term {
+                        ProcessTreeTermination::Confirmed { .. } | ProcessTreeTermination::AlreadyExited => {
+                            End::Cancelled
+                        }
+                        ProcessTreeTermination::Unconfirmed { job_error, fallback_error } => {
+                            let reason = format!(
+                                "cancel: termination unconfirmed; job_error={:?}, fallback_error={:?}",
+                                job_error, fallback_error
+                            );
+                            tracing::error!(pid, execution_id = %execution_id, "{}", reason);
+                            End::ProcessUnknown { reason }
+                        }
+                    }
                 }
                 result = tokio_timeout(timeout_dur, child.wait()) => {
                     match result {
                         Ok(Ok(status)) => End::Natural(status),
                         Ok(Err(_e)) => End::WaitFailed,
                         Err(_elapsed) => {
-                            tree_guard.kill_tree();
+                            let term = tree_guard.kill_tree();
                             let _ = tokio_timeout(reap_timeout, child.wait()).await;
-                            End::Timeout
+                            match term {
+                                ProcessTreeTermination::Confirmed { .. } | ProcessTreeTermination::AlreadyExited => {
+                                    End::Timeout
+                                }
+                                ProcessTreeTermination::Unconfirmed { job_error, fallback_error } => {
+                                    let reason = format!(
+                                        "timeout: termination unconfirmed; job_error={:?}, fallback_error={:?}",
+                                        job_error, fallback_error
+                                    );
+                                    tracing::error!(pid, execution_id = %execution_id, "{}", reason);
+                                    End::ProcessUnknown { reason }
+                                }
+                            }
                         }
                     }
                 }
@@ -290,6 +319,11 @@ impl ProcessManager {
                 End::Cancelled => {
                     ProcessOutcome::skeleton(ProcessTermination::Cancelled, None, duration_ms)
                 }
+                End::ProcessUnknown { reason } => ProcessOutcome::skeleton(
+                    ProcessTermination::ProcessUnknown { reason },
+                    None,
+                    duration_ms,
+                ),
                 End::WaitFailed => {
                     ProcessOutcome::skeleton(ProcessTermination::Lost, None, duration_ms)
                 }

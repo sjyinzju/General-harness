@@ -33,6 +33,10 @@ pub struct ProcessResult {
     pub stderr_preview: Option<String>,
     pub timed_out: bool,
     pub terminated: bool,
+    /// True when process termination could not be confirmed — the OS may
+    /// still be running the process tree.  MUST block completion.
+    pub process_unknown: bool,
+    pub process_unknown_reason: Option<String>,
 }
 
 // ── Step execution request ────────────────────────────────────────────
@@ -171,6 +175,8 @@ impl ProcessExecutor for ProcessManagerAdapter {
                     stderr_preview: None,
                     timed_out: false,
                     terminated: false,
+                    process_unknown: false,
+                    process_unknown_reason: None,
                 }
             }
         };
@@ -179,6 +185,12 @@ impl ProcessExecutor for ProcessManagerAdapter {
             match state {
                 ProcessState::Completed { outcome } => {
                     let ms = start.elapsed().as_millis() as u64;
+                    let (is_unknown, unknown_reason) = match &outcome.termination {
+                        ProcessTermination::ProcessUnknown { reason } => {
+                            (true, Some(reason.clone()))
+                        }
+                        _ => (false, None),
+                    };
                     return ProcessResult {
                         exit_code: outcome.exit_code.unwrap_or(-1),
                         duration_ms: ms,
@@ -186,6 +198,8 @@ impl ProcessExecutor for ProcessManagerAdapter {
                         stderr_preview: outcome.stderr_preview,
                         timed_out: outcome.termination == ProcessTermination::Timeout,
                         terminated: true,
+                        process_unknown: is_unknown,
+                        process_unknown_reason: unknown_reason,
                     };
                 }
                 ProcessState::Starting | ProcessState::Running => {
@@ -197,6 +211,8 @@ impl ProcessExecutor for ProcessManagerAdapter {
                             stderr_preview: None,
                             timed_out: true,
                             terminated: false,
+                            process_unknown: false,
+                            process_unknown_reason: None,
                         };
                     }
                     tokio::time::sleep(Duration::from_millis(50)).await;
@@ -249,6 +265,8 @@ impl ProcessExecutor for FakeProcessExecutor {
                 stderr_preview: None,
                 timed_out: false,
                 terminated: false,
+                process_unknown: false,
+                process_unknown_reason: None,
             };
         }
         if self.hang_forever.load(Ordering::SeqCst) {
@@ -260,6 +278,8 @@ impl ProcessExecutor for FakeProcessExecutor {
                 stderr_preview: None,
                 timed_out: true,
                 terminated: false,
+                process_unknown: false,
+                process_unknown_reason: None,
             };
         }
         let ec = *self.exit_code.lock().unwrap();
@@ -280,6 +300,8 @@ impl ProcessExecutor for FakeProcessExecutor {
                 Some(stderr)
             },
             timed_out: false,
+            process_unknown: false,
+            process_unknown_reason: None,
         }
     }
 }
@@ -388,7 +410,11 @@ impl VerificationExecutionService {
         let exit_code = result.exit_code;
 
         // ── 4. Classify ─────────────────────────────────────────────
-        let (status, _fc) = classify(exit_code, &req.step_kind, result.timed_out, req.timeout);
+        let (status, _fc) = if result.process_unknown {
+            (VerificationStepStatus::ProcessUnknown, None)
+        } else {
+            classify(exit_code, &req.step_kind, result.timed_out, req.timeout)
+        };
 
         // ── 5. Validate output ──────────────────────────────────────
         if let Some(ref out) = result.stdout_preview {
@@ -755,6 +781,7 @@ fn status_to_str(s: &VerificationStepStatus) -> &'static str {
         VerificationStepStatus::Blocked => "blocked",
         VerificationStepStatus::Error => "error",
         VerificationStepStatus::Skipped => "skipped",
+        VerificationStepStatus::ProcessUnknown => "process_unknown",
     }
 }
 
@@ -765,6 +792,7 @@ fn terminal_event_type(s: &VerificationStepStatus) -> &'static str {
         VerificationStepStatus::Blocked => "policy_blocked",
         VerificationStepStatus::Error => "infrastructure_error",
         VerificationStepStatus::Skipped => "cancelled",
+        VerificationStepStatus::ProcessUnknown => "process_unknown",
     }
 }
 
