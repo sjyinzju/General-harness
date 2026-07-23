@@ -174,7 +174,9 @@ impl VerificationOutcomeAggregator {
                     let sr = matching[0];
                     if matches!(
                         sr.status,
-                        VerificationStepStatus::Skipped | VerificationStepStatus::Error
+                        VerificationStepStatus::Skipped
+                            | VerificationStepStatus::Error
+                            | VerificationStepStatus::ProcessUnknown
                     ) {
                         return Ok(Self::blocked(
                             run_id,
@@ -197,16 +199,19 @@ impl VerificationOutcomeAggregator {
             }
         }
 
-        // Any Error result — required or not — blocks finalization
-        // (conservative: an errored check proves nothing).
+        // Any Error or ProcessUnknown result — required or not — blocks
+        // finalization (conservative: an errored or unknown-process check
+        // proves nothing safe).
         for sr in step_results {
-            if sr.status == VerificationStepStatus::Error {
+            if sr.status == VerificationStepStatus::Error
+                || sr.status == VerificationStepStatus::ProcessUnknown
+            {
                 return Ok(Self::blocked(
                     run_id,
                     task_id,
                     execution_id,
                     plan_fingerprint,
-                    &format!("step {} not terminal: {:?}", sr.step_id, sr.status),
+                    &format!("step {} not terminal/unknown: {:?}", sr.step_id, sr.status),
                 ));
             }
         }

@@ -211,44 +211,47 @@ if ($fc_failed -gt 0) { $AllPassed = $false; Write-Host "FAIL: $fc_failed fault 
 else { Write-Host "PASS: 30/30 fault cases" -ForegroundColor Green }
 
 # ═══════════════════════════════════════════════════════════════════════
-# 4. Certification Scenarios (27) — each run individually
+# 4. Certification Scenarios (27) — derived from Manifest (single source)
 # ═══════════════════════════════════════════════════════════════════════
-$allScenarios = @(
-    @{id="gp01"; test="test_gp01_first_attempt_passes";                 binary="task_loop_fault_tests"},
-    @{id="gp02"; test="test_gp02_one_repair_then_pass";                  binary="task_loop_fault_tests"},
-    @{id="gp03"; test="test_gp03_progressive_repairs_budget_allows";     binary="task_loop_fault_tests"},
-    @{id="gp04"; test="test_gp04_no_progress_stop";                      binary="task_loop_fault_tests"},
-    @{id="gp05"; test="test_gp05_cycle_detection";                       binary="task_loop_fault_tests"},
-    @{id="gp06"; test="test_gp06_hard_attempt_budget";                   binary="task_loop_fault_tests"},
-    @{id="gp07"; test="test_gp07_unknown_token_usage";                   binary="task_loop_fault_tests"},
-    @{id="gp08"; test="test_gp08_hard_token_budget";                    binary="task_loop_fault_tests"},
-    @{id="gp09"; test="test_gp09_hard_tool_call_budget";                binary="task_loop_fault_tests"},
-    @{id="gp10"; test="test_gp10_hard_cost_budget";                     binary="task_loop_fault_tests"},
-    @{id="gp11"; test="test_gp11_infrastructure_blocked";                binary="task_loop_fault_tests"},
-    @{id="gp12"; test="test_gp12_reconciliation_required";               binary="task_loop_fault_tests"},
-    @{id="gp13"; test="test_gp13_awaiting_human";                       binary="task_loop_fault_tests"},
-    @{id="gp14"; test="test_gp14_project_escalation";                   binary="task_loop_fault_tests"},
-    @{id="gp15"; test="test_gp15_cancellation_classification";           binary="task_loop_fault_tests"},
-    @{id="gp16"; test="test_gp16_cancellation_overrides";               binary="task_loop_fault_tests"},
-    @{id="gp23"; test="test_gp23_two_pool_full_controller";            binary="task_loop_fault_tests"},
-    @{id="gp26"; test="test_gp26_profile_selection_all_scenarios";      binary="task_loop_fault_tests"},
-    @{id="gp27"; test="test_gp27_context_security";                    binary="task_loop_fault_tests"},
-    @{id="ri01"; test="test_real_i4_first_attempt_pass";                binary="real_i4_e2e_tests"},
-    @{id="ri02"; test="test_real_i4_repair_then_pass";                  binary="real_i4_e2e_tests"},
-    @{id="ri03"; test="test_real_i4_crash_restart";                     binary="real_i4_e2e_tests"},
-    @{id="ri04"; test="test_real_i4_workspace_continuation";            binary="real_i4_e2e_tests"},
-    @{id="ri05"; test="test_real_i4_two_pool_full_lifecycle";           binary="real_i4_e2e_tests"},
-    @{id="ii01"; test="test_first_attempt_passes";                      binary="task_loop_i4_integration"},
-    @{id="ii02"; test="test_one_repair_then_pass";                      binary="task_loop_i4_integration"},
-    @{id="ii03"; test="test_two_pool_full_lifecycle_one_winner";        binary="task_loop_i4_integration"}
-)
+function Get-CertificationManifest {
+    $manifestJson = ""
+    $inManifest = $false
+    $output = cargo test -p harness-runtime --test i4_5_certification_manifest `
+        tests::export_manifest_json_for_runner -- --nocapture 2>&1
+    foreach ($line in $output) {
+        if ($line -match 'MANIFEST_JSON_START') { $inManifest = $true; continue }
+        if ($line -match 'MANIFEST_JSON_END') { $inManifest = $false; continue }
+        if ($inManifest) { $manifestJson += $line }
+    }
+    if (-not $manifestJson) {
+        Write-Host "ERROR: Failed to load certification manifest" -ForegroundColor Red
+        exit 1
+    }
+    return ($manifestJson | ConvertFrom-Json)
+}
 
-Write-Host "=== Scenarios (27 individual) ===" -ForegroundColor Cyan
+Write-Host "=== Loading Manifest ===" -ForegroundColor Cyan
+$Manifest = Get-CertificationManifest
+Write-Host "Manifest: $($Manifest.scenarios.Count) scenarios, $($Manifest.repeat_groups.Count) repeat groups"
+
+if ($Manifest.scenarios.Count -ne 27) {
+    Write-Host "ERROR: Manifest scenario count is $($Manifest.scenarios.Count), expected 27" -ForegroundColor Red
+    exit 1
+}
+
+Write-Host "=== Scenarios (27 from Manifest) ===" -ForegroundColor Cyan
 $scPassed = 0; $scFailed = 0; $scFirstFailure = ""
 $scSw = [System.Diagnostics.Stopwatch]::StartNew()
-foreach ($s in $allScenarios) {
+foreach ($s in $Manifest.scenarios) {
+    $parts = $s.test_target -split '::', 2
+    if ($parts.Count -ne 2) {
+        Write-Host "ERROR: scenario $($s.id) has invalid test_target: $($s.test_target)" -ForegroundColor Red
+        exit 1
+    }
+    $binary = $parts[0]
+    $testFn = $parts[1]
     $sSw = [System.Diagnostics.Stopwatch]::StartNew()
-    $output = cargo test -p harness-runtime --test $s.binary $s.test -- --nocapture 2>&1
+    $output = cargo test -p harness-runtime --test $binary $testFn -- --nocapture 2>&1
     $sSw.Stop()
     $sOk = ($LASTEXITCODE -eq 0)
     $sFailFirst = ""
@@ -257,11 +260,9 @@ foreach ($s in $allScenarios) {
     } else {
         $scFailed++
         $sFailFirst = "$($s.id): $($output | Select-Object -Last 3 | Out-String)"
-        if (-not $scFirstFailure) {
-            $scFirstFailure = $sFailFirst
-        }
+        if (-not $scFirstFailure) { $scFirstFailure = $sFailFirst }
     }
-    Write-ScenarioResult -ScenarioId $s.id -TestName $s.test -Binary $s.binary `
+    Write-ScenarioResult -ScenarioId $s.id -TestName $testFn -Binary $binary `
         -Passed $(if ($sOk) { 1 } else { 0 }) `
         -Failed $(if ($sOk) { 0 } else { 1 }) `
         -ExitCode $(if ($sOk) { 0 } else { 1 }) `
@@ -270,46 +271,39 @@ foreach ($s in $allScenarios) {
 }
 $scSw.Stop()
 $scExit = if ($scFailed -gt 0) { 1 } else { 0 }
-# Total from 27 individual detail rows (no separate summary row — no double counting).
 $TotalTests += 27; $TotalPassed += $scPassed; $TotalFailed += $scFailed
 if ($scFailed -gt 0) { $AllPassed = $false; Write-Host "FAIL: $scFailed scenarios failed" -ForegroundColor Red }
 else { Write-Host "PASS: 27/27 scenarios" -ForegroundColor Green }
 
-# ═══════════════════════════════════════════════════════════════════════
-# 5. Repeat Groups (18)
-# ═══════════════════════════════════════════════════════════════════════
-$repeatGroups = @(
-    @{name="rg01_first_attempt_passes"; test="test_real_i4_first_attempt_pass"; count=20; extra="--test real_i4_e2e_tests"},
-    @{name="rg02_one_repair_then_pass"; test="test_real_i4_repair_then_pass"; count=20; extra="--test real_i4_e2e_tests"},
-    @{name="rg03_progressive_repairs"; test="test_gp03_progressive_repairs_budget_allows"; count=20; extra="--test task_loop_fault_tests"},
-    @{name="rg04_no_progress_stop"; test="test_gp04_no_progress_stop"; count=20; extra="--test task_loop_fault_tests"},
-    @{name="rg05_two_pool_full_controller"; test="test_real_i4_two_pool_full_lifecycle"; count=50; extra="--test real_i4_e2e_tests"},
-    @{name="rg06_two_pool_attempt_creation"; test="test_repeat_two_pool_attempt_creation_100"; count=100; extra="--test task_loop_fault_tests"},
-    @{name="rg07_response_lost_attempt"; test="test_fc07_attempt_insert_response_lost"; count=20; extra="--test task_loop_fault_tests"},
-    @{name="rg08_response_lost_dispatch"; test="test_fc17_dispatch_response_lost"; count=20; extra="--test task_loop_fault_tests"},
-    @{name="rg09_response_lost_decision"; test="test_fc21_decision_response_lost"; count=20; extra="--test task_loop_fault_tests"},
-    @{name="rg10_decision_exactly_once"; test="test_fc20_decision_insert_before_effect"; count=20; extra="--test task_loop_fault_tests"},
-    @{name="rg11_context_pack_exactly_once"; test="test_fc22_context_pack_before_effect"; count=20; extra="--test task_loop_fault_tests"},
-    @{name="rg12_budget_reservation_exactly_once"; test="test_fc08_budget_reservation_before_effect"; count=20; extra="--test task_loop_fault_tests"},
-    @{name="rg13_usage_exactly_once"; test="test_fc24_usage_write_before_effect"; count=20; extra="--test task_loop_fault_tests"},
-    @{name="rg14_crash_resume_loop"; test="test_real_i4_crash_restart"; count=10; extra="--test real_i4_e2e_tests"},
-    @{name="rg15_workspace_continuation"; test="test_real_i4_workspace_continuation"; count=10; extra="--test real_i4_e2e_tests"},
-    @{name="rg16_profile_switch_allowed"; test="test_profile_policy_allows_switch_within_provider"; count=10; extra="--test task_loop_i4_integration"},
-    @{name="rg17_profile_switch_forbidden"; test="test_profile_policy_rejects_cross_provider"; count=10; extra="--test task_loop_i4_integration"},
-    @{name="rg18_stale_ownership_takeover"; test="test_stale_fencing_rejected"; count=50; extra="--test task_loop_fault_tests"}
-)
-
-if ($Quick) {
-    Write-Host "=== Repeat Groups (QUICK MODE — 1 each) ===" -ForegroundColor Yellow
-    foreach ($rg in $repeatGroups) { $rg.count = 1 }
-} else {
-    Write-Host "=== Repeat Groups (18) ===" -ForegroundColor Cyan
+# Consistency check: all 27 Manifest IDs appear in results.
+$resultScIds = @($script:Results | Where-Object { $_.category -eq "scenario" } | ForEach-Object { $_.scenario_id } | Sort-Object)
+$manifestScIds = @($Manifest.scenarios | ForEach-Object { $_.id } | Sort-Object)
+$missingCheck = Compare-Object $manifestScIds $resultScIds | Where-Object { $_.SideIndicator -eq "<=" }
+if ($missingCheck) {
+    Write-Host "ERROR: Manifest scenarios missing from results: $missingCheck" -ForegroundColor Red
+    exit 1
 }
 
-foreach ($rg in $repeatGroups) {
-    $ok = Invoke-SpecificTest -TestName $rg.test -Count $rg.count -Group $rg.name -ExtraArgs $rg.extra
+# ═══════════════════════════════════════════════════════════════════════
+# 5. Repeat Groups (18) — sum = 460, derived from Manifest
+# ═══════════════════════════════════════════════════════════════════════
+Write-Host "=== Repeat Groups (18 from Manifest) ===" -ForegroundColor Cyan
+$repeatTotalRuns = 0
+foreach ($rg in $Manifest.repeat_groups) {
+    $rgParts = $rg.test_target -split '::', 2
+    if ($rgParts.Count -ne 2) {
+        Write-Host "ERROR: repeat group $($rg.id) invalid test_target: $($rg.test_target)" -ForegroundColor Red
+        exit 1
+    }
+    $rgBin = $rgParts[0]
+    $rgTest = $rgParts[1]
+    $rgCount = if ($Quick) { 1 } else { $rg.repeat_count }
+    $repeatTotalRuns += $rgCount
+    $ok = Invoke-SpecificTest -TestName $rgTest -Count $rgCount -Group $rg.id `
+        -ExtraArgs "--test $rgBin"
     if (-not $ok) { $AllPassed = $false }
 }
+Write-Host "Repeat group total (from Manifest): $repeatTotalRuns"
 
 # ═══════════════════════════════════════════════════════════════════════
 # 6. C8 Schedules (5 x 100)
@@ -379,6 +373,9 @@ if (-not $ok) { $AllPassed = $false }
 # ═══════════════════════════════════════════════════════════════════════
 # 9. Three consecutive workspace runs
 # ═══════════════════════════════════════════════════════════════════════
+# Use a dedicated target directory for workspace runs to avoid artifact
+# lock contention with the preceding per-test cargo invocations.
+$env:CARGO_TARGET_DIR = "$RepoRoot\target\i45-workspace"
 Write-Host "=== Workspace Runs (3) ===" -ForegroundColor Cyan
 for ($run = 1; $run -le 3; $run++) {
     Write-Host "--- Run $run/3 ---" -ForegroundColor Yellow

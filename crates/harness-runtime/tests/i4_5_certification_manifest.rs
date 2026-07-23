@@ -840,4 +840,17 @@ mod tests {
         assert!(json.contains("RealI4Executed"));
         assert!(json.len() > 1000, "manifest JSON must be substantial");
     }
+
+    /// Export the manifest as JSON for the certification runner.
+    /// The runner invokes this test with `-- --nocapture` and parses
+    /// the JSON between the `///MANIFEST_JSON_START///` and
+    /// `///MANIFEST_JSON_END///` markers.
+    #[test]
+    fn export_manifest_json_for_runner() {
+        let m = build_manifest();
+        let json = serde_json::to_string(&m).unwrap();
+        println!("///MANIFEST_JSON_START///");
+        println!("{json}");
+        println!("///MANIFEST_JSON_END///");
+    }
 }

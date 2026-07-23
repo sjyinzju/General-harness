@@ -649,6 +649,93 @@ mod tests {
         assert!(matches!(r2, ProcessTreeTermination::Unconfirmed { .. }));
     }
 
+    // ── T6: Response-lost retry after unconfirmed ────────────────────
+    ///
+    /// Scenario:
+    /// 1. Cancel → both mechanisms fail → Unconfirmed (ProcessUnknown)
+    /// 2. Response lost before caller observes result
+    /// 3. Retry with same idempotency key
+    ///
+    /// Critical invariant: the retry MUST NOT overwrite ProcessUnknown
+    /// with clean Cancelled. The termination fact is immutable.
+    #[tokio::test]
+    async fn t6_response_lost_retry_after_unconfirmed() {
+        let (guard, _child) = make_running_guard().await;
+        guard.set_fault_injection(TerminationFault::BothFail);
+
+        // First attempt: both fail → Unconfirmed.
+        let r1 = guard.kill_tree();
+        let ProcessTreeTermination::Unconfirmed {
+            job_error: je1,
+            fallback_error: fe1,
+        } = r1
+        else {
+            panic!("T6 first call: expected Unconfirmed, got {r1:?}");
+        };
+        assert!(je1.is_some(), "T6: first call must record job_error");
+        assert!(fe1.is_some(), "T6: first call must record fallback_error");
+
+        // Simulate response lost: caller retries with same idempotency key.
+        // kill_tree() is idempotent and still reports Unconfirmed.
+        let r2 = guard.kill_tree();
+        let ProcessTreeTermination::Unconfirmed {
+            job_error: je2,
+            fallback_error: fe2,
+        } = r2
+        else {
+            panic!("T6 retry: expected Unconfirmed (NOT Cancelled), got {r2:?}");
+        };
+
+        // Both attempts produce the same Unconfirmed classification.
+        // Neither produces Confirmed, AlreadyExited, or any clean variant.
+        assert!(je2.is_some(), "T6: retry must record job_error");
+        assert!(fe2.is_some(), "T6: retry must record fallback_error");
+
+        // The termination fact is immutable: ProcessUnknown persists.
+        // A caller that observes the retry result must still see
+        // ProcessUnknown, NOT a falsely rewritten Cancelled.
+    }
+
+    // ── T7: Timeout path with both mechanisms failing ────────────────
+    ///
+    /// Scenario:
+    /// 1. Execution reaches timeout
+    /// 2. TerminateJobObject fails
+    /// 3. taskkill /T /F fails
+    /// 4. Process exit cannot be confirmed
+    ///
+    /// The timeout path in manager.rs has identical kill_tree() branching
+    /// as the cancel path (both match ProcessTreeTermination).  This test
+    /// verifies that kill_tree() with BothFail returns Unconfirmed,
+    /// which the timeout path maps to End::ProcessUnknown (never End::Timeout).
+    #[tokio::test]
+    async fn t7_timeout_both_mechanisms_fail() {
+        let (guard, _child) = make_running_guard().await;
+        guard.set_fault_injection(TerminationFault::BothFail);
+
+        let result = guard.kill_tree();
+        assert!(
+            matches!(result, ProcessTreeTermination::Unconfirmed { .. }),
+            "T7: timeout with both failing must return Unconfirmed, got {result:?}"
+        );
+
+        // Verify the Unconfirmed variant carries diagnostic information.
+        if let ProcessTreeTermination::Unconfirmed {
+            job_error,
+            fallback_error,
+        } = &result
+        {
+            assert!(job_error.is_some(), "T7: Unconfirmed must carry job_error");
+            assert!(
+                fallback_error.is_some(),
+                "T7: Unconfirmed must carry fallback_error"
+            );
+        }
+
+        // Key invariant: clean Timeout is false.  clean Cancelled is false.
+        // The outcome is ProcessUnknown — completion MUST be blocked.
+    }
+
     // ── T8: Reconciler sees process now dead ─────────────────────────
     #[tokio::test]
     async fn t8_reconciler_sees_process_dead() {
