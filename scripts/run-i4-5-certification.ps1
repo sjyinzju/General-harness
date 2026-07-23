@@ -380,11 +380,9 @@ Write-Host "=== Workspace Runs (3) ===" -ForegroundColor Cyan
 for ($run = 1; $run -le 3; $run++) {
     Write-Host "--- Run $run/3 ---" -ForegroundColor Yellow
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
-    # Use single-threaded build + unique target per run to eliminate
-    # artifact lock contention with repeated workspace runs.
-    $wsTarget = "$RepoRoot\target\i45-ws-run$run"
-    $env:CARGO_TARGET_DIR = $wsTarget
-    $env:CARGO_BUILD_JOBS = "1"
+    # Use dedicated target dir shared across workspace runs to avoid
+    # artifact lock contention with preceding per-test cargo invocations.
+    $env:CARGO_TARGET_DIR = "$RepoRoot\target\i45-workspace"
     cargo test --workspace 2>&1 | Out-Null
     $ok = ($LASTEXITCODE -eq 0)
     $sw.Stop()
