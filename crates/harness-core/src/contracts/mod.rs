@@ -7,6 +7,7 @@ pub mod commit;
 pub mod discovery;
 pub mod goal_contract;
 pub mod integration;
+pub mod ipc;
 pub mod project;
 pub mod repository;
 pub mod review;

@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod event_log;
 pub mod idempotency;
 pub mod integration;
+pub mod ipc;
 pub mod lease;
 pub mod liveness;
 pub mod operation;

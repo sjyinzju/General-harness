@@ -15,6 +15,7 @@
 //! - No detached background tasks remain after shutdown.
 
 mod commands;
+mod ipc_client;
 
 use harness_runtime::db::Database;
 use harness_runtime::liveness::RunContext;
