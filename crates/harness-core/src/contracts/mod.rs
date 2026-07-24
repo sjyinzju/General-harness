@@ -3,8 +3,10 @@ pub mod agent_definition;
 pub mod agent_event;
 pub mod agent_identity;
 pub mod candidate;
+pub mod commit;
 pub mod discovery;
 pub mod goal_contract;
+pub mod integration;
 pub mod project;
 pub mod repository;
 pub mod review;
@@ -23,6 +25,15 @@ pub use agent_definition::{AgentDefinition, DiscoverySource, PassiveDiscoverySta
 pub use agent_event::AgentEvent;
 pub use agent_identity::AgentIdentity;
 pub use candidate::{CandidateId, CandidateSnapshot};
+pub use commit::{
+    CommitAdmission, CommitCandidate, CommitRequest, CommitRequestId, CommitState, GitIdentity,
+    RepositoryId,
+};
+pub use integration::{
+    ConflictInfo, IntegrationAttempt, IntegrationAttemptId, IntegrationId,
+    IntegrationRequest, IntegrationResult, IntegrationState, IntegrationStrategy,
+    IntegrationVerificationPolicy, VerificationCommand,
+};
 pub use discovery::{
     ActiveValidationRequest, AdapterCompatibility, AuthModeHint, AuthStateValue,
     AuthenticationState, CapabilityNegotiation, CapabilitySupport, CompatibilityDiagnostic,

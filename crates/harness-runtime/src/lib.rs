@@ -1,9 +1,11 @@
 //! harness-runtime: Persistence, repositories, transition, process management.
 pub mod artifact;
+pub mod commit;
 pub mod db;
 pub mod discovery;
 pub mod event_log;
 pub mod idempotency;
+pub mod integration;
 pub mod lease;
 pub mod liveness;
 pub mod operation;
