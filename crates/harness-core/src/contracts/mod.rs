@@ -12,6 +12,7 @@ pub mod repository;
 pub mod review;
 pub mod runtime_profile;
 pub mod scheduler;
+pub mod supervisor;
 pub mod task;
 pub mod task_envelope;
 pub mod task_result;
@@ -55,4 +56,8 @@ pub use runtime_profile::{
 pub use task::{Task, TaskDependency, TaskLifecycle};
 pub use task_envelope::{FileScope, TaskBudget, TaskEnvelope};
 pub use task_result::TaskResult;
+pub use supervisor::{
+    SupervisorConfig, SupervisorEvent, SupervisorInstance, SupervisorInstanceId, SupervisorLease,
+    SupervisorState, SupervisorStatus,
+};
 pub use workspace::{LeaseLifecycle, WorkspaceLease};

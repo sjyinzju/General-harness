@@ -16,6 +16,7 @@ pub mod repo;
 pub mod resource_claim;
 pub mod review;
 pub mod scheduler;
+pub mod supervisor;
 pub mod task_loop;
 pub mod transition;
 pub mod verification;

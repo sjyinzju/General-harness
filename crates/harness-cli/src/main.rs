@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Dispatch with Ctrl+C awareness ──────────────────────────
     let run_succeeded = tokio::select! {
-        result = dispatch_command(&args, &db, &graph, &repo_root) => {
+        result = dispatch_command(&args, &db, &graph, &repo_root, &db_path) => {
             result
         }
         _ = tokio::signal::ctrl_c() => {
@@ -139,6 +139,7 @@ async fn dispatch_command(
     db: &Database,
     graph: &ProductionGraph,
     repo_path: &Path,
+    db_path: &str,
 ) -> bool {
     match args[1].as_str() {
         "task-loop" => {
@@ -163,6 +164,14 @@ async fn dispatch_command(
                 false
             } else {
                 dispatch_integration(args, db, repo_path).await
+            }
+        }
+        "supervisor" => {
+            if args.len() < 3 {
+                eprintln!("error: missing supervisor subcommand");
+                false
+            } else {
+                dispatch_supervisor(args, db, &db_path).await
             }
         }
         _ => {
@@ -472,6 +481,10 @@ fn print_usage() {
     println!("  harness integration list [--json] [--repo <path>]");
     println!("  harness integration cancel <id> [--repo <path>]");
     println!("  harness integration recover [--repo <path>]");
+    println!("  harness supervisor run [--state-dir <id>] [--repo <path>]");
+    println!("  harness supervisor start [--state-dir <id>] [--repo <path>]");
+    println!("  harness supervisor status [--state-dir <id>] [--json] [--repo <path>]");
+    println!("  harness supervisor stop [--state-dir <id>] [--repo <path>]");
     println!("  harness cleanup [--dry-run|--apply] [--repo <path>]");
     println!();
     println!("Environment:");
@@ -566,6 +579,54 @@ async fn cmd_review_standalone(
         Ok(())
     } else {
         Err("review command failed".into())
+    }
+}
+
+async fn dispatch_supervisor(args: &[String], db: &Database, db_path: &str) -> bool {
+    let state_dir = parse_flag(args, "--state-dir").unwrap_or("default");
+    match args[2].as_str() {
+        "run" => {
+            match commands::supervisor::cmd_supervisor_run(db, state_dir).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "start" => {
+            match commands::supervisor::cmd_supervisor_start(db_path, state_dir).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "status" => {
+            let json = args.contains(&"--json".to_string());
+            match commands::supervisor::cmd_supervisor_status(db, state_dir, json).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "stop" => {
+            match commands::supervisor::cmd_supervisor_stop(db, state_dir).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        _ => {
+            eprintln!("error: unknown supervisor subcommand: {}", args[2]);
+            eprintln!("Usage: harness supervisor <run|start|status|stop> [--state-dir <id>]");
+            false
+        }
     }
 }
 

@@ -168,11 +168,15 @@ mod tests {
             "verification_step_results",
             "workspace_leases",
             "worktrees",
+            // 026 — supervisor
+            "supervisor_events",
+            "supervisor_instances",
+            "supervisor_leases",
         ];
         expected.sort();
         assert_eq!(
             names, expected,
-            "60 business tables expected (001\u{2013}025)"
+            "63 business tables expected (001\u{2013}026)"
         );
     }
 
