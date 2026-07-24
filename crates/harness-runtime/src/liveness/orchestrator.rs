@@ -435,9 +435,28 @@ fn scan_stale_managed_root(
 
         // Read marker.
         let marker_path = path.join(super::types::OWNERSHIP_MARKER_FILENAME);
-        let marker: Option<super::types::OwnershipMarker> = std::fs::read_to_string(&marker_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok());
+        let marker: Option<super::types::OwnershipMarker> =
+            match std::fs::read_to_string(&marker_path) {
+                Ok(raw) => {
+                    // Strip UTF-8 BOM if present (PowerShell adds it).
+                    let cleaned = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+                    match serde_json::from_str(cleaned) {
+                        Ok(m) => Some(m),
+                        Err(e) => {
+                            tracing::warn!(
+                                path = %path.display(),
+                                error = %e,
+                                "marker JSON parse failed"
+                            );
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(path = %path.display(), error = %e, "marker file read failed");
+                    None
+                }
+            };
 
         let eligible = match &marker {
             None => {

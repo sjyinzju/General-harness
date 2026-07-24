@@ -150,55 +150,59 @@ impl DeletionGuard {
         // ── 13. Ownership marker check ──────────────────────────
         let marker_path = canonical.join(OWNERSHIP_MARKER_FILENAME);
         match std::fs::read_to_string(&marker_path) {
-            Ok(raw) => match serde_json::from_str::<OwnershipMarker>(&raw) {
-                Ok(m) => {
-                    // Schema version check.
-                    if m.schema_version != super::types::MARKER_SCHEMA_VERSION {
-                        reasons.push(format!(
-                            "marker schema version {} != expected {}",
-                            m.schema_version,
-                            super::types::MARKER_SCHEMA_VERSION
-                        ));
-                    }
-
-                    // Kind matches expected (if specified).
-                    if let Some(expected) = expected_kind {
-                        if m.kind != expected {
+            Ok(raw) => {
+                // Strip UTF-8 BOM if present.
+                let cleaned = raw.strip_prefix('\u{FEFF}').unwrap_or(&raw);
+                match serde_json::from_str::<OwnershipMarker>(cleaned) {
+                    Ok(m) => {
+                        // Schema version check.
+                        if m.schema_version != super::types::MARKER_SCHEMA_VERSION {
                             reasons.push(format!(
-                                "marker kind {:?} does not match expected {:?}",
-                                m.kind, expected
+                                "marker schema version {} != expected {}",
+                                m.schema_version,
+                                super::types::MARKER_SCHEMA_VERSION
                             ));
                         }
-                    }
 
-                    // Kind matches the managed root.
-                    let root_kind = managed_root_to_kind(&managed_canonical);
-                    if root_kind != m.kind {
-                        reasons.push(format!(
-                            "marker kind {:?} does not match managed root kind {:?}",
-                            m.kind, root_kind
-                        ));
-                    }
+                        // Kind matches expected (if specified).
+                        if let Some(expected) = expected_kind {
+                            if m.kind != expected {
+                                reasons.push(format!(
+                                    "marker kind {:?} does not match expected {:?}",
+                                    m.kind, expected
+                                ));
+                            }
+                        }
 
-                    // Run ID matches directory name.
-                    if let Some(dir_name) = canonical.file_name().and_then(|n| n.to_str()) {
-                        if dir_name != m.run_id {
+                        // Kind matches the managed root.
+                        let root_kind = managed_root_to_kind(&managed_canonical);
+                        if root_kind != m.kind {
                             reasons.push(format!(
-                                "directory name {dir_name} != marker run_id {}",
-                                m.run_id
+                                "marker kind {:?} does not match managed root kind {:?}",
+                                m.kind, root_kind
                             ));
                         }
-                    }
 
-                    marker = Some(m);
+                        // Run ID matches directory name.
+                        if let Some(dir_name) = canonical.file_name().and_then(|n| n.to_str()) {
+                            if dir_name != m.run_id {
+                                reasons.push(format!(
+                                    "directory name {dir_name} != marker run_id {}",
+                                    m.run_id
+                                ));
+                            }
+                        }
+
+                        marker = Some(m);
+                    }
+                    Err(e) => {
+                        reasons.push(format!(
+                            "invalid ownership marker in {}: {e}",
+                            marker_path.display()
+                        ));
+                    }
                 }
-                Err(e) => {
-                    reasons.push(format!(
-                        "invalid ownership marker in {}: {e}",
-                        marker_path.display()
-                    ));
-                }
-            },
+            }
             Err(e) => {
                 reasons.push(format!(
                     "missing or unreadable ownership marker in {}: {e}",
