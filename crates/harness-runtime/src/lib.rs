@@ -12,6 +12,7 @@ pub mod process;
 pub mod production_graph;
 pub mod repo;
 pub mod resource_claim;
+pub mod review;
 pub mod scheduler;
 pub mod task_loop;
 pub mod transition;

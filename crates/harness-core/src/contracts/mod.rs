@@ -2,10 +2,12 @@ pub mod agent_adapter;
 pub mod agent_definition;
 pub mod agent_event;
 pub mod agent_identity;
+pub mod candidate;
 pub mod discovery;
 pub mod goal_contract;
 pub mod project;
 pub mod repository;
+pub mod review;
 pub mod runtime_profile;
 pub mod scheduler;
 pub mod task;
@@ -20,6 +22,7 @@ pub use agent_adapter::{
 pub use agent_definition::{AgentDefinition, DiscoverySource, PassiveDiscoveryStatus};
 pub use agent_event::AgentEvent;
 pub use agent_identity::AgentIdentity;
+pub use candidate::{CandidateId, CandidateSnapshot};
 pub use discovery::{
     ActiveValidationRequest, AdapterCompatibility, AuthModeHint, AuthStateValue,
     AuthenticationState, CapabilityNegotiation, CapabilitySupport, CompatibilityDiagnostic,
@@ -28,6 +31,11 @@ pub use discovery::{
 };
 pub use goal_contract::{ChangeRequest, GoalContractVersion};
 pub use project::{Project, ProjectLifecycle};
+pub use review::{
+    ApprovedCandidate, FindingCategory, FindingSeverity, PrecheckFinding, PrecheckResult,
+    ReviewDecision, ReviewDossier, ReviewFinding, ReviewRequest, ReviewState, ReviewerFinding,
+    ReviewerOutput,
+};
 pub use runtime_profile::{
     ActiveValidationResult as ProbeResult, CapabilitySet, CoreStatus,
     CoreStatus as RuntimeProfileStatus, OptionalCapabilities, RequiredCapabilities, RuntimeProfile,

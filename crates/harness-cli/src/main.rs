@@ -141,6 +141,14 @@ async fn dispatch_command(args: &[String], db: &Database, graph: &ProductionGrap
                 dispatch_task_loop(args, db, graph).await
             }
         }
+        "review" => {
+            if args.len() < 3 {
+                eprintln!("error: missing review subcommand");
+                false
+            } else {
+                dispatch_review(args, db).await
+            }
+        }
         _ => {
             eprintln!("harness v0.1.0 — unknown command: {}", args[1]);
             false
@@ -307,11 +315,92 @@ fn print_usage() {
     println!("  harness task-loop cancel <loop-id> [--owner <id>] [--repo <path>]");
     println!("  harness task-loop inspect <loop-id> [--json] [--repo <path>]");
     println!("  harness task-loop dry-run-decision <loop-id> [--repo <path>]");
+    println!("  harness review create <candidate-id> [--reviewer <profile-id>] [--repo <path>]");
+    println!("  harness review run <review-id> [--repo <path>]");
+    println!("  harness review show <review-id> [--json] [--repo <path>]");
+    println!("  harness review list [--state <state>] [--json] [--repo <path>]");
     println!("  harness cleanup [--dry-run|--apply] [--repo <path>]");
     println!();
     println!("Environment:");
     println!("  HARNESS_DB     path to SQLite database (default: target/data/harness.db)");
     println!("  TEMP/TMP       automatically redirected to managed temp");
+}
+
+async fn dispatch_review(args: &[String], db: &Database) -> bool {
+    match args[2].as_str() {
+        "create" => {
+            let candidate_id = match parse_flag(args, "--candidate") {
+                Some(c) => c,
+                None => {
+                    // Also accept positional candidate ID
+                    match args.get(3) {
+                        Some(c) if !c.starts_with("--") => c.as_str(),
+                        _ => {
+                            eprintln!("error: --candidate <id> required (or use positional)");
+                            return false;
+                        }
+                    }
+                }
+            };
+            let reviewer = parse_flag(args, "--reviewer").unwrap_or("default-reviewer");
+            match commands::review::cmd_review_create(db, candidate_id, reviewer).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "show" => {
+            let review_id = match args.get(3) {
+                Some(id) => id,
+                None => {
+                    eprintln!("error: review-id required");
+                    return false;
+                }
+            };
+            let json = args.contains(&"--json".to_string());
+            match commands::review::cmd_review_show(db, review_id, json).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "run" => {
+            let review_id = match args.get(3) {
+                Some(id) => id,
+                None => {
+                    eprintln!("error: review-id required");
+                    return false;
+                }
+            };
+            match commands::review::cmd_review_run(db, review_id).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "list" => {
+            let json = args.contains(&"--json".to_string());
+            let state_filter = parse_flag(args, "--state");
+            match commands::review::cmd_review_list(db, state_filter, json).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        other => {
+            eprintln!("error: unknown review subcommand: {other}");
+            eprintln!("Usage: harness review <create|show|run|list> [args]");
+            false
+        }
+    }
 }
 
 fn parse_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {

@@ -8,4 +8,4 @@ pub mod fake;
 pub use claude::ClaudeCliAdapter;
 pub use codex::CodexCliAdapter;
 pub use contract_test::AdapterContractTest;
-pub use fake::FakeAgentAdapter;
+pub use fake::{FakeAgentAdapter, FakeReviewScript, FakeReviewer};

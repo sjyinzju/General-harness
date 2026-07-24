@@ -40,14 +40,19 @@ pub enum ErrorCode {
     SinkInvalidSequence { expected: u64, got: u64 },
     // State machine
     InvalidStateTransition { from: String, to: String },
+    InvalidState,
     EntityTerminal { entity_id: String },
     // Resource
     ResourceConflict { resource: String },
+    NotFound,
+    Conflict,
     // Workspace
     WorkspaceError,
     WorkspaceLeaseExpired,
     // Persistence
     PersistenceError,
+    // Serialization
+    SerializationError,
     // Verification
     VerificationFailed { check: String },
     // Internal
@@ -91,6 +96,7 @@ impl ErrorCode {
                 | ErrorCode::SinkClosed
                 | ErrorCode::SinkConsumerFailed
                 | ErrorCode::ResourceConflict { .. }
+                | ErrorCode::Conflict
                 | ErrorCode::WorkspaceLeaseExpired
                 | ErrorCode::PersistenceError
                 | ErrorCode::ProtocolError
