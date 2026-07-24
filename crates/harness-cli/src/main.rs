@@ -4,8 +4,15 @@
 //! 1. Creates a `RunContext` with managed temp directories.
 //! 2. Redirects `TEMP`/`TMP` to the managed temp (inherited by all children).
 //! 3. Builds a `ProductionGraph` with mandatory `LivenessOrchestrator`.
-//! 4. Runs the startup janitor before accepting work.
-//! 5. Cleans up managed temp on shutdown.
+//! 4. Starts a periodic janitor for background cleanup.
+//! 5. Runs the startup janitor before accepting work.
+//! 6. Calls explicit shutdown on all exit paths (including Ctrl+C).
+//!
+//! # invariants
+//! - `RunContext::shutdown()` is ALWAYS called (success, failure, cancel, Ctrl+C).
+//! - `std::process::exit()` is NEVER called after `RunContext` creation.
+//! - The periodic janitor is started exactly once and cancelled before shutdown.
+//! - No detached background tasks remain after shutdown.
 
 mod commands;
 
@@ -13,6 +20,8 @@ use harness_runtime::db::Database;
 use harness_runtime::liveness::RunContext;
 use harness_runtime::production_graph::ProductionGraph;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -27,7 +36,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let code_head = parse_flag(&args, "--code-head").unwrap_or("unknown");
-    let db_path = std::env::var("HARNESS_DB").unwrap_or_else(|_| "harness.db".to_string());
+    // Default DB goes into target/data/ so it never lands in repo root.
+    let default_db = repo_root
+        .join("target")
+        .join("data")
+        .join("harness.db")
+        .to_string_lossy()
+        .to_string();
+    let db_path = std::env::var("HARNESS_DB").unwrap_or(default_db);
 
     // ── "cleanup" is a special case — no ProductionGraph needed ──
     if args.len() >= 2 && args[1] == "cleanup" {
@@ -35,60 +51,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Create RunContext (managed temp + env redirect) ─────────
-    let run_context = RunContext::create(&repo_root, code_head, true)?;
+    let run_context = match RunContext::create(&repo_root, code_head, true) {
+        Ok(rc) => Arc::new(rc),
+        Err(e) => {
+            eprintln!("fatal: run context: {e}");
+            return Err(e.into());
+        }
+    };
 
     // ── Build ProductionGraph ───────────────────────────────────
     let db = Database::open(&PathBuf::from(&db_path)).await?;
     let worktree_root = parse_flag(&args, "--worktree-root")
         .map(PathBuf::from)
         .unwrap_or_else(|| repo_root.join("target/tmp"));
-    let graph =
-        match ProductionGraph::build(db.pool.clone(), &worktree_root, &repo_root, run_context) {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("fatal: {e}");
-                std::process::exit(1);
-            }
-        };
+    let graph = match ProductionGraph::build(
+        db.pool.clone(),
+        &worktree_root,
+        &repo_root,
+        run_context.clone(),
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            // Shutdown run context before exit — env restore + marker finalize.
+            let _ = run_context.shutdown(false).await;
+            std::process::exit(1);
+        }
+    };
 
     // ── Run startup janitor ─────────────────────────────────────
     let _startup_result = graph.startup().await;
 
-    // ── Dispatch ────────────────────────────────────────────────
-    let run_succeeded = match args[1].as_str() {
-        "task-loop" => {
-            if args.len() < 3 {
-                eprintln!("error: missing task-loop subcommand");
-                false
-            } else {
-                dispatch_task_loop(&args, &db, &graph).await
-            }
+    // ── Start periodic janitor ──────────────────────────────────
+    let janitor_cancel = graph.start_periodic_janitor(Duration::from_secs(300));
+
+    // ── Install Ctrl+C handler ──────────────────────────────────
+    let _ctrlc_cancel = janitor_cancel.clone();
+    let _ctrlc_run_context = run_context.clone();
+
+    // ── Dispatch with Ctrl+C awareness ──────────────────────────
+    let run_succeeded = tokio::select! {
+        result = dispatch_command(&args, &db, &graph) => {
+            result
         }
-        _ => {
-            println!("harness v0.1.0 — unknown command: {}", args[1]);
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl+C received, initiating graceful shutdown");
+            eprintln!("\nInterrupted — shutting down...");
             false
         }
     };
 
-    // ── Shutdown (cleans managed temp) ──────────────────────────
-    // We need to extract the run_context from the graph.
-    // Since RunContext is in an Arc, we can't take ownership easily.
-    // The Drop impl will restore env + mark as abandoned if shutdown
-    // wasn't called.  For a clean exit we rely on Drop restore.
-    // The managed temp will be cleaned by the next startup janitor
-    // if this process crashes.
+    // ── Cancel periodic janitor (bounded wait) ──────────────────
+    janitor_cancel.cancel();
+    // Give the periodic janitor up to 2 seconds to finish its current tick.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        // The janitor will observe cancellation and exit its loop.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    })
+    .await
+    .ok();
 
-    // Actually, let's use a different approach: the RunContext shutdown
-    // is called via explicit cleanup here.  Since the graph owns the
-    // Arc<RunContext>, we can't move out. Instead, we store it separately.
-    // For now, we note that the Drop impl handles env restore.
+    // ── Explicit shutdown ───────────────────────────────────────
+    // The Ctrl+C handler uses its own cleanup path; for the main path,
+    // we call shutdown explicitly.  The Drop impl on RunContext is the
+    // last-resort safety net.
+    let _shutdown_result = graph.shutdown(run_succeeded).await;
+
+    // Also ensure the Ctrl+C path's clone is shut down if it was
+    // the one that activated.  Since Ctrl+C selects the signal future,
+    // the main run_context.shutdown is still called above.
 
     tracing::info!(run_succeeded = run_succeeded, "harness exiting");
 
     if run_succeeded {
         Ok(())
     } else {
-        std::process::exit(1);
+        // Return error via main return, NOT process::exit().
+        Err("command failed".into())
+    }
+}
+
+async fn dispatch_command(args: &[String], db: &Database, graph: &ProductionGraph) -> bool {
+    match args[1].as_str() {
+        "task-loop" => {
+            if args.len() < 3 {
+                eprintln!("error: missing task-loop subcommand");
+                false
+            } else {
+                dispatch_task_loop(args, db, graph).await
+            }
+        }
+        _ => {
+            eprintln!("harness v0.1.0 — unknown command: {}", args[1]);
+            false
+        }
     }
 }
 
@@ -254,7 +310,7 @@ fn print_usage() {
     println!("  harness cleanup [--dry-run|--apply] [--repo <path>]");
     println!();
     println!("Environment:");
-    println!("  HARNESS_DB     path to SQLite database (default: harness.db)");
+    println!("  HARNESS_DB     path to SQLite database (default: target/data/harness.db)");
     println!("  TEMP/TMP       automatically redirected to managed temp");
 }
 

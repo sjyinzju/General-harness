@@ -126,16 +126,53 @@ impl LivenessOrchestrator {
         ));
 
         // ── 4. Orphan artifacts ──────────────────────────────
+        // Now routed through DeletionGuard::validate_path_safety.
         if let Ok(artifact_root) =
             crate::artifact::ArtifactRoot::open(&self.config.protected.target_root)
         {
-            match artifact_root.reclaim_orphans(&self.config.supervisor_id) {
-                Ok(count) => {
-                    result.deleted += count;
-                    result.examined += count;
+            match artifact_root.find_orphans(&self.config.supervisor_id) {
+                Ok(orphans) => {
+                    for orphan in &orphans {
+                        result.examined += 1;
+                        // Validate through DeletionGuard safety checks.
+                        if let Some(denial) = guard
+                            .validate_path_safety(&orphan.path, &self.config.protected.target_root)
+                        {
+                            tracing::warn!(
+                                path = %orphan.path.display(),
+                                reason = %denial,
+                                "orphan artifact blocked by DeletionGuard"
+                            );
+                            result.preserved += 1;
+                            result.entries.push(super::types::CleanupEntry {
+                                path: orphan.path.clone(),
+                                action: super::types::CleanupAction::Preserve,
+                                reason: format!("blocked by DeletionGuard: {denial}"),
+                            });
+                            continue;
+                        }
+                        // Safe to delete.
+                        match std::fs::remove_dir_all(&orphan.path) {
+                            Ok(()) => {
+                                result.deleted += 1;
+                                tracing::info!(
+                                    path = %orphan.path.display(),
+                                    "reclaimed orphan artifact"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    path = %orphan.path.display(),
+                                    error = %e,
+                                    "failed to reclaim orphan artifact"
+                                );
+                                result.preserved += 1;
+                            }
+                        }
+                    }
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, "orphan artifact reclamation failed");
+                    tracing::warn!(error = %e, "orphan artifact scan failed");
                 }
             }
         }
@@ -267,13 +304,49 @@ impl LivenessOrchestrator {
             if let Ok(artifact_root) =
                 crate::artifact::ArtifactRoot::open(&self.config.protected.target_root)
             {
-                match artifact_root.reclaim_orphans(&self.config.supervisor_id) {
-                    Ok(count) => {
-                        result.deleted += count;
-                        result.examined += count;
+                match artifact_root.find_orphans(&self.config.supervisor_id) {
+                    Ok(orphans) => {
+                        for orphan in &orphans {
+                            result.examined += 1;
+                            // Validate through DeletionGuard safety checks.
+                            if let Some(denial) = guard.validate_path_safety(
+                                &orphan.path,
+                                &self.config.protected.target_root,
+                            ) {
+                                tracing::warn!(
+                                    path = %orphan.path.display(),
+                                    reason = %denial,
+                                    "orphan artifact blocked by DeletionGuard"
+                                );
+                                result.preserved += 1;
+                                result.entries.push(super::types::CleanupEntry {
+                                    path: orphan.path.clone(),
+                                    action: super::types::CleanupAction::Preserve,
+                                    reason: format!("blocked by DeletionGuard: {denial}"),
+                                });
+                                continue;
+                            }
+                            match std::fs::remove_dir_all(&orphan.path) {
+                                Ok(()) => {
+                                    result.deleted += 1;
+                                    tracing::info!(
+                                        path = %orphan.path.display(),
+                                        "reclaimed orphan artifact"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        path = %orphan.path.display(),
+                                        error = %e,
+                                        "failed to reclaim orphan artifact"
+                                    );
+                                    result.preserved += 1;
+                                }
+                            }
+                        }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, "orphan artifact reclamation failed");
+                        tracing::warn!(error = %e, "orphan artifact scan failed");
                     }
                 }
             }

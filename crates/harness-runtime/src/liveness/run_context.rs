@@ -170,7 +170,10 @@ impl RunContext {
     /// This should be called in a `finally`-style block at the end
     /// of every run.  On failure, directories are left for the
     /// Startup Janitor.
-    pub async fn shutdown(mut self, run_succeeded: bool) -> CleanupResult {
+    ///
+    /// Takes `&self` so it can be called via `Arc<RunContext>`.
+    /// Repeated calls are safe (idempotent — only cleans existing dirs).
+    pub async fn shutdown(&self, run_succeeded: bool) -> CleanupResult {
         let mut result = CleanupResult::default();
 
         // ── Restore environment ──────────────────────────────────
@@ -205,7 +208,7 @@ impl RunContext {
         // ── Cleanup managed temp (bounded retry) ────────────────
         let guard = self.build_guard(vec![]);
 
-        if let Some(temp) = self.managed_temp.take() {
+        if let Some(ref temp) = self.managed_temp {
             let entry = temp
                 .cleanup_with_retry(&guard, &self.config.managed_temp_root)
                 .await;
@@ -222,7 +225,7 @@ impl RunContext {
         }
 
         // ── Cleanup cargo dir ───────────────────────────────────
-        if let Some(cargo) = self.managed_cargo.take() {
+        if let Some(ref cargo) = self.managed_cargo {
             let entry = cargo.cleanup_with_guard(&guard, &self.config.managed_cargo_root);
             if entry.action == CleanupAction::Delete {
                 result.deleted += 1;
@@ -231,6 +234,10 @@ impl RunContext {
             }
             result.entries.push(entry);
         }
+
+        // ── Finalize evidence (always preserved, not deleted) ──
+        // Evidence is preserved for diagnostics; retention policy
+        // is applied by the startup janitor.
 
         result.examined = result.deleted + result.preserved;
         tracing::info!(
@@ -269,9 +276,16 @@ impl Drop for RunContext {
         if let Some(ref tmp) = self.original_tmp {
             std::env::set_var("TMP", tmp);
         }
-        // Markers are finalized as abandoned so startup janitor can find them.
+        // Finalize all managed directories as abandoned so the
+        // startup janitor can find and reclaim them.
         if let Some(ref temp) = self.managed_temp {
             let _ = temp.finalize(MarkerState::Abandoned);
+        }
+        if let Some(ref ev) = self.managed_evidence {
+            let _ = ev.finalize(MarkerState::Abandoned);
+        }
+        if let Some(ref cargo) = self.managed_cargo {
+            let _ = cargo.finalize(MarkerState::Abandoned);
         }
     }
 }

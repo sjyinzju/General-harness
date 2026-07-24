@@ -124,6 +124,25 @@ impl HarnessEvidenceDir {
         check_dir_contents(&self.path, &mut forbidden);
         forbidden
     }
+
+    /// Check whether a file of the given byte size may be written to this
+    /// evidence directory.  Rejects files that exceed `max_single_file_bytes`.
+    pub fn check_file_size(
+        &self,
+        size_bytes: u64,
+        retention: &EvidenceRetention,
+    ) -> Result<(), String> {
+        if size_bytes > retention.max_single_file_bytes {
+            return Err(format!(
+                "file of {} bytes exceeds evidence max single file {} bytes; \
+                 file would be rejected from {}",
+                size_bytes,
+                retention.max_single_file_bytes,
+                self.path.display()
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Apply evidence retention policy to a managed evidence root.
@@ -183,14 +202,30 @@ pub fn apply_evidence_retention(
             .collect();
         let unmarked: Vec<_> = run_dirs.iter().filter(|(_, m)| m.is_none()).collect();
 
-        // Keep the most recent N.
+        // Sort chronologically by marker created_at (oldest first).
+        // Timestamps are RFC 3339 strings that sort lexicographically.
+        fn marker_time(marker: &Option<OwnershipMarker>) -> String {
+            marker
+                .as_ref()
+                .and_then(|m| m.completed_at.as_deref().or(Some(&m.created_at)))
+                .unwrap_or("")
+                .to_string()
+        }
+
+        // ── Count-based retention ────────────────────────────────
         let excess_successful = successful.len().saturating_sub(retention.max_successful);
         let excess_failed = failed.len().saturating_sub(retention.max_failed);
 
-        // Process excess successful (oldest first, assuming lexical sort ~ chronological).
+        // Collect remaining runs AFTER count-based eviction.
+        let mut remaining_runs: Vec<(PathBuf, Option<OwnershipMarker>)> = Vec::new();
+
+        // Process excess successful (oldest first by marker timestamp).
         let mut sorted_successful: Vec<_> = successful.iter().map(|(p, m)| (p, m)).collect();
-        sorted_successful.sort_by_key(|(p, _)| p.to_string_lossy().to_string());
-        for (path, _marker) in sorted_successful.iter().take(excess_successful) {
+        sorted_successful.sort_by_key(|(_, m)| marker_time(m));
+        let excess_candidates: Vec<_> = sorted_successful.iter().take(excess_successful).collect();
+        let kept_successful: Vec<_> = sorted_successful.iter().skip(excess_successful).collect();
+
+        for (path, _marker) in &excess_candidates {
             result.examined += 1;
             let entry = if apply {
                 guard.guarded_delete(
@@ -205,18 +240,20 @@ pub fn apply_evidence_retention(
                     Some(ManagedDirKind::HarnessManagedEvidence),
                 )
             };
-            if entry.action == CleanupAction::Delete {
-                result.deleted += 1;
-            } else {
-                result.preserved += 1;
-            }
-            result.entries.push(entry);
+            record_entry(&mut result, &entry);
         }
 
-        // Process excess failed.
+        for (path, marker) in &kept_successful {
+            remaining_runs.push(((**path).clone(), (**marker).clone()));
+        }
+
+        // Process excess failed (oldest first).
         let mut sorted_failed: Vec<_> = failed.iter().map(|(p, m)| (p, m)).collect();
-        sorted_failed.sort_by_key(|(p, _)| p.to_string_lossy().to_string());
-        for (path, _marker) in sorted_failed.iter().take(excess_failed) {
+        sorted_failed.sort_by_key(|(_, m)| marker_time(m));
+        let excess_failed_candidates: Vec<_> = sorted_failed.iter().take(excess_failed).collect();
+        let kept_failed: Vec<_> = sorted_failed.iter().skip(excess_failed).collect();
+
+        for (path, _marker) in &excess_failed_candidates {
             result.examined += 1;
             let entry = if apply {
                 guard.guarded_delete(
@@ -231,12 +268,47 @@ pub fn apply_evidence_retention(
                     Some(ManagedDirKind::HarnessManagedEvidence),
                 )
             };
-            if entry.action == CleanupAction::Delete {
-                result.deleted += 1;
-            } else {
-                result.preserved += 1;
+            record_entry(&mut result, &entry);
+        }
+
+        for (path, marker) in &kept_failed {
+            remaining_runs.push(((**path).clone(), (**marker).clone()));
+        }
+
+        // ── Byte-quota retention ─────────────────────────────────
+        // Sort remaining runs by marker time (oldest first) and evict
+        // until total bytes are under max_total_bytes.
+        if retention.max_total_bytes > 0 {
+            remaining_runs.sort_by_key(|(_, m)| marker_time(m));
+            let mut total_bytes: u64 = remaining_runs
+                .iter()
+                .map(|(p, _)| super::types::dir_size(p))
+                .sum();
+
+            for (path, _marker) in &remaining_runs {
+                if total_bytes <= retention.max_total_bytes {
+                    break;
+                }
+                let size = super::types::dir_size(path);
+                result.examined += 1;
+                let entry = if apply {
+                    guard.guarded_delete(
+                        path,
+                        evidence_root,
+                        Some(ManagedDirKind::HarnessManagedEvidence),
+                    )
+                } else {
+                    guard.dry_run(
+                        path,
+                        evidence_root,
+                        Some(ManagedDirKind::HarnessManagedEvidence),
+                    )
+                };
+                record_entry(&mut result, &entry);
+                if entry.action == CleanupAction::Delete {
+                    total_bytes = total_bytes.saturating_sub(size);
+                }
             }
-            result.entries.push(entry);
         }
 
         // Unmarked entries are always preserved.
@@ -255,6 +327,14 @@ pub fn apply_evidence_retention(
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
+
+fn record_entry(result: &mut CleanupResult, entry: &CleanupEntry) {
+    match entry.action {
+        CleanupAction::Delete => result.deleted += 1,
+        CleanupAction::Preserve => result.preserved += 1,
+    }
+    result.entries.push(entry.clone());
+}
 
 fn read_marker(dir: &Path) -> Option<OwnershipMarker> {
     let raw = std::fs::read_to_string(dir.join(OWNERSHIP_MARKER_FILENAME)).ok()?;

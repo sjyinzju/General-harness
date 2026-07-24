@@ -247,9 +247,25 @@ async fn binary_cancel() {
         &db,
     );
     let l = lid(&o);
-    assert!(run(&["task-loop", "cancel", &l, "--owner", "ci"], &db)
-        .status
-        .success());
+    let cancel_output = run(
+        &[
+            "task-loop",
+            "cancel",
+            &l,
+            "--owner",
+            "ci",
+            "--repo",
+            &rp,
+            "--worktree-root",
+            &w,
+        ],
+        &db,
+    );
+    assert!(
+        cancel_output.status.success(),
+        "cancel failed: {}",
+        String::from_utf8_lossy(&cancel_output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -277,7 +293,19 @@ async fn binary_inspect_json() {
         &db,
     );
     let l = lid(&o);
-    let o2 = run(&["task-loop", "inspect", &l, "--json"], &db);
+    let o2 = run(
+        &[
+            "task-loop",
+            "inspect",
+            &l,
+            "--json",
+            "--repo",
+            &rp,
+            "--worktree-root",
+            &w,
+        ],
+        &db,
+    );
     let s = String::from_utf8_lossy(&o2.stdout);
     assert!(s.contains(&l), "inspect output missing loop_id");
     serde_json::from_str::<serde_json::Value>(&s).expect("inspect output not valid JSON");

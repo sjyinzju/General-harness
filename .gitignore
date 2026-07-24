@@ -3,8 +3,11 @@ reference
 # Rust build artifacts
 target/
 
+# Debug symbols
 *.pdb
-# Rust build artifacts
-target/
 
-I4.5_FINAL_CERTIFICATION_REPORT.mdharness.db*
+# Runtime SQLite database files (default path is now target/data/harness.db)
+harness.db
+harness.db-shm
+harness.db-wal
+harness.db-journal

@@ -421,6 +421,66 @@ impl DeletionGuard {
         None
     }
 
+    /// Lightweight safety check for paths that use a different marker
+    /// system (e.g., the legacy `.harness-owner.json` artifact format).
+    /// Performs canonicalization, containment, symlink, protected-path,
+    /// shared-cargo, and .git checks but does NOT require the liveness
+    /// ownership marker.
+    ///
+    /// Returns `None` if the path is safe to delete, or `Some(reason)`
+    /// if it is blocked.
+    pub fn validate_path_safety(&self, path: &Path, expected_root: &Path) -> Option<String> {
+        // Path must exist.
+        if !path.exists() {
+            return Some(format!("path does not exist: {}", path.display()));
+        }
+
+        // Not a symlink/junction.
+        if let Ok(meta) = path.symlink_metadata() {
+            if meta.file_type().is_symlink() {
+                return Some(format!("path is a symlink: {}", path.display()));
+            }
+        } else {
+            return Some(format!("cannot read metadata: {}", path.display()));
+        }
+
+        // Canonicalize and check containment.
+        let canonical = match path.canonicalize() {
+            Ok(c) => c,
+            Err(e) => return Some(format!("cannot canonicalize: {e}")),
+        };
+        let root_canonical = match expected_root.canonicalize() {
+            Ok(c) => c,
+            Err(e) => return Some(format!("cannot canonicalize root: {e}")),
+        };
+        if !canonical.starts_with(&root_canonical) {
+            return Some(format!(
+                "path {} is not under expected root {}",
+                canonical.display(),
+                root_canonical.display()
+            ));
+        }
+        if canonical == root_canonical {
+            return Some(format!(
+                "refusing to delete root itself: {}",
+                canonical.display()
+            ));
+        }
+
+        // Protected path checks.
+        if self.config.protected.is_protected(&canonical) {
+            return Some(format!("path is protected: {}", canonical.display()));
+        }
+        if self.config.protected.is_under_shared_cargo(&canonical) {
+            return Some(format!("refusing shared cargo: {}", canonical.display()));
+        }
+        if self.config.protected.is_git_dir(&canonical) {
+            return Some("refusing .git directory".into());
+        }
+
+        None
+    }
+
     /// Scan all immediate children of a managed root, evaluating each
     /// against the guard.  Returns a `CleanupResult`.
     pub fn scan_managed_root(
@@ -500,20 +560,79 @@ fn managed_root_to_kind(root: &Path) -> ManagedDirKind {
 
 /// Check whether a process with the given PID was created at the expected
 /// time.  Used to guard against PID reuse.
+///
+/// Returns `true` when the PID is alive AND the process creation time
+/// matches the expected RFC 3339 timestamp.  Returns `false` when:
+/// - The PID is not alive (process exited).
+/// - The PID is alive but creation time differs (PID was reused).
+/// - The creation time cannot be read (fail-safe: treat as mismatch).
 #[cfg(windows)]
-fn check_process_creation_time(pid: u32, _expected: &str) -> bool {
-    // On Windows, comparing process creation times requires opening the
-    // process with QUERY_LIMITED_INFORMATION and calling
-    // GetProcessTimes.  For now, we return `true` when the PID is alive
-    // (conservative: deny deletion when the PID exists, regardless of
-    // creation time).  PID reuse is rare enough that this is acceptable;
-    // the grace period (30 min) provides an additional safety margin.
-    is_pid_alive(pid)
+#[allow(unsafe_code)]
+fn check_process_creation_time(pid: u32, expected: &str) -> bool {
+    use std::os::windows::io::RawHandle;
+
+    // Parse the expected timestamp to seconds since Unix epoch.
+    let expected_secs = match chrono::DateTime::parse_from_rfc3339(expected) {
+        Ok(dt) => dt.timestamp(),
+        Err(_) => {
+            // Cannot parse expected — fail safe.
+            tracing::warn!(
+                pid = pid,
+                expected = %expected,
+                "cannot parse expected creation time; refusing creation-time match"
+            );
+            return false;
+        }
+    };
+
+    unsafe {
+        let handle = windows_sys::Win32::System::Threading::OpenProcess(
+            windows_sys::Win32::System::Threading::PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            pid,
+        );
+        if handle.is_null() {
+            // Process not accessible or not alive.
+            return false;
+        }
+
+        let mut creation: windows_sys::Win32::Foundation::FILETIME = std::mem::zeroed();
+        let mut exit: windows_sys::Win32::Foundation::FILETIME = std::mem::zeroed();
+        let mut kernel: windows_sys::Win32::Foundation::FILETIME = std::mem::zeroed();
+        let mut user: windows_sys::Win32::Foundation::FILETIME = std::mem::zeroed();
+
+        let ok = windows_sys::Win32::System::Threading::GetProcessTimes(
+            handle as RawHandle,
+            &mut creation,
+            &mut exit,
+            &mut kernel,
+            &mut user,
+        );
+        windows_sys::Win32::Foundation::CloseHandle(handle);
+
+        if ok == 0 {
+            // Cannot read process times — fail safe.
+            tracing::warn!(
+                pid = pid,
+                "GetProcessTimes failed; refusing creation-time match"
+            );
+            return false;
+        }
+
+        // FILETIME: 100-nanosecond intervals since 1601-01-01.
+        // Convert to seconds since Unix epoch (1970-01-01).
+        let ft_u64 = (creation.dwHighDateTime as u64) << 32 | (creation.dwLowDateTime as u64);
+        // 11644473600 = seconds between 1601 and 1970.
+        let creation_secs = (ft_u64 / 10_000_000).saturating_sub(11_644_473_600);
+
+        creation_secs == expected_secs as u64
+    }
 }
 
 #[cfg(not(windows))]
 fn check_process_creation_time(pid: u32, _expected: &str) -> bool {
     // On Unix we could read /proc/<pid>/stat starttime.
+    // For now, conservative: check PID alive only.
     is_pid_alive(pid)
 }
 

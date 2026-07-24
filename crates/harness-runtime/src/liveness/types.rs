@@ -217,6 +217,7 @@ pub struct ProtectedPaths {
     pub repo_root: PathBuf,
     pub target_root: PathBuf,
     pub shared_cargo_target: PathBuf,
+    pub shared_cargo_cache: PathBuf,
     pub user_profile: PathBuf,
     pub system_temp_root: PathBuf,
 }
@@ -231,10 +232,13 @@ impl ProtectedPaths {
             .unwrap_or_else(|| PathBuf::from("C:\\Users"));
         let system_temp_root = std::env::temp_dir();
 
+        let shared_cargo_cache = target_root.join("cargo-shared");
+
         Self {
             repo_root: repo_root.to_path_buf(),
             target_root,
             shared_cargo_target,
+            shared_cargo_cache,
             user_profile,
             system_temp_root,
         }
@@ -246,12 +250,14 @@ impl ProtectedPaths {
         canonical == self.repo_root
             || canonical == self.target_root
             || canonical == self.shared_cargo_target
+            || canonical == self.shared_cargo_cache
             || canonical == self.user_profile
             || canonical == self.system_temp_root
             // Also compare canonicalized versions (Windows \\?\ prefix).
             || self.try_canonical_eq(canonical, &self.repo_root)
             || self.try_canonical_eq(canonical, &self.target_root)
             || self.try_canonical_eq(canonical, &self.shared_cargo_target)
+            || self.try_canonical_eq(canonical, &self.shared_cargo_cache)
             || self.try_canonical_eq(canonical, &self.user_profile)
             || self.try_canonical_eq(canonical, &self.system_temp_root)
             || canonical.starts_with(&self.user_profile)
@@ -279,11 +285,14 @@ impl ProtectedPaths {
             }
     }
 
-    /// Check if a path IS or IS UNDER the shared cargo target (debug/).
+    /// Check if a path IS or IS UNDER a shared cargo target (debug/ or cargo-shared/).
     pub fn is_under_shared_cargo(&self, canonical: &std::path::Path) -> bool {
         canonical == self.shared_cargo_target
             || canonical.starts_with(&self.shared_cargo_target)
             || self.try_canonical_prefix(canonical, &self.shared_cargo_target)
+            || canonical == self.shared_cargo_cache
+            || canonical.starts_with(&self.shared_cargo_cache)
+            || self.try_canonical_prefix(canonical, &self.shared_cargo_cache)
     }
 
     /// Check if a path is the repo's `.git` directory or any path within it.

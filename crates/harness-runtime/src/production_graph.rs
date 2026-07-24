@@ -22,6 +22,7 @@ use std::time::Duration;
 
 use harness_core::contracts::scheduler::ConcurrencyConfig;
 use sqlx::SqlitePool;
+use tokio_util::sync::CancellationToken;
 
 use crate::lease::clock::SystemClock;
 use crate::lease::types::LeaseConfig;
@@ -75,7 +76,7 @@ impl ProductionGraph {
         pool: SqlitePool,
         worktree_root: &std::path::Path,
         repo_root: &std::path::Path,
-        run_context: RunContext,
+        run_context: Arc<RunContext>,
     ) -> Result<Self, String> {
         // ── Clock (production: wall-clock) ──────────────────────────
         let clock: Arc<dyn crate::lease::clock::Clock + Send + Sync> = Arc::new(SystemClock);
@@ -164,7 +165,7 @@ impl ProductionGraph {
             claim_service,
             heartbeat_registry,
             liveness_orchestrator: Arc::new(liveness_orchestrator),
-            run_context: Arc::new(run_context),
+            run_context,
         })
     }
 
@@ -175,11 +176,31 @@ impl ProductionGraph {
         self.liveness_orchestrator.startup_janitor(vec![]).await
     }
 
+    /// Start the periodic janitor background task.  Returns a
+    /// `CancellationToken` that MUST be used to stop the task
+    /// before shutdown.
+    ///
+    /// The periodic janitor runs every `interval` and reclaims
+    /// stale owned artifacts. Exactly one instance is started;
+    /// the caller must ensure no duplicate calls.
+    pub fn start_periodic_janitor(&self, interval: Duration) -> CancellationToken {
+        self.liveness_orchestrator.start_periodic_janitor(interval)
+    }
+
+    /// Shutdown the managed run context.  Restores TEMP/TMP,
+    /// finalizes markers, and cleans up managed directories.
+    /// Must be called before process exit.
+    pub async fn shutdown(&self, run_succeeded: bool) -> crate::liveness::CleanupResult {
+        self.run_context.shutdown(run_succeeded).await
+    }
+
     /// Build a production graph for tests (no managed temp env redirect).
     /// Liveness is still mandatory but uses a test config.
     pub fn build_for_tests(pool: SqlitePool, repo_root: &std::path::Path) -> Result<Self, String> {
-        let run_context = RunContext::create(repo_root, "test-head", false)
-            .map_err(|e| format!("run context: {e}"))?;
+        let run_context = Arc::new(
+            RunContext::create(repo_root, "test-head", false)
+                .map_err(|e| format!("run context: {e}"))?,
+        );
         let worktree_root = run_context
             .managed_temp()
             .map(|t| t.path().to_path_buf())
