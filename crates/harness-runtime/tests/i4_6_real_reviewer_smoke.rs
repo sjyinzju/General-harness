@@ -93,7 +93,8 @@ fn mk_profile(id: &str, kind: &str, exe: &str) -> RuntimeProfile {
             supported_platforms: vec!["windows".into()],
         },
         core_status: CoreStatus::Available,
-        authentication_status: harness_core::contracts::runtime_profile::AuthCheckStatus::Authenticated,
+        authentication_status:
+            harness_core::contracts::runtime_profile::AuthCheckStatus::Authenticated,
         execution_status: ExecutionStatus::SmokeTestPassed,
         optional_integrations: vec![],
         discovery_source: "real-smoke".into(),
@@ -491,24 +492,20 @@ mod tests {
     let reviewer = &profiles[0]; // claude
     assert_ne!(executor.id, reviewer.id);
     assert_ne!(executor.agent_kind, reviewer.agent_kind);
-    println!(
-        "Executor: {} ({})",
-        executor.id, executor.agent_kind
-    );
-    println!(
-        "Reviewer: {} ({})",
-        reviewer.id, reviewer.agent_kind
-    );
+    println!("Executor: {} ({})", executor.id, executor.agent_kind);
+    println!("Reviewer: {} ({})", reviewer.id, reviewer.agent_kind);
 
     // ── Set up database and service ────────────────────────────────
     let db = Database::open(&sb.join("harness.db")).await.unwrap();
     let svc = ReviewOrchestrationService::new(db.pool.clone());
 
     // Seed
-    sqlx::query("INSERT INTO projects(id,objective,lifecycle) VALUES('p1','review-smoke','active')")
-        .execute(&db.pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO projects(id,objective,lifecycle) VALUES('p1','review-smoke','active')",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
     sqlx::query(
         "INSERT INTO tasks(id,project_id,goal,lifecycle) VALUES('t1','p1','add doc comment to add() function','verified')",
     )
@@ -607,7 +604,7 @@ mod tests {
     let prompt_bytes = prompt.len();
     println!("Prompt size: {} bytes", prompt_bytes);
 
-    let review_start = chrono::Utc::now();
+    let _review_start = chrono::Utc::now();
 
     // Log invocation
     let inv_id = svc
@@ -623,7 +620,12 @@ mod tests {
 
     // ── Capture git state BEFORE reviewer ───────────────────────
     let before_diff = String::from_utf8_lossy(
-        &Command::new("git").args(["diff"]).current_dir(&repo_dir).output().unwrap().stdout,
+        &Command::new("git")
+            .args(["diff"])
+            .current_dir(&repo_dir)
+            .output()
+            .unwrap()
+            .stdout,
     )
     .to_string();
     let before_untracked = String::from_utf8_lossy(
@@ -670,10 +672,7 @@ mod tests {
             println!("Summary: {}", reviewer_output.summary);
             println!("Findings: {}", reviewer_output.findings.len());
             for f in &reviewer_output.findings {
-                println!(
-                    "  [{}] {}: {}",
-                    f.severity, f.category, f.summary
-                );
+                println!("  [{}] {}: {}", f.severity, f.category, f.summary);
             }
 
             // Check that the output is parseable
@@ -690,7 +689,12 @@ mod tests {
             // ── Read-only verification ───────────────────────────────
             // Capture git state AFTER reviewer
             let after_diff = String::from_utf8_lossy(
-                &Command::new("git").args(["diff"]).current_dir(&repo_dir).output().unwrap().stdout,
+                &Command::new("git")
+                    .args(["diff"])
+                    .current_dir(&repo_dir)
+                    .output()
+                    .unwrap()
+                    .stdout,
             )
             .to_string();
             let after_untracked = String::from_utf8_lossy(
@@ -752,14 +756,8 @@ mod tests {
             println!("Reviewer: {} ({})", reviewer.id, reviewer.agent_kind);
             println!("Reviewer is fake: false");
             println!("Decision: {:?}", decision);
-            println!(
-                "Structured output parsed: {}",
-                parsed_decision.is_some()
-            );
-            println!(
-                "Candidate digest unchanged: {}",
-                !reviewer_modified
-            );
+            println!("Structured output parsed: {}", parsed_decision.is_some());
+            println!("Candidate digest unchanged: {}", !reviewer_modified);
             println!(
                 "Candidate files modified by reviewer: {}",
                 if reviewer_modified { 1 } else { 0 }
@@ -773,10 +771,7 @@ mod tests {
             println!("Exit code: {exit_code}");
             println!("Duration: {duration_ms}ms");
             println!("Prompt bytes: {prompt_bytes}");
-            println!(
-                "Candidate modified by reviewer: {}",
-                reviewer_modified
-            );
+            println!("Candidate modified by reviewer: {}", reviewer_modified);
             println!(
                 "Candidate files modified by reviewer: {}",
                 if reviewer_modified { 1 } else { 0 }
@@ -836,10 +831,7 @@ async fn real_reviewer_timeout_control() {
             println!("Completed in {duration_ms}ms (within timeout)");
         }
         Err(e) => {
-            assert!(
-                e.contains("timeout"),
-                "Expected timeout error, got: {e}"
-            );
+            assert!(e.contains("timeout"), "Expected timeout error, got: {e}");
             println!("Timeout controlled: {e}");
         }
     }

@@ -140,6 +140,7 @@ impl ControlledCommitService {
     ///
     /// Idempotent: same inputs → same CommitCandidate.
     /// Handles: concurrent creators, response-lost retries, Git object before DB.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_commit(
         &self,
         approved: &ApprovedCandidate,
@@ -187,11 +188,7 @@ impl ControlledCommitService {
             "commit-{}-{}-{}",
             approved.candidate_id, approved.review_id, target_ref
         );
-        if let Some(existing) = self
-            .commit_repo
-            .find_by_idempotency_key(&ikey)
-            .await?
-        {
+        if let Some(existing) = self.commit_repo.find_by_idempotency_key(&ikey).await? {
             // Check if commit already created
             if let Some(cc) = self
                 .commit_repo
@@ -243,15 +240,29 @@ impl ControlledCommitService {
         }
 
         // Emit event
-        self.emit_event(&commit_request_id, &approved.candidate_id, "CommitRequested", "{}")
-            .await;
+        self.emit_event(
+            &commit_request_id,
+            &approved.candidate_id,
+            "CommitRequested",
+            "{}",
+        )
+        .await;
 
         // 5. Transition to Materializing
         self.commit_repo
-            .transition_state(&commit_request_id, &CommitState::Requested, &CommitState::Materializing)
+            .transition_state(
+                &commit_request_id,
+                &CommitState::Requested,
+                &CommitState::Materializing,
+            )
             .await?;
-        self.emit_event(&commit_request_id, &approved.candidate_id, "CommitMaterializationStarted", "{}")
-            .await;
+        self.emit_event(
+            &commit_request_id,
+            &approved.candidate_id,
+            "CommitMaterializationStarted",
+            "{}",
+        )
+        .await;
 
         // 6. Log attempt
         let attempt_id = format!("catt-{}", Uuid::new_v4());
@@ -302,7 +313,11 @@ impl ControlledCommitService {
 
         // 10. Transition to Created
         self.commit_repo
-            .transition_state(&commit_request_id, &CommitState::Materializing, &CommitState::Created)
+            .transition_state(
+                &commit_request_id,
+                &CommitState::Materializing,
+                &CommitState::Created,
+            )
             .await?;
 
         // Complete attempt
@@ -455,6 +470,7 @@ impl ControlledCommitService {
 
     /// Create a commit object using git commit-tree.
     /// Uses environment variables for author/committer identity — never modifies global config.
+    #[allow(clippy::too_many_arguments)]
     async fn git_commit_tree(
         &self,
         repo_path: &Path,
@@ -471,14 +487,7 @@ impl ControlledCommitService {
         let committer_env = format!("{} <{}> {}", committer.name, committer.email, ts_str);
 
         let output = std::process::Command::new("git")
-            .args([
-                "commit-tree",
-                tree_oid,
-                "-p",
-                parent_oid,
-                "-m",
-                message,
-            ])
+            .args(["commit-tree", tree_oid, "-p", parent_oid, "-m", message])
             .env("GIT_AUTHOR_NAME", &author.name)
             .env("GIT_AUTHOR_EMAIL", &author.email)
             .env("GIT_AUTHOR_DATE", &author_env)
@@ -546,8 +555,7 @@ impl ControlledCommitService {
                 ErrorCode::WorkspaceError,
                 format!(
                     "commit tree mismatch: expected tree {}, got line: {}",
-                    expected_tree,
-                    first_line
+                    expected_tree, first_line
                 ),
                 ErrorSource::System,
             ));
@@ -557,7 +565,10 @@ impl ControlledCommitService {
         if !output.contains(&format!("parent {}", expected_parent)) {
             return Err(CoreError::new(
                 ErrorCode::WorkspaceError,
-                format!("commit parent mismatch: expected parent {}", expected_parent),
+                format!(
+                    "commit parent mismatch: expected parent {}",
+                    expected_parent
+                ),
                 ErrorSource::System,
             ));
         }
@@ -584,7 +595,10 @@ impl ControlledCommitService {
 
     // ── DB Helpers ────────────────────────────────────────────────────
 
-    async fn get_candidate(&self, id: &CandidateId) -> Result<Option<CandidateSnapshot>, CoreError> {
+    async fn get_candidate(
+        &self,
+        id: &CandidateId,
+    ) -> Result<Option<CandidateSnapshot>, CoreError> {
         let row: Option<CandidateSnapshot> = sqlx::query_as::<_, (String, String, String, String, String, String, String, String, String, String, String)>(
             "SELECT candidate_id, task_id, execution_id, executor_profile_id, workspace_id, base_commit, candidate_tree_hash, diff_digest, task_spec_digest, evidence_digest, created_at FROM candidate_snapshots WHERE candidate_id = ?",
         )
@@ -641,11 +655,23 @@ impl ControlledCommitService {
 
     // ── Events ────────────────────────────────────────────────────────
 
-    async fn emit_event(&self, commit_request_id: &str, candidate_id: &str, event_type: &str, payload_json: &str) {
+    async fn emit_event(
+        &self,
+        commit_request_id: &str,
+        candidate_id: &str,
+        event_type: &str,
+        payload_json: &str,
+    ) {
         let event_id = format!("evt-{}", Uuid::new_v4());
         let _ = self
             .commit_repo
-            .write_event(&event_id, commit_request_id, candidate_id, event_type, payload_json)
+            .write_event(
+                &event_id,
+                commit_request_id,
+                candidate_id,
+                event_type,
+                payload_json,
+            )
             .await;
     }
 
@@ -655,7 +681,10 @@ impl ControlledCommitService {
         self.commit_repo.get_request(id).await
     }
 
-    pub async fn get_commit_candidate(&self, id: &str) -> Result<Option<CommitCandidate>, CoreError> {
+    pub async fn get_commit_candidate(
+        &self,
+        id: &str,
+    ) -> Result<Option<CommitCandidate>, CoreError> {
         self.commit_repo.get_candidate(id).await
     }
 }

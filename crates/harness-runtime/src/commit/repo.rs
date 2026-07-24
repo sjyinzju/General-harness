@@ -5,7 +5,11 @@ use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 
 fn db_err(e: sqlx::Error) -> CoreError {
-    CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System)
+    CoreError::new(
+        ErrorCode::PersistenceError,
+        e.to_string(),
+        ErrorSource::System,
+    )
 }
 
 pub struct CommitRepo {
@@ -48,7 +52,10 @@ impl CommitRepo {
     }
 
     /// Look up a request by its idempotency key.
-    pub async fn find_by_idempotency_key(&self, ikey: &str) -> Result<Option<CommitRequest>, CoreError> {
+    pub async fn find_by_idempotency_key(
+        &self,
+        ikey: &str,
+    ) -> Result<Option<CommitRequest>, CoreError> {
         let row: Option<CommitRequestRow> = sqlx::query_as(
             "SELECT commit_request_id, candidate_id, review_id, repository_id, target_ref, expected_base_commit, author_name, author_email, committer_name, committer_email, commit_timestamp, message, state, idempotency_key, idempotency_digest, created_at FROM commit_requests WHERE idempotency_key = ?",
         )
@@ -73,13 +80,12 @@ impl CommitRepo {
 
     /// Get just the state of a commit request.
     pub async fn get_state(&self, id: &str) -> Result<Option<String>, CoreError> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT state FROM commit_requests WHERE commit_request_id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT state FROM commit_requests WHERE commit_request_id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
         Ok(row.map(|r| r.0))
     }
 
@@ -146,7 +152,10 @@ impl CommitRepo {
     }
 
     /// Get a commit candidate by request ID.
-    pub async fn get_candidate(&self, commit_request_id: &str) -> Result<Option<CommitCandidate>, CoreError> {
+    pub async fn get_candidate(
+        &self,
+        commit_request_id: &str,
+    ) -> Result<Option<CommitCandidate>, CoreError> {
         let row: Option<CommitCandidateRow> = sqlx::query_as(
             "SELECT commit_request_id, candidate_id, review_id, repository_id, commit_oid, parent_oid, tree_oid, diff_digest, created_at FROM commit_candidates WHERE commit_request_id = ?",
         )
@@ -260,8 +269,14 @@ impl From<CommitRequestRow> for CommitRequest {
             repository_id: r.repository_id,
             target_ref: r.target_ref,
             expected_base_commit: r.expected_base_commit,
-            author_identity: harness_core::contracts::commit::GitIdentity::new(&r.author_name, &r.author_email),
-            committer_identity: harness_core::contracts::commit::GitIdentity::new(&r.committer_name, &r.committer_email),
+            author_identity: harness_core::contracts::commit::GitIdentity::new(
+                &r.author_name,
+                &r.author_email,
+            ),
+            committer_identity: harness_core::contracts::commit::GitIdentity::new(
+                &r.committer_name,
+                &r.committer_email,
+            ),
             commit_timestamp: ts,
             message: r.message,
             idempotency_key: r.idempotency_key,
@@ -303,5 +318,5 @@ fn parse_dt(s: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
         .ok()
         .and_then(|dt| dt.and_utc().into())
-        .unwrap_or_else(|| chrono::Utc::now())
+        .unwrap_or_else(chrono::Utc::now)
 }

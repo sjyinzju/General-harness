@@ -37,14 +37,23 @@ impl IntegrationFsm {
         matches!(
             (from, to),
             (IntegrationState::Queued, IntegrationState::WaitingForLease)
-                | (IntegrationState::WaitingForLease, IntegrationState::Preparing)
+                | (
+                    IntegrationState::WaitingForLease,
+                    IntegrationState::Preparing
+                )
                 | (IntegrationState::Preparing, IntegrationState::Applying)
                 | (IntegrationState::Preparing, IntegrationState::Blocked)
                 | (IntegrationState::Applying, IntegrationState::Verifying)
                 | (IntegrationState::Applying, IntegrationState::Conflict)
                 | (IntegrationState::Applying, IntegrationState::Stale)
-                | (IntegrationState::Verifying, IntegrationState::ReadyToPublish)
-                | (IntegrationState::ReadyToPublish, IntegrationState::Integrated)
+                | (
+                    IntegrationState::Verifying,
+                    IntegrationState::ReadyToPublish
+                )
+                | (
+                    IntegrationState::ReadyToPublish,
+                    IntegrationState::Integrated
+                )
         )
     }
 
@@ -53,11 +62,20 @@ impl IntegrationFsm {
         matches!(
             (from, to),
             (IntegrationState::Queued, IntegrationState::WaitingForLease)
-                | (IntegrationState::WaitingForLease, IntegrationState::Preparing)
+                | (
+                    IntegrationState::WaitingForLease,
+                    IntegrationState::Preparing
+                )
                 | (IntegrationState::Preparing, IntegrationState::Applying)
                 | (IntegrationState::Applying, IntegrationState::Verifying)
-                | (IntegrationState::Verifying, IntegrationState::ReadyToPublish)
-                | (IntegrationState::ReadyToPublish, IntegrationState::Integrated)
+                | (
+                    IntegrationState::Verifying,
+                    IntegrationState::ReadyToPublish
+                )
+                | (
+                    IntegrationState::ReadyToPublish,
+                    IntegrationState::Integrated
+                )
         )
     }
 }

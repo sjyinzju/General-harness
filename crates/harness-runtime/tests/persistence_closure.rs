@@ -71,8 +71,8 @@ async fn table_count_10_business_tables() {
     let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(
         names.len(),
-        50,
-        "Expected 50 business tables (001–023), got: {names:?}"
+        60,
+        "Expected 60 business tables (001–025), got: {names:?}"
     );
     assert_eq!(
         names,
@@ -80,11 +80,21 @@ async fn table_count_10_business_tables() {
             "agent_definitions",
             "agent_provider_hints",
             "candidate_snapshots",
+            "commit_candidates",
+            "commit_creation_attempts",
+            "commit_events",
+            "commit_requests",
             "discovery_evidence",
             "dispatch_operations",
             "event_log",
             "execution_attempts",
             "idempotency_records",
+            "integration_attempts",
+            "integration_events",
+            "integration_leases",
+            "integration_requests",
+            "integration_results",
+            "integration_verifications",
             "operations",
             "policy_approvals",
             "policy_evaluations",

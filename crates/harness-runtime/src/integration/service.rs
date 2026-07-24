@@ -30,6 +30,7 @@ impl IntegrationQueueService {
 
     /// Enqueue an integration request for a commit candidate.
     /// Idempotent: same candidate + repo + target_ref returns existing request.
+    #[allow(clippy::too_many_arguments)]
     pub async fn enqueue(
         &self,
         integration_id: &IntegrationId,
@@ -42,17 +43,15 @@ impl IntegrationQueueService {
         priority: i32,
     ) -> Result<IntegrationRequest, CoreError> {
         // Validate target ref
-        IntegrationRequest::validate_target_ref(target_ref).map_err(|e| {
-            CoreError::new(ErrorCode::InvalidState, e, ErrorSource::System)
-        })?;
+        IntegrationRequest::validate_target_ref(target_ref)
+            .map_err(|e| CoreError::new(ErrorCode::InvalidState, e, ErrorSource::System))?;
 
         // Idempotency: check existing
-        let ikey = format!("integrate-{}-{}-{}", candidate_id, repository_id, target_ref);
-        if let Some(existing) = self
-            .integration_repo
-            .find_by_idempotency_key(&ikey)
-            .await?
-        {
+        let ikey = format!(
+            "integrate-{}-{}-{}",
+            candidate_id, repository_id, target_ref
+        );
+        if let Some(existing) = self.integration_repo.find_by_idempotency_key(&ikey).await? {
             return Ok(existing);
         }
 
@@ -120,7 +119,8 @@ impl IntegrationQueueService {
                 &req.integration_id,
                 None,
                 "IntegrationDequeued",
-                &serde_json::json!({"repository_id": repository_id, "target_ref": target_ref}).to_string(),
+                &serde_json::json!({"repository_id": repository_id, "target_ref": target_ref})
+                    .to_string(),
             )
             .await;
             Ok(Some(req.clone()))
@@ -138,10 +138,7 @@ impl IntegrationQueueService {
         commit_oid: &str,
         parent_oid: &str,
     ) -> Result<IntegrationAttempt, CoreError> {
-        let attempt_count = self
-            .integration_repo
-            .count_attempts(integration_id)
-            .await?;
+        let attempt_count = self.integration_repo.count_attempts(integration_id).await?;
         let attempt_number = attempt_count + 1;
         let attempt_id = format!("iatt-{}", Uuid::new_v4());
 
@@ -213,7 +210,10 @@ impl IntegrationQueueService {
     }
 
     /// Get an integration request by ID.
-    pub async fn get(&self, integration_id: &IntegrationId) -> Result<Option<IntegrationRequest>, CoreError> {
+    pub async fn get(
+        &self,
+        integration_id: &IntegrationId,
+    ) -> Result<Option<IntegrationRequest>, CoreError> {
         self.integration_repo.get_request(integration_id).await
     }
 
@@ -227,27 +227,42 @@ impl IntegrationQueueService {
         .await
         .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
 
-        Ok(rows.into_iter().map(|r| IntegrationRequest {
-            integration_id: r.integration_id,
-            commit_request_id: r.commit_request_id,
-            candidate_id: r.candidate_id,
-            review_id: r.review_id,
-            repository_id: r.repository_id,
-            target_ref: r.target_ref,
-            expected_target_head: r.expected_target_head,
-            priority: r.priority as i32,
-            idempotency_key: r.idempotency_key,
-            created_at: parse_dt(&r.created_at),
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| IntegrationRequest {
+                integration_id: r.integration_id,
+                commit_request_id: r.commit_request_id,
+                candidate_id: r.candidate_id,
+                review_id: r.review_id,
+                repository_id: r.repository_id,
+                target_ref: r.target_ref,
+                expected_target_head: r.expected_target_head,
+                priority: r.priority as i32,
+                idempotency_key: r.idempotency_key,
+                created_at: parse_dt(&r.created_at),
+            })
+            .collect())
     }
 
     // ── Events ────────────────────────────────────────────────────────
 
-    async fn emit_event(&self, integration_id: &str, attempt_id: Option<&str>, event_type: &str, payload_json: &str) {
+    async fn emit_event(
+        &self,
+        integration_id: &str,
+        attempt_id: Option<&str>,
+        event_type: &str,
+        payload_json: &str,
+    ) {
         let event_id = format!("evt-{}", Uuid::new_v4());
         let _ = self
             .integration_repo
-            .write_event(&event_id, integration_id, attempt_id, event_type, payload_json)
+            .write_event(
+                &event_id,
+                integration_id,
+                attempt_id,
+                event_type,
+                payload_json,
+            )
             .await;
     }
 }

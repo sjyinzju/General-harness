@@ -111,11 +111,21 @@ mod tests {
             "agent_definitions",
             "agent_provider_hints",
             "candidate_snapshots",
+            "commit_candidates",
+            "commit_creation_attempts",
+            "commit_events",
+            "commit_requests",
             "discovery_evidence",
             "dispatch_operations",
             "event_log",
             "execution_attempts",
             "idempotency_records",
+            "integration_attempts",
+            "integration_events",
+            "integration_leases",
+            "integration_requests",
+            "integration_results",
+            "integration_verifications",
             "operations",
             "policy_approvals",
             "policy_evaluations",
@@ -162,7 +172,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             names, expected,
-            "50 business tables expected (001\u{2013}023)"
+            "60 business tables expected (001\u{2013}025)"
         );
     }
 

@@ -152,6 +152,14 @@ async fn dispatch_command(args: &[String], db: &Database, graph: &ProductionGrap
                 dispatch_review(args, db).await
             }
         }
+        "integration" => {
+            if args.len() < 3 {
+                eprintln!("error: missing integration subcommand");
+                false
+            } else {
+                dispatch_integration(args, db).await
+            }
+        }
         _ => {
             eprintln!("harness v0.1.0 — unknown command: {}", args[1]);
             false
@@ -309,6 +317,127 @@ async fn cmd_cleanup(
     Ok(())
 }
 
+async fn dispatch_integration(args: &[String], db: &Database) -> bool {
+    match args[2].as_str() {
+        "enqueue" => {
+            let candidate_id = match parse_flag(args, "--candidate") {
+                Some(c) => c,
+                None => {
+                    eprintln!("error: --candidate required");
+                    return false;
+                }
+            };
+            let review_id = match parse_flag(args, "--review") {
+                Some(r) => r,
+                None => {
+                    eprintln!("error: --review required");
+                    return false;
+                }
+            };
+            let commit_id = match parse_flag(args, "--commit") {
+                Some(c) => c,
+                None => {
+                    eprintln!("error: --commit required");
+                    return false;
+                }
+            };
+            let repo_id = parse_flag(args, "--repo-id").unwrap_or("default");
+            let target_ref = parse_flag(args, "--target-ref").unwrap_or("refs/heads/main");
+            let expected_head = parse_flag(args, "--expected-head").unwrap_or("HEAD");
+            let priority: i32 = parse_flag(args, "--priority")
+                .unwrap_or("0")
+                .parse()
+                .unwrap_or(0);
+            match commands::integration::cmd_integration_enqueue(
+                db,
+                candidate_id,
+                review_id,
+                commit_id,
+                repo_id,
+                target_ref,
+                expected_head,
+                priority,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "run-next" => {
+            let repo_id = parse_flag(args, "--repo-id").unwrap_or("default");
+            let target_ref = parse_flag(args, "--target-ref").unwrap_or("refs/heads/main");
+            match commands::integration::cmd_integration_run_next(db, repo_id, target_ref).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "show" => {
+            let json = args.contains(&"--json".to_string());
+            let id = match args.get(3) {
+                Some(i) => i,
+                None => {
+                    eprintln!("error: integration-id required");
+                    return false;
+                }
+            };
+            match commands::integration::cmd_integration_show(db, id, json).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "list" => {
+            let json = args.contains(&"--json".to_string());
+            match commands::integration::cmd_integration_list(db, json).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "cancel" => {
+            let id = match args.get(3) {
+                Some(i) => i,
+                None => {
+                    eprintln!("error: integration-id required");
+                    return false;
+                }
+            };
+            match commands::integration::cmd_integration_cancel(db, id).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "recover" => match commands::integration::cmd_integration_recover(db).await {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("error: {e}");
+                false
+            }
+        },
+        _ => {
+            eprintln!("error: unknown integration subcommand: {}", args[2]);
+            eprintln!(
+                "Usage: harness integration <enqueue|run-next|show|list|cancel|recover> [args]"
+            );
+            false
+        }
+    }
+}
+
 fn print_usage() {
     println!("harness v0.1.0 — task engineering harness");
     println!("Usage:");
@@ -322,6 +451,14 @@ fn print_usage() {
     println!("  harness review run <review-id> [--repo <path>]");
     println!("  harness review show <review-id> [--json] [--repo <path>]");
     println!("  harness review list [--state <state>] [--json] [--repo <path>]");
+    println!("  harness integration enqueue --candidate <id> --review <id> --commit <id> [--repo-id <id>] [--target-ref <ref>] [--priority <n>] [--repo <path>]");
+    println!(
+        "  harness integration run-next [--repo-id <id>] [--target-ref <ref>] [--repo <path>]"
+    );
+    println!("  harness integration show <id> [--json] [--repo <path>]");
+    println!("  harness integration list [--json] [--repo <path>]");
+    println!("  harness integration cancel <id> [--repo <path>]");
+    println!("  harness integration recover [--repo <path>]");
     println!("  harness cleanup [--dry-run|--apply] [--repo <path>]");
     println!();
     println!("Environment:");

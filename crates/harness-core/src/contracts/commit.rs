@@ -61,12 +61,13 @@ impl CommitRequest {
     /// Same inputs → same digest → same commit OID.
     pub fn idempotency_digest(&self) -> String {
         let input = format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
             self.candidate_id,
             self.review_id,
             self.repository_id,
             self.target_ref,
             self.expected_base_commit,
+            self.message,
             self.author_identity.name,
             self.author_identity.email,
             self.committer_identity.name,
@@ -85,12 +86,7 @@ impl CommitRequest {
              Harness-Task: {}\n\
              Harness-Execution: {}\n\
              Harness-Diff-Digest: {}",
-            self.message,
-            self.candidate_id,
-            self.review_id,
-            task_id,
-            execution_id,
-            diff_digest
+            self.message, self.candidate_id, self.review_id, task_id, execution_id, diff_digest
         )
     }
 }
@@ -134,7 +130,10 @@ pub enum CommitState {
 
 impl CommitState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Created | Self::Blocked | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Created | Self::Blocked | Self::Failed | Self::Cancelled
+        )
     }
 
     pub fn is_active(&self) -> bool {

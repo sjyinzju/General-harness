@@ -7,7 +7,11 @@ use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 
 fn db_err(e: sqlx::Error) -> CoreError {
-    CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System)
+    CoreError::new(
+        ErrorCode::PersistenceError,
+        e.to_string(),
+        ErrorSource::System,
+    )
 }
 
 pub struct IntegrationRepo {
@@ -45,7 +49,10 @@ impl IntegrationRepo {
     }
 
     /// Find an existing request by idempotency key.
-    pub async fn find_by_idempotency_key(&self, ikey: &str) -> Result<Option<IntegrationRequest>, CoreError> {
+    pub async fn find_by_idempotency_key(
+        &self,
+        ikey: &str,
+    ) -> Result<Option<IntegrationRequest>, CoreError> {
         let row: Option<IntegrationRequestRow> = sqlx::query_as(
             "SELECT integration_id, commit_request_id, candidate_id, review_id, repository_id, target_ref, expected_target_head, priority, state, idempotency_key, created_at FROM integration_requests WHERE idempotency_key = ?",
         )
@@ -77,13 +84,12 @@ impl IntegrationRepo {
 
     /// Get just the state of an integration request.
     pub async fn get_state(&self, id: &str) -> Result<Option<String>, CoreError> {
-        let row: Option<(String,)> = sqlx::query_as(
-            "SELECT state FROM integration_requests WHERE integration_id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT state FROM integration_requests WHERE integration_id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(db_err)?;
         Ok(row.map(|r| r.0))
     }
 
@@ -180,13 +186,12 @@ impl IntegrationRepo {
 
     /// Count attempts for an integration request.
     pub async fn count_attempts(&self, integration_id: &str) -> Result<u32, CoreError> {
-        let row: (i64,) = sqlx::query_as(
-            "SELECT COUNT(*) FROM integration_attempts WHERE integration_id = ?",
-        )
-        .bind(integration_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db_err)?;
+        let row: (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM integration_attempts WHERE integration_id = ?")
+                .bind(integration_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?;
         Ok(row.0 as u32)
     }
 
@@ -216,11 +221,16 @@ impl IntegrationRepo {
     /// Insert an integration result.
     pub async fn insert_result(&self, result: &IntegrationResult) -> Result<bool, CoreError> {
         let strategy_str = result.strategy.as_ref().map(|s| match s {
-            harness_core::contracts::integration::IntegrationStrategy::FastForward => "fast_forward",
+            harness_core::contracts::integration::IntegrationStrategy::FastForward => {
+                "fast_forward"
+            }
             harness_core::contracts::integration::IntegrationStrategy::CherryPick => "cherry_pick",
             harness_core::contracts::integration::IntegrationStrategy::Conflict => "conflict",
         });
-        let conflict_json = result.conflicts.as_ref().map(|c| serde_json::to_string(c).unwrap_or_default());
+        let conflict_json = result
+            .conflicts
+            .as_ref()
+            .map(|c| serde_json::to_string(c).unwrap_or_default());
 
         let rows = sqlx::query(
             "INSERT OR IGNORE INTO integration_results (integration_id, attempt_id, state, previous_target_head, new_target_head, commit_oid, strategy, verification_status, conflict_json, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",

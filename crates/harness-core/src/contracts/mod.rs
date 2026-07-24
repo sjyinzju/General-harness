@@ -29,11 +29,6 @@ pub use commit::{
     CommitAdmission, CommitCandidate, CommitRequest, CommitRequestId, CommitState, GitIdentity,
     RepositoryId,
 };
-pub use integration::{
-    ConflictInfo, IntegrationAttempt, IntegrationAttemptId, IntegrationId,
-    IntegrationRequest, IntegrationResult, IntegrationState, IntegrationStrategy,
-    IntegrationVerificationPolicy, VerificationCommand,
-};
 pub use discovery::{
     ActiveValidationRequest, AdapterCompatibility, AuthModeHint, AuthStateValue,
     AuthenticationState, CapabilityNegotiation, CapabilitySupport, CompatibilityDiagnostic,
@@ -41,6 +36,11 @@ pub use discovery::{
     ExecutableIdentity, ProviderHint, ProviderHintSource, ValidationResult, ValidationStatus,
 };
 pub use goal_contract::{ChangeRequest, GoalContractVersion};
+pub use integration::{
+    ConflictInfo, IntegrationAttempt, IntegrationAttemptId, IntegrationId, IntegrationRequest,
+    IntegrationResult, IntegrationState, IntegrationStrategy, IntegrationVerificationPolicy,
+    VerificationCommand,
+};
 pub use project::{Project, ProjectLifecycle};
 pub use review::{
     ApprovedCandidate, FindingCategory, FindingSeverity, PrecheckFinding, PrecheckResult,

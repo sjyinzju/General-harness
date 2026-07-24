@@ -226,7 +226,14 @@ impl Default for IntegrationVerificationPolicy {
                 },
                 VerificationCommand {
                     program: "cargo".into(),
-                    args: vec!["clippy".into(), "--workspace".into(), "--all-targets".into(), "--".into(), "-D".into(), "warnings".into()],
+                    args: vec![
+                        "clippy".into(),
+                        "--workspace".into(),
+                        "--all-targets".into(),
+                        "--".into(),
+                        "-D".into(),
+                        "warnings".into(),
+                    ],
                     working_dir: None,
                 },
             ],
@@ -312,6 +319,9 @@ mod tests {
             idempotency_key: "ik1".into(),
             created_at: Utc::now(),
         };
-        assert_eq!(req.queue_scope(), ("repo-a".to_string(), "refs/heads/main".to_string()));
+        assert_eq!(
+            req.queue_scope(),
+            ("repo-a".to_string(), "refs/heads/main".to_string())
+        );
     }
 }
