@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Dispatch with Ctrl+C awareness ──────────────────────────
     let run_succeeded = tokio::select! {
-        result = dispatch_command(&args, &db, &graph) => {
+        result = dispatch_command(&args, &db, &graph, &repo_root) => {
             result
         }
         _ = tokio::signal::ctrl_c() => {
@@ -134,7 +134,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-async fn dispatch_command(args: &[String], db: &Database, graph: &ProductionGraph) -> bool {
+async fn dispatch_command(
+    args: &[String],
+    db: &Database,
+    graph: &ProductionGraph,
+    repo_path: &Path,
+) -> bool {
     match args[1].as_str() {
         "task-loop" => {
             if args.len() < 3 {
@@ -157,7 +162,7 @@ async fn dispatch_command(args: &[String], db: &Database, graph: &ProductionGrap
                 eprintln!("error: missing integration subcommand");
                 false
             } else {
-                dispatch_integration(args, db).await
+                dispatch_integration(args, db, repo_path).await
             }
         }
         _ => {
@@ -317,33 +322,19 @@ async fn cmd_cleanup(
     Ok(())
 }
 
-async fn dispatch_integration(args: &[String], db: &Database) -> bool {
+async fn dispatch_integration(args: &[String], db: &Database, repo_path: &Path) -> bool {
+    let integration_root = repo_path.join("target").join("harness-integration");
     match args[2].as_str() {
         "enqueue" => {
             let candidate_id = match parse_flag(args, "--candidate") {
                 Some(c) => c,
                 None => {
-                    eprintln!("error: --candidate required");
-                    return false;
-                }
-            };
-            let review_id = match parse_flag(args, "--review") {
-                Some(r) => r,
-                None => {
-                    eprintln!("error: --review required");
-                    return false;
-                }
-            };
-            let commit_id = match parse_flag(args, "--commit") {
-                Some(c) => c,
-                None => {
-                    eprintln!("error: --commit required");
+                    eprintln!("error: --candidate <candidate-id> required");
                     return false;
                 }
             };
             let repo_id = parse_flag(args, "--repo-id").unwrap_or("default");
             let target_ref = parse_flag(args, "--target-ref").unwrap_or("refs/heads/main");
-            let expected_head = parse_flag(args, "--expected-head").unwrap_or("HEAD");
             let priority: i32 = parse_flag(args, "--priority")
                 .unwrap_or("0")
                 .parse()
@@ -351,16 +342,17 @@ async fn dispatch_integration(args: &[String], db: &Database) -> bool {
             match commands::integration::cmd_integration_enqueue(
                 db,
                 candidate_id,
-                review_id,
-                commit_id,
                 repo_id,
                 target_ref,
-                expected_head,
                 priority,
+                repo_path,
             )
             .await
             {
-                Ok(()) => true,
+                Ok(json_output) => {
+                    println!("{json_output}");
+                    true
+                }
                 Err(e) => {
                     eprintln!("error: {e}");
                     false
@@ -370,8 +362,19 @@ async fn dispatch_integration(args: &[String], db: &Database) -> bool {
         "run-next" => {
             let repo_id = parse_flag(args, "--repo-id").unwrap_or("default");
             let target_ref = parse_flag(args, "--target-ref").unwrap_or("refs/heads/main");
-            match commands::integration::cmd_integration_run_next(db, repo_id, target_ref).await {
-                Ok(()) => true,
+            match commands::integration::cmd_integration_run_next(
+                db,
+                repo_id,
+                target_ref,
+                repo_path,
+                &integration_root,
+            )
+            .await
+            {
+                Ok(json_output) => {
+                    println!("{json_output}");
+                    true
+                }
                 Err(e) => {
                     eprintln!("error: {e}");
                     false
@@ -421,13 +424,23 @@ async fn dispatch_integration(args: &[String], db: &Database) -> bool {
                 }
             }
         }
-        "recover" => match commands::integration::cmd_integration_recover(db).await {
-            Ok(()) => true,
-            Err(e) => {
-                eprintln!("error: {e}");
-                false
+        "recover" => {
+            let json = args.contains(&"--json".to_string());
+            match commands::integration::cmd_integration_recover(
+                db,
+                repo_path,
+                &integration_root,
+                json,
+            )
+            .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
             }
-        },
+        }
         _ => {
             eprintln!("error: unknown integration subcommand: {}", args[2]);
             eprintln!(
@@ -451,7 +464,7 @@ fn print_usage() {
     println!("  harness review run <review-id> [--repo <path>]");
     println!("  harness review show <review-id> [--json] [--repo <path>]");
     println!("  harness review list [--state <state>] [--json] [--repo <path>]");
-    println!("  harness integration enqueue --candidate <id> --review <id> --commit <id> [--repo-id <id>] [--target-ref <ref>] [--priority <n>] [--repo <path>]");
+    println!("  harness integration enqueue --candidate <id> [--repo-id <id>] [--target-ref <ref>] [--priority <n>] [--repo <path>]");
     println!(
         "  harness integration run-next [--repo-id <id>] [--target-ref <ref>] [--repo <path>]"
     );

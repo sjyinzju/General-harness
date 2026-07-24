@@ -5,7 +5,6 @@ use harness_core::contracts::integration::{
     VerificationCommand,
 };
 use harness_runtime::integration::IntegrationExecutor;
-use sqlx::sqlite::SqlitePoolOptions;
 use std::path::Path;
 use std::process::Command;
 use tempfile::TempDir;
@@ -71,11 +70,10 @@ fn create_commit(repo_path: &Path, file: &str, content: &str, msg: &str) -> Stri
 fn make_pool() -> sqlx::SqlitePool {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        SqlitePoolOptions::new()
-            .max_connections(2)
-            .connect("sqlite::memory:")
+        harness_runtime::db::Database::open_in_memory()
             .await
             .unwrap()
+            .pool
     })
 }
 
@@ -157,9 +155,18 @@ fn test_fast_forward_integration_success() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let outcome = rt.block_on(async {
-        exec.execute("i", &attempt, rp, "refs/heads/main", &noop_policy())
-            .await
-            .unwrap()
+        exec.execute(
+            "i",
+            &attempt,
+            rp,
+            "refs/heads/main",
+            "test-repo",
+            "test-lease",
+            1,
+            &noop_policy(),
+        )
+        .await
+        .unwrap()
     });
     assert!(outcome.published, "FF publish should succeed");
     assert_eq!(outcome.result.state, IntegrationState::Integrated);
@@ -235,9 +242,18 @@ fn test_conflict_integration() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let outcome = rt.block_on(async {
-        exec.execute("i", &attempt, rp, "refs/heads/main", &noop_policy())
-            .await
-            .unwrap()
+        exec.execute(
+            "i",
+            &attempt,
+            rp,
+            "refs/heads/main",
+            "test-repo",
+            "test-lease",
+            1,
+            &noop_policy(),
+        )
+        .await
+        .unwrap()
     });
     assert!(!outcome.published);
     assert_eq!(outcome.result.state, IntegrationState::Conflict);
@@ -286,9 +302,18 @@ fn test_advanced_target_no_conflict() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let outcome = rt.block_on(async {
-        exec.execute("i", &attempt, rp, "refs/heads/main", &noop_policy())
-            .await
-            .unwrap()
+        exec.execute(
+            "i",
+            &attempt,
+            rp,
+            "refs/heads/main",
+            "test-repo",
+            "test-lease",
+            1,
+            &noop_policy(),
+        )
+        .await
+        .unwrap()
     });
     assert!(outcome.published);
     assert_eq!(outcome.result.state, IntegrationState::Integrated);
@@ -336,6 +361,9 @@ fn test_verification_failure_blocks_publish() {
             &attempt,
             rp,
             "refs/heads/main",
+            "test-repo",
+            "test-lease",
+            1,
             &required_failing_policy(),
         )
         .await
@@ -382,9 +410,18 @@ fn test_cas_race_target_advanced() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     let outcome = rt.block_on(async {
-        exec.execute("i", &attempt, rp, "refs/heads/main", &noop_policy())
-            .await
-            .unwrap()
+        exec.execute(
+            "i",
+            &attempt,
+            rp,
+            "refs/heads/main",
+            "test-repo",
+            "test-lease",
+            1,
+            &noop_policy(),
+        )
+        .await
+        .unwrap()
     });
     assert!(!outcome.published);
     assert_eq!(outcome.result.state, IntegrationState::Failed);
@@ -423,9 +460,18 @@ fn test_integration_worktree_isolation() {
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
-        exec.execute("i", &attempt, rp, "refs/heads/main", &noop_policy())
-            .await
-            .unwrap()
+        exec.execute(
+            "i",
+            &attempt,
+            rp,
+            "refs/heads/main",
+            "test-repo",
+            "test-lease",
+            1,
+            &noop_policy(),
+        )
+        .await
+        .unwrap()
     });
     // Cleanup after execution
     exec.cleanup_worktree(rp, &wt_path);

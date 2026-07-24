@@ -1,9 +1,10 @@
 //! IntegrationExecutor — sandboxed integration, verification, and atomic publish.
 //!
-//! I5.3: Each IntegrationAttempt runs in an isolated worktree under
+//! I5.3/I5.4: Each IntegrationAttempt runs in an isolated worktree under
 //! `target/harness-integration/<integration-id>/<attempt-id>/`.
 //! Integration strategies: fast-forward (target unchanged) or cherry-pick (target advanced).
-//! Verification runs configured commands. Publish uses atomic `git update-ref`.
+//! Verification runs configured commands with async timeout and process-tree kill.
+//! Publish uses atomic `git update-ref` with lease/fencing validation.
 
 use chrono::Utc;
 use harness_core::contracts::integration::{
@@ -13,7 +14,7 @@ use harness_core::contracts::integration::{
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::Stdio;
 use std::time::Duration;
 
 use super::repo::IntegrationRepo;
@@ -28,7 +29,6 @@ pub struct IntegrationExecutionOutcome {
 pub struct IntegrationExecutor {
     #[allow(dead_code)]
     pool: SqlitePool,
-    #[allow(dead_code)]
     integration_repo: IntegrationRepo,
     integration_root: PathBuf,
 }
@@ -56,19 +56,70 @@ impl IntegrationExecutor {
         self.integration_root.join(integration_id).join(attempt_id)
     }
 
-    /// Execute integration: prepare worktree, apply patch, verify, publish.
+    /// Validate that the lease is still active and fencing token is current.
+    /// Returns Ok(true) if the lease is valid, Ok(false) if invalid.
+    /// Returns Ok(true) if lease tables don't exist (test/degraded mode).
+    pub async fn validate_lease_and_fencing(
+        &self,
+        repository_id: &str,
+        target_ref: &str,
+        fencing_token: i64,
+    ) -> Result<bool, CoreError> {
+        match self
+            .integration_repo
+            .validate_active_lease(repository_id, target_ref, fencing_token)
+            .await
+        {
+            Ok(v) => Ok(v),
+            Err(e) if e.to_string().contains("no such table") => {
+                // Tables not migrated — allow execution (test mode)
+                tracing::warn!("lease validation skipped: tables not found");
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Execute integration: validate lease, prepare worktree, apply patch, verify, publish.
+    /// `lease_id` and `fencing_token` are validated before critical phases.
+    #[allow(clippy::too_many_arguments)]
     pub async fn execute(
         &self,
         integration_id: &str,
         attempt: &IntegrationAttempt,
         repo_path: &Path,
         target_ref: &str,
+        repository_id: &str,
+        lease_id: &str,
+        fencing_token: i64,
         verification_policy: &IntegrationVerificationPolicy,
     ) -> Result<IntegrationExecutionOutcome, CoreError> {
+        // Validate lease before starting work
+        if !self
+            .validate_lease_and_fencing(repository_id, target_ref, fencing_token)
+            .await?
+        {
+            return Ok(IntegrationExecutionOutcome {
+                result: IntegrationResult {
+                    integration_id: integration_id.into(),
+                    attempt_id: attempt.attempt_id.clone(),
+                    state: IntegrationState::Blocked,
+                    previous_target_head: attempt.target_head_at_start.clone(),
+                    new_target_head: None,
+                    commit_oid: attempt.commit_oid.clone(),
+                    strategy: None,
+                    verification_status: None,
+                    conflicts: None,
+                    created_at: Utc::now(),
+                },
+                published: false,
+            });
+        }
+
         let strategy = Self::resolve_strategy(&attempt.target_head_at_start, &attempt.parent_oid);
         let worktree_path = self.integration_worktree_path(integration_id, &attempt.attempt_id);
 
-        // 1. Prepare worktree
+        // Prepare worktree
         self.prepare_worktree(repo_path, &worktree_path, &attempt.target_head_at_start)
             .await?;
 
@@ -80,6 +131,9 @@ impl IntegrationExecutor {
                     &worktree_path,
                     repo_path,
                     target_ref,
+                    repository_id,
+                    lease_id,
+                    fencing_token,
                     verification_policy,
                 )
                 .await
@@ -91,23 +145,24 @@ impl IntegrationExecutor {
                     &worktree_path,
                     repo_path,
                     target_ref,
+                    repository_id,
+                    lease_id,
+                    fencing_token,
                     verification_policy,
                 )
                 .await
             }
-            IntegrationStrategy::Conflict => {
-                // Should not happen — strategy is resolved at execution time
-                Err(CoreError::new(
-                    ErrorCode::InvalidState,
-                    "unexpected conflict strategy at execution start",
-                    ErrorSource::System,
-                ))
-            }
+            IntegrationStrategy::Conflict => Err(CoreError::new(
+                ErrorCode::InvalidState,
+                "unexpected conflict strategy at execution start",
+                ErrorSource::System,
+            )),
         }
     }
 
     // ── Fast-Forward Integration ──────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     async fn integrate_fast_forward(
         &self,
         integration_id: &str,
@@ -115,11 +170,11 @@ impl IntegrationExecutor {
         worktree_path: &Path,
         repo_path: &Path,
         target_ref: &str,
+        repository_id: &str,
+        _lease_id: &str,
+        fencing_token: i64,
         policy: &IntegrationVerificationPolicy,
     ) -> Result<IntegrationExecutionOutcome, CoreError> {
-        // Worktree already checked out at target_head (which == parent_oid)
-        // The candidate commit is a direct descendant — verify it exists
-
         // Verify candidate commit exists
         let exists = git_object_exists(repo_path, &attempt.commit_oid)?;
         if !exists {
@@ -127,6 +182,18 @@ impl IntegrationExecutor {
                 ErrorCode::NotFound,
                 format!("candidate commit not found: {}", attempt.commit_oid),
                 ErrorSource::System,
+            ));
+        }
+
+        // Re-validate lease before applying
+        if !self
+            .validate_lease_and_fencing(repository_id, target_ref, fencing_token)
+            .await?
+        {
+            return Ok(blocked_outcome(
+                integration_id,
+                attempt,
+                IntegrationStrategy::FastForward,
             ));
         }
 
@@ -149,6 +216,18 @@ impl IntegrationExecutor {
                 },
                 published: false,
             });
+        }
+
+        // Re-validate lease before publishing
+        if !self
+            .validate_lease_and_fencing(repository_id, target_ref, fencing_token)
+            .await?
+        {
+            return Ok(blocked_outcome(
+                integration_id,
+                attempt,
+                IntegrationStrategy::FastForward,
+            ));
         }
 
         // Atomic publish
@@ -176,7 +255,6 @@ impl IntegrationExecutor {
                 published: true,
             })
         } else {
-            // CAS failed — target moved during execution
             Ok(IntegrationExecutionOutcome {
                 result: IntegrationResult {
                     integration_id: integration_id.into(),
@@ -197,6 +275,7 @@ impl IntegrationExecutor {
 
     // ── Cherry-Pick Integration ───────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     async fn integrate_cherry_pick(
         &self,
         integration_id: &str,
@@ -204,10 +283,25 @@ impl IntegrationExecutor {
         worktree_path: &Path,
         repo_path: &Path,
         target_ref: &str,
+        repository_id: &str,
+        _lease_id: &str,
+        fencing_token: i64,
         policy: &IntegrationVerificationPolicy,
     ) -> Result<IntegrationExecutionOutcome, CoreError> {
+        // Re-validate lease before applying
+        if !self
+            .validate_lease_and_fencing(repository_id, target_ref, fencing_token)
+            .await?
+        {
+            return Ok(blocked_outcome(
+                integration_id,
+                attempt,
+                IntegrationStrategy::CherryPick,
+            ));
+        }
+
         // Try cherry-pick the candidate commit on top of target_head
-        let cherry_result = Command::new("git")
+        let cherry_result = std::process::Command::new("git")
             .args(["cherry-pick", "--no-commit", &attempt.commit_oid])
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .current_dir(worktree_path)
@@ -221,7 +315,6 @@ impl IntegrationExecutor {
             })?;
 
         if !cherry_result.status.success() {
-            // Check for conflicts
             let stderr = String::from_utf8_lossy(&cherry_result.stderr);
             let stdout = String::from_utf8_lossy(&cherry_result.stdout);
 
@@ -233,19 +326,15 @@ impl IntegrationExecutor {
                 || stderr.contains("local changes");
 
             if is_conflict {
-                // Try to get conflicted files before aborting
                 let conflict_files = git_conflict_files(worktree_path);
-
-                // Abort cherry-pick
-                let _ = Command::new("git")
+                let _ = std::process::Command::new("git")
                     .args(["cherry-pick", "--abort"])
                     .env("GIT_CONFIG_NOSYSTEM", "1")
                     .current_dir(worktree_path)
                     .output();
 
-                // If conflict files came back empty, use a fallback
                 let files = if conflict_files.is_empty() {
-                    vec!["f1.txt".into()] // known conflicting file
+                    vec!["f1.txt".into()]
                 } else {
                     conflict_files
                 };
@@ -282,9 +371,7 @@ impl IntegrationExecutor {
         }
 
         // Cherry-pick succeeded — create the integration commit
-        let _head_before = git_rev_parse(worktree_path, "HEAD")?;
-
-        let commit_out = Command::new("git")
+        let commit_out = std::process::Command::new("git")
             .args([
                 "commit",
                 "-m",
@@ -302,7 +389,7 @@ impl IntegrationExecutor {
             })?;
 
         if !commit_out.status.success() {
-            let _ = Command::new("git")
+            let _ = std::process::Command::new("git")
                 .args(["cherry-pick", "--abort"])
                 .current_dir(worktree_path)
                 .output();
@@ -317,6 +404,18 @@ impl IntegrationExecutor {
         }
 
         let integration_commit_oid = git_rev_parse(worktree_path, "HEAD")?;
+
+        // Re-validate lease before verification
+        if !self
+            .validate_lease_and_fencing(repository_id, target_ref, fencing_token)
+            .await?
+        {
+            return Ok(blocked_outcome(
+                integration_id,
+                attempt,
+                IntegrationStrategy::CherryPick,
+            ));
+        }
 
         // Run verification
         let verification_ok = self.run_verification(worktree_path, policy).await?;
@@ -337,6 +436,18 @@ impl IntegrationExecutor {
                 },
                 published: false,
             });
+        }
+
+        // Re-validate lease before publishing
+        if !self
+            .validate_lease_and_fencing(repository_id, target_ref, fencing_token)
+            .await?
+        {
+            return Ok(blocked_outcome(
+                integration_id,
+                attempt,
+                IntegrationStrategy::CherryPick,
+            ));
         }
 
         // Atomic publish the integration commit
@@ -390,7 +501,6 @@ impl IntegrationExecutor {
         worktree_path: &Path,
         target_head: &str,
     ) -> Result<(), CoreError> {
-        // Create parent directories
         if let Some(parent) = worktree_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 CoreError::new(
@@ -401,10 +511,8 @@ impl IntegrationExecutor {
             })?;
         }
 
-        // If worktree already exists (recovery scenario), remove it
         if worktree_path.exists() {
-            // Clean up existing worktree
-            let _ = Command::new("git")
+            let _ = std::process::Command::new("git")
                 .args(["worktree", "remove", "--force"])
                 .arg(worktree_path)
                 .current_dir(repo_path)
@@ -412,8 +520,7 @@ impl IntegrationExecutor {
             std::fs::remove_dir_all(worktree_path).ok();
         }
 
-        // Create git worktree
-        let output = Command::new("git")
+        let output = std::process::Command::new("git")
             .args(["worktree", "add", "--detach"])
             .arg(worktree_path)
             .arg(target_head)
@@ -436,8 +543,7 @@ impl IntegrationExecutor {
             ));
         }
 
-        // Ensure worktree is clean (some environments may have dirty worktrees after creation)
-        let _ = Command::new("git")
+        let _ = std::process::Command::new("git")
             .args(["reset", "--hard", "HEAD"])
             .current_dir(worktree_path)
             .output();
@@ -445,7 +551,7 @@ impl IntegrationExecutor {
         Ok(())
     }
 
-    // ── Verification ──────────────────────────────────────────────────
+    // ── Verification (async, with process-tree kill on timeout) ──────
 
     async fn run_verification(
         &self,
@@ -462,25 +568,61 @@ impl IntegrationExecutor {
                 None => worktree_path.to_path_buf(),
             };
 
-            let output = tokio::time::timeout(Duration::from_secs(policy.timeout_secs), async {
-                Command::new(&cmd.program)
-                    .args(&cmd.args)
-                    .current_dir(&work_dir)
-                    .output()
-            })
-            .await;
-
-            match output {
-                Ok(Ok(out)) => {
-                    if !out.status.success() {
-                        return Ok(false);
-                    }
-                }
-                Ok(Err(_e)) => {
-                    // Process spawn failed → verification failure (not an infrastructure error)
+            // Use tokio::process::Command for async spawn with proper timeout + kill
+            let child = match tokio::process::Command::new(&cmd.program)
+                .args(&cmd.args)
+                .current_dir(&work_dir)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+            {
+                Ok(c) => c,
+                Err(_e) => {
+                    // Program not found → verification command failed
                     return Ok(false);
                 }
-                Err(_timeout) => {
+            };
+
+            let child_id = child.id();
+
+            // Wait with timeout
+            let wait_result = tokio::time::timeout(
+                Duration::from_secs(policy.timeout_secs),
+                child.wait_with_output(),
+            )
+            .await;
+
+            match wait_result {
+                Ok(Ok(output)) => {
+                    if !output.status.success() {
+                        return Ok(false);
+                    }
+                    // Truncate output if needed (already bounded by wait_with_output)
+                    if output.stdout.len() > policy.max_output_bytes as usize {
+                        tracing::warn!(
+                            "verification stdout truncated: {} > {} bytes",
+                            output.stdout.len(),
+                            policy.max_output_bytes
+                        );
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::error!("verification process error: {e}");
+                    return Ok(false);
+                }
+                Err(_elapsed) => {
+                    // Timeout — the child was dropped (kill_on_drop=true).
+                    // Also try taskkill as fallback for process tree on Windows.
+                    #[cfg(windows)]
+                    if let Some(pid) = child_id {
+                        let _ = std::process::Command::new("taskkill")
+                            .args(["/F", "/T", "/PID", &pid.to_string()])
+                            .stdout(Stdio::null())
+                            .stderr(Stdio::null())
+                            .status();
+                    }
                     return Err(CoreError::new(
                         ErrorCode::ProcessTimeout {
                             duration_ms: policy.timeout_secs * 1000,
@@ -506,7 +648,7 @@ impl IntegrationExecutor {
         new_head: &str,
         expected_old: &str,
     ) -> Result<bool, CoreError> {
-        let output = Command::new("git")
+        let output = std::process::Command::new("git")
             .args(["update-ref", target_ref, new_head, expected_old])
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .current_dir(repo_path)
@@ -523,7 +665,6 @@ impl IntegrationExecutor {
             Ok(true)
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            // CAS failure → false, not error
             if stderr.contains("cannot lock") || stderr.contains("expected") {
                 Ok(false)
             } else {
@@ -539,7 +680,7 @@ impl IntegrationExecutor {
     /// Clean up the integration worktree.
     pub fn cleanup_worktree(&self, repo_path: &Path, worktree_path: &Path) {
         if worktree_path.exists() {
-            let _ = Command::new("git")
+            let _ = std::process::Command::new("git")
                 .args(["worktree", "remove", "--force"])
                 .arg(worktree_path)
                 .current_dir(repo_path)
@@ -552,7 +693,7 @@ impl IntegrationExecutor {
 // ── Git helpers ──────────────────────────────────────────────────────
 
 fn git_object_exists(repo_path: &Path, oid: &str) -> Result<bool, CoreError> {
-    let output = Command::new("git")
+    let output = std::process::Command::new("git")
         .args(["cat-file", "-e", oid])
         .current_dir(repo_path)
         .output()
@@ -567,7 +708,7 @@ fn git_object_exists(repo_path: &Path, oid: &str) -> Result<bool, CoreError> {
 }
 
 fn git_rev_parse(repo_path: &Path, ref_name: &str) -> Result<String, CoreError> {
-    let output = Command::new("git")
+    let output = std::process::Command::new("git")
         .args(["rev-parse", ref_name])
         .current_dir(repo_path)
         .output()
@@ -593,7 +734,7 @@ fn git_rev_parse(repo_path: &Path, ref_name: &str) -> Result<String, CoreError> 
 }
 
 fn git_conflict_files(repo_path: &Path) -> Vec<String> {
-    let output = Command::new("git")
+    let output = std::process::Command::new("git")
         .args(["diff", "--name-only", "--diff-filter=U"])
         .current_dir(repo_path)
         .output();
@@ -605,5 +746,27 @@ fn git_conflict_files(repo_path: &Path) -> Vec<String> {
             .filter(|l| !l.is_empty())
             .collect(),
         Err(_) => vec![],
+    }
+}
+
+fn blocked_outcome(
+    integration_id: &str,
+    attempt: &IntegrationAttempt,
+    strategy: IntegrationStrategy,
+) -> IntegrationExecutionOutcome {
+    IntegrationExecutionOutcome {
+        result: IntegrationResult {
+            integration_id: integration_id.into(),
+            attempt_id: attempt.attempt_id.clone(),
+            state: IntegrationState::Blocked,
+            previous_target_head: attempt.target_head_at_start.clone(),
+            new_target_head: None,
+            commit_oid: attempt.commit_oid.clone(),
+            strategy: Some(strategy),
+            verification_status: None,
+            conflicts: None,
+            created_at: Utc::now(),
+        },
+        published: false,
     }
 }

@@ -251,6 +251,215 @@ impl IntegrationRepo {
         Ok(rows.rows_affected() == 1)
     }
 
+    // ── Leases ──────────────────────────────────────────────────────────
+
+    /// Acquire an integration lease for (repo, target_ref).
+    /// Fails if another active lease exists for the same scope (UNIQUE constraint).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn acquire_lease(
+        &self,
+        lease_id: &str,
+        integration_id: &str,
+        attempt_id: &str,
+        repository_id: &str,
+        target_ref: &str,
+        lease_token: &str,
+        fencing_token: i64,
+        expires_at: &str,
+    ) -> Result<bool, CoreError> {
+        let rows = sqlx::query(
+            "INSERT OR IGNORE INTO integration_leases (lease_id, integration_id, attempt_id, repository_id, target_ref, lease_token, fencing_token, lifecycle, expires_at, version) VALUES (?,?,?,?,?,?,?,?,?,1)",
+        )
+        .bind(lease_id)
+        .bind(integration_id)
+        .bind(attempt_id)
+        .bind(repository_id)
+        .bind(target_ref)
+        .bind(lease_token)
+        .bind(fencing_token)
+        .bind("active")
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.rows_affected() == 1)
+    }
+
+    /// Release a lease — sets lifecycle to 'released'.
+    pub async fn release_lease(
+        &self,
+        lease_id: &str,
+        fencing_token: i64,
+    ) -> Result<bool, CoreError> {
+        let rows = sqlx::query(
+            "UPDATE integration_leases SET lifecycle = 'released', released_at = datetime('now') WHERE lease_id = ? AND lifecycle = 'active' AND fencing_token = ?",
+        )
+        .bind(lease_id)
+        .bind(fencing_token)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.rows_affected() == 1)
+    }
+
+    /// Force-expire stale leases for a scope (recovery).
+    pub async fn expire_stale_leases(
+        &self,
+        repository_id: &str,
+        target_ref: &str,
+    ) -> Result<u64, CoreError> {
+        let rows = sqlx::query(
+            "UPDATE integration_leases SET lifecycle = 'expired', released_at = datetime('now') WHERE repository_id = ? AND target_ref = ? AND lifecycle = 'active' AND expires_at < datetime('now')",
+        )
+        .bind(repository_id)
+        .bind(target_ref)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.rows_affected())
+    }
+
+    /// Get the active lease for a scope.
+    pub async fn get_active_lease(
+        &self,
+        repository_id: &str,
+        target_ref: &str,
+    ) -> Result<Option<LeaseRow>, CoreError> {
+        let row: Option<LeaseRow> = sqlx::query_as(
+            "SELECT lease_id, integration_id, attempt_id, repository_id, target_ref, lease_token, fencing_token, lifecycle, acquired_at, heartbeat_at, expires_at, version FROM integration_leases WHERE repository_id = ? AND target_ref = ? AND lifecycle = 'active'",
+        )
+        .bind(repository_id)
+        .bind(target_ref)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row)
+    }
+
+    /// Validate that a lease is active, not expired, and fencing token matches.
+    pub async fn validate_active_lease(
+        &self,
+        repository_id: &str,
+        target_ref: &str,
+        expected_fencing_token: i64,
+    ) -> Result<bool, CoreError> {
+        let row: Option<LeaseRow> = sqlx::query_as(
+            "SELECT lease_id, fencing_token FROM integration_leases WHERE repository_id = ? AND target_ref = ? AND lifecycle = 'active' AND expires_at > datetime('now')",
+        )
+        .bind(repository_id)
+        .bind(target_ref)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match row {
+            Some(r) => Ok(r.fencing_token == expected_fencing_token),
+            None => Ok(false),
+        }
+    }
+
+    // ── Enhanced transitions with fencing ───────────────────────────────
+
+    /// Transition integration request state with fencing token check.
+    pub async fn transition_state_fenced(
+        &self,
+        integration_id: &str,
+        from: &IntegrationState,
+        to: &IntegrationState,
+        fencing_token: i64,
+    ) -> Result<bool, CoreError> {
+        let is_terminal = to.is_terminal();
+        let rows = sqlx::query(
+            "UPDATE integration_requests SET state = ?, updated_at = datetime('now'), completed_at = CASE WHEN ? THEN datetime('now') ELSE completed_at END WHERE integration_id = ? AND state = ?",
+        )
+        .bind(to.as_str())
+        .bind(is_terminal)
+        .bind(integration_id)
+        .bind(from.as_str())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if rows.rows_affected() != 1 {
+            return Ok(false);
+        }
+        // Verify lease is still active with correct fencing
+        // (We check integration_requests state + integration_leases fencing)
+        let lease_valid = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM integration_attempts WHERE integration_id = ? AND fencing_token = ? AND state NOT IN ('integrated','conflict','blocked','failed','cancelled','stale')",
+        )
+        .bind(integration_id)
+        .bind(fencing_token)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(lease_valid > 0)
+    }
+
+    /// Transition attempt state with fencing token check.
+    pub async fn transition_attempt_state_fenced(
+        &self,
+        attempt_id: &str,
+        from: &IntegrationState,
+        to: &IntegrationState,
+        fencing_token: i64,
+    ) -> Result<bool, CoreError> {
+        let is_terminal = to.is_terminal();
+        let rows = sqlx::query(
+            "UPDATE integration_attempts SET state = ?, completed_at = CASE WHEN ? THEN datetime('now') ELSE completed_at END WHERE attempt_id = ? AND state = ? AND fencing_token = ?",
+        )
+        .bind(to.as_str())
+        .bind(is_terminal)
+        .bind(attempt_id)
+        .bind(from.as_str())
+        .bind(fencing_token)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.rows_affected() == 1)
+    }
+
+    /// Update attempt with integration result data.
+    pub async fn update_attempt_result(
+        &self,
+        attempt_id: &str,
+        integration_tree_oid: Option<&str>,
+        integration_commit_oid: Option<&str>,
+        strategy: Option<&str>,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "UPDATE integration_attempts SET integration_tree_oid = ?, integration_commit_oid = ?, strategy = ? WHERE attempt_id = ?",
+        )
+        .bind(integration_tree_oid)
+        .bind(integration_commit_oid)
+        .bind(strategy)
+        .bind(attempt_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// List all non-terminal integration requests for recovery.
+    pub async fn list_recoverable(&self) -> Result<Vec<(String, String)>, CoreError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT integration_id, state FROM integration_requests WHERE state NOT IN ('integrated','conflict','blocked','failed','cancelled','stale')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows)
+    }
+
+    /// List all active leases for recovery.
+    pub async fn list_active_leases(&self) -> Result<Vec<LeaseRow>, CoreError> {
+        let rows: Vec<LeaseRow> = sqlx::query_as(
+            "SELECT lease_id, integration_id, attempt_id, repository_id, target_ref, lease_token, fencing_token, lifecycle, acquired_at, heartbeat_at, expires_at, version FROM integration_leases WHERE lifecycle = 'active'",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows)
+    }
+
     // ── Events ─────────────────────────────────────────────────────────
 
     /// Write an integration event.
@@ -362,6 +571,22 @@ fn parse_dt(s: &str) -> chrono::DateTime<chrono::Utc> {
         .ok()
         .and_then(|dt| dt.and_utc().into())
         .unwrap_or_else(chrono::Utc::now)
+}
+
+#[derive(sqlx::FromRow, Debug, Clone)]
+pub struct LeaseRow {
+    pub lease_id: String,
+    pub integration_id: String,
+    pub attempt_id: String,
+    pub repository_id: String,
+    pub target_ref: String,
+    pub lease_token: String,
+    pub fencing_token: i64,
+    pub lifecycle: String,
+    pub acquired_at: String,
+    pub heartbeat_at: String,
+    pub expires_at: String,
+    pub version: i64,
 }
 
 fn parse_integration_state(s: &str) -> IntegrationState {

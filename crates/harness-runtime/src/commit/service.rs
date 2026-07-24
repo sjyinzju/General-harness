@@ -687,6 +687,54 @@ impl ControlledCommitService {
     ) -> Result<Option<CommitCandidate>, CoreError> {
         self.commit_repo.get_candidate(id).await
     }
+
+    /// Public: read a CandidateSnapshot from the database.
+    pub async fn get_candidate_snapshot(
+        &self,
+        id: &CandidateId,
+    ) -> Result<Option<CandidateSnapshot>, CoreError> {
+        self.get_candidate(id).await
+    }
+
+    /// Public: find the latest approved review for a candidate.
+    /// Returns an ApprovedCandidate ready for commit creation.
+    pub async fn find_approved_review_for_candidate(
+        &self,
+        candidate_id: &str,
+    ) -> Result<Option<ApprovedCandidate>, CoreError> {
+        // Find the most recent approved review for this candidate
+        let row: Option<(String, String, String, String)> = sqlx::query_as(
+            "SELECT review_id, candidate_id, reviewer_profile_id, state FROM review_requests WHERE candidate_id = ? AND state = 'approved' ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(candidate_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
+
+        let (review_id, cid, _reviewer, _state) = match row {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // Get the review decision for digests
+        let decision = self.get_decision(&review_id).await?;
+        let decision_digest = decision.map(|d| d.decision_digest).unwrap_or_default();
+
+        // Get candidate for tree hash and diff digest
+        let candidate = match self.get_candidate(&cid).await? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        Ok(Some(ApprovedCandidate {
+            candidate_id: cid,
+            review_id,
+            candidate_tree_hash: candidate.candidate_tree_hash,
+            diff_digest: candidate.diff_digest,
+            review_decision_digest: decision_digest,
+            approved_at: candidate.created_at,
+        }))
+    }
 }
 
 // ── Helper types ──────────────────────────────────────────────────────

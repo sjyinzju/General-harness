@@ -1,76 +1,166 @@
-//! I5 CLI commands for Integration Queue management.
+//! I5 CLI commands for Controlled Commit and Integration Queue management.
+//!
+//! Production path:
+//!   enqueue: candidate-id → ControlledCommitService → commit → IntegrationRequest
+//!   run-next: dequeue → lease → IntegrationExecutor → verify → publish
+//!   recover: IntegrationRecoveryService → deep reconciliation
 
+use harness_runtime::commit::ControlledCommitService;
 use harness_runtime::db::Database;
-use harness_runtime::integration::IntegrationQueueService;
+use harness_runtime::integration::{IntegrationQueueService, IntegrationRecoveryService};
+use std::path::Path;
 
-/// Enqueue an integration request.
-#[allow(clippy::too_many_arguments)]
+// ── Enqueue: candidate → commit → integration ──────────────────────
+
+/// Enqueue an integration request from a candidate.
+/// This is the default production path:
+///   1. Read CandidateSnapshot from DB
+///   2. Read Approved Review from DB
+///   3. Admission validation via ControlledCommitService
+///   4. Create or recover CommitCandidate
+///   5. Enqueue IntegrationRequest
 pub async fn cmd_integration_enqueue(
     db: &Database,
     candidate_id: &str,
-    review_id: &str,
-    commit_request_id: &str,
     repository_id: &str,
     target_ref: &str,
-    expected_target_head: &str,
     priority: i32,
-) -> Result<(), String> {
-    let svc = IntegrationQueueService::new(db.pool.clone());
-    let integration_id = format!("i-{}", sqlx::types::Uuid::new_v4());
+    repo_path: &Path,
+) -> Result<String, String> {
+    let commit_svc = ControlledCommitService::new(db.pool.clone());
+    let queue_svc = IntegrationQueueService::new(db.pool.clone());
 
-    let req = svc
-        .enqueue(
-            &integration_id,
-            commit_request_id,
-            candidate_id,
-            review_id,
+    // 1. Read CandidateSnapshot
+    let _candidate = commit_svc
+        .get_candidate_snapshot(&candidate_id.to_string())
+        .await
+        .map_err(|e| format!("candidate lookup: {e}"))?
+        .ok_or_else(|| format!("Candidate not found: {candidate_id}"))?;
+
+    // 2. Find approved review for this candidate
+    let approved_review = commit_svc
+        .find_approved_review_for_candidate(candidate_id)
+        .await
+        .map_err(|e| format!("review lookup: {e}"))?
+        .ok_or_else(|| format!("No approved review found for candidate: {candidate_id}"))?;
+
+    // 3. Admission validation
+    let admission = commit_svc
+        .validate_admission(&approved_review)
+        .await
+        .map_err(|e| format!("admission: {e}"))?;
+
+    if !matches!(
+        admission,
+        harness_core::contracts::commit::CommitAdmission::Admitted
+    ) {
+        return Err(format!("admission blocked: {admission:?}"));
+    }
+
+    // 4. Create or recover commit
+    use harness_core::contracts::commit::GitIdentity;
+    let author = GitIdentity::new("Harness", "harness@localhost");
+    let committer = GitIdentity::new("Harness Integration", "integration@localhost");
+
+    let commit_outcome = commit_svc
+        .create_commit(
+            &approved_review,
             repository_id,
             target_ref,
-            expected_target_head,
+            &author,
+            &committer,
+            &format!("Harness integration of candidate {}", candidate_id),
+            repo_path,
+        )
+        .await
+        .map_err(|e| format!("commit creation: {e}"))?;
+
+    let cc = &commit_outcome.commit_candidate;
+
+    // 5. Get current target head
+    let target_head = git_rev_parse(repo_path, target_ref)?;
+
+    // 6. Enqueue integration
+    let integration_id = format!("i-{}", sqlx::types::Uuid::new_v4());
+    let req = queue_svc
+        .enqueue(
+            &integration_id,
+            &cc.commit_request_id,
+            candidate_id,
+            &approved_review.review_id,
+            repository_id,
+            target_ref,
+            &target_head,
             priority,
         )
         .await
         .map_err(|e| format!("enqueue: {e}"))?;
 
-    println!("Integration enqueued: {}", req.integration_id);
-    println!("  Candidate: {}", req.candidate_id);
-    println!("  Repository: {}", req.repository_id);
-    println!("  Target: {}", req.target_ref);
-    println!("  Priority: {}", req.priority);
-    Ok(())
+    let output = serde_json::json!({
+        "candidate_id": candidate_id,
+        "review_id": approved_review.review_id,
+        "commit_candidate_id": cc.commit_request_id,
+        "commit_oid": cc.commit_oid,
+        "integration_id": req.integration_id,
+        "state": "queued",
+        "idempotent_reuse": commit_outcome.recovered || req.integration_id != integration_id,
+    });
+
+    Ok(serde_json::to_string_pretty(&output).unwrap_or_default())
 }
 
-/// Dequeue and show the next integration for a (repo, target_ref).
+// ── Run Next: full integration execution ────────────────────────────
+
+/// Run the next integration for a (repo, target_ref) scope.
+/// Full production path: dequeue → acquire lease → execute → persist → cleanup.
 pub async fn cmd_integration_run_next(
     db: &Database,
     repository_id: &str,
     target_ref: &str,
-) -> Result<(), String> {
+    repo_path: &Path,
+    integration_root: &Path,
+) -> Result<String, String> {
     let svc = IntegrationQueueService::new(db.pool.clone());
+    let policy = harness_core::contracts::integration::IntegrationVerificationPolicy::default();
 
     match svc
-        .dequeue(repository_id, target_ref)
+        .run_next(
+            repository_id,
+            target_ref,
+            repo_path,
+            integration_root,
+            &policy,
+        )
         .await
-        .map_err(|e| format!("dequeue: {e}"))?
+        .map_err(|e| format!("run-next: {e}"))?
     {
-        Some(req) => {
-            println!("Dequeued: {}", req.integration_id);
-            println!("  Commit request: {}", req.commit_request_id);
-            println!("  Candidate: {}", req.candidate_id);
-            println!("  Priority: {}", req.priority);
-            println!("  Created: {}", req.created_at.to_rfc3339());
+        Some(outcome) => {
+            let output = serde_json::json!({
+                "integration_id": outcome.integration_id,
+                "attempt_id": outcome.attempt_id,
+                "lease_id": outcome.lease_id,
+                "fencing_token": outcome.fencing_token,
+                "previous_target_head": outcome.previous_target_head,
+                "new_target_head": outcome.new_target_head,
+                "strategy": outcome.strategy.map(|s| format!("{:?}", s)),
+                "verification_status": outcome.verification_status,
+                "state": format!("{:?}", outcome.state),
+                "published": outcome.published,
+            });
+            Ok(serde_json::to_string_pretty(&output).unwrap_or_default())
         }
         None => {
-            println!(
-                "No queued integrations for {}/{}",
-                repository_id, target_ref
-            );
+            let output = serde_json::json!({
+                "result": "NoWork",
+                "message": format!("No queued integrations for {}/{}", repository_id, target_ref),
+            });
+            Ok(serde_json::to_string_pretty(&output).unwrap_or_default())
         }
     }
-    Ok(())
 }
 
-/// Show an integration by ID.
+// ── Show ───────────────────────────────────────────────────────────
+
 pub async fn cmd_integration_show(
     db: &Database,
     integration_id: &str,
@@ -114,7 +204,8 @@ pub async fn cmd_integration_show(
     Ok(())
 }
 
-/// List all integration requests.
+// ── List ────────────────────────────────────────────────────────────
+
 pub async fn cmd_integration_list(db: &Database, json: bool) -> Result<(), String> {
     let svc = IntegrationQueueService::new(db.pool.clone());
     let items = svc.list_all().await.map_err(|e| format!("list: {e}"))?;
@@ -157,7 +248,8 @@ pub async fn cmd_integration_list(db: &Database, json: bool) -> Result<(), Strin
     Ok(())
 }
 
-/// Cancel an integration.
+// ── Cancel ──────────────────────────────────────────────────────────
+
 pub async fn cmd_integration_cancel(db: &Database, integration_id: &str) -> Result<(), String> {
     let svc = IntegrationQueueService::new(db.pool.clone());
     match svc
@@ -171,22 +263,75 @@ pub async fn cmd_integration_cancel(db: &Database, integration_id: &str) -> Resu
     Ok(())
 }
 
-/// Recover stuck integrations (in-progress states that appear abandoned).
-pub async fn cmd_integration_recover(db: &Database) -> Result<(), String> {
-    let svc = IntegrationQueueService::new(db.pool.clone());
-    let all = svc.list_all().await.map_err(|e| format!("list: {e}"))?;
+// ── Recover: deep reconciliation ───────────────────────────────────
 
-    let mut recovered = 0;
-    for req in &all {
-        // List each item — recovery moves stuck items back to queued
-        let _ = svc.get(&req.integration_id).await;
-        // For now, just list recoverable items
+/// Recover stuck integrations via deep reconciliation.
+pub async fn cmd_integration_recover(
+    db: &Database,
+    repo_path: &Path,
+    integration_root: &Path,
+    json: bool,
+) -> Result<(), String> {
+    let recovery = IntegrationRecoveryService::new(db.pool.clone());
+    let outcome = recovery
+        .reconcile(repo_path, integration_root)
+        .await
+        .map_err(|e| format!("recover: {e}"))?;
+
+    if json {
+        let output = serde_json::json!({
+            "scanned": outcome.scanned,
+            "requeued": outcome.requeued,
+            "recovered_integrated": outcome.recovered_integrated,
+            "failed_attempts": outcome.failed_attempts,
+            "blocked": outcome.blocked,
+            "leases_closed": outcome.leases_closed,
+            "worktrees_cleaned": outcome.worktrees_cleaned,
+            "processes_terminated": outcome.processes_terminated,
+            "actions": outcome.actions,
+        });
         println!(
-            "  {} (use 'cancel' or re-enqueue for stuck items)",
-            req.integration_id
+            "{}",
+            serde_json::to_string_pretty(&output).unwrap_or_default()
         );
-        recovered += 1;
+    } else {
+        println!("Integration Recovery Report:");
+        println!("  Scanned: {}", outcome.scanned);
+        println!("  Requeued: {}", outcome.requeued);
+        println!("  Recovered (Integrated): {}", outcome.recovered_integrated);
+        println!("  Failed attempts: {}", outcome.failed_attempts);
+        println!("  Blocked: {}", outcome.blocked);
+        println!("  Leases closed: {}", outcome.leases_closed);
+        println!("  Worktrees cleaned: {}", outcome.worktrees_cleaned);
+        println!("  Processes terminated: {}", outcome.processes_terminated);
+        if !outcome.actions.is_empty() {
+            println!("  Actions:");
+            for a in &outcome.actions {
+                println!(
+                    "    {}: {} → {} ({})",
+                    a.integration_id, a.from_state, a.to_state, a.reason
+                );
+            }
+        }
     }
-    println!("Listed {} integration requests", recovered);
     Ok(())
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+fn git_rev_parse(repo_path: &Path, ref_name: &str) -> Result<String, String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", ref_name])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        Err(format!(
+            "git rev-parse {} failed: {}",
+            ref_name,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))
+    }
 }

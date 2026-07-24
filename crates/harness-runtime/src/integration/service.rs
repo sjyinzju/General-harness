@@ -1,16 +1,19 @@
 //! IntegrationQueueService — enqueue, dequeue, run, and publish integrations.
 //!
-//! I5.2/I5.3: Durable integration queue with lease/fencing, sandboxed integration,
+//! I5.2/I5.3/I5.4: Durable integration queue with lease/fencing, sandboxed integration,
 //! verification, and atomic git update-ref publish.
 
 use chrono::Utc;
 use harness_core::contracts::integration::{
-    IntegrationAttempt, IntegrationId, IntegrationRequest, IntegrationState,
+    IntegrationAttempt, IntegrationId, IntegrationRequest, IntegrationState, IntegrationStrategy,
+    IntegrationVerificationPolicy,
 };
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
+use std::path::Path;
 use uuid::Uuid;
 
+use super::executor::IntegrationExecutor;
 use super::repo::IntegrationRepo;
 
 pub struct IntegrationQueueService {
@@ -24,6 +27,10 @@ impl IntegrationQueueService {
             integration_repo: IntegrationRepo::new(pool.clone()),
             pool,
         }
+    }
+
+    pub fn repo(&self) -> &IntegrationRepo {
+        &self.integration_repo
     }
 
     // ── Enqueue ──────────────────────────────────────────────────────
@@ -104,7 +111,6 @@ impl IntegrationQueueService {
 
         let req = &queued[0];
 
-        // CAS: Queued → WaitingForLease
         let ok = self
             .integration_repo
             .transition_state(
@@ -125,8 +131,222 @@ impl IntegrationQueueService {
             .await;
             Ok(Some(req.clone()))
         } else {
-            // Lost the race — another dequeue won
             Ok(None)
+        }
+    }
+
+    // ── Lease Operations ─────────────────────────────────────────────
+
+    /// Acquire a lease for the (repo, target_ref) scope.
+    /// Returns (lease_id, fencing_token) if successful.
+    pub async fn acquire_lease(
+        &self,
+        integration_id: &str,
+        attempt_id: &str,
+        repository_id: &str,
+        target_ref: &str,
+        duration_secs: u64,
+    ) -> Result<Option<(String, i64)>, CoreError> {
+        // First expire stale leases for this scope
+        let _ = self
+            .integration_repo
+            .expire_stale_leases(repository_id, target_ref)
+            .await;
+
+        let lease_id = format!("lease-{}", Uuid::new_v4());
+        let lease_token = format!("lt-{}", Uuid::new_v4());
+        let fencing_token = Utc::now().timestamp_millis();
+        let expires_at = (Utc::now() + chrono::Duration::seconds(duration_secs as i64))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+
+        let ok = self
+            .integration_repo
+            .acquire_lease(
+                &lease_id,
+                integration_id,
+                attempt_id,
+                repository_id,
+                target_ref,
+                &lease_token,
+                fencing_token,
+                &expires_at,
+            )
+            .await?;
+
+        if ok {
+            Ok(Some((lease_id, fencing_token)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Release a lease for a given lease_id and fencing_token.
+    pub async fn release_lease(
+        &self,
+        lease_id: &str,
+        fencing_token: i64,
+    ) -> Result<bool, CoreError> {
+        self.integration_repo
+            .release_lease(lease_id, fencing_token)
+            .await
+    }
+
+    // ── Full Integration Run ─────────────────────────────────────────
+
+    /// Run the next integration for a scope: dequeue → acquire lease → execute → persist.
+    /// This is the full production path for `harness integration run-next`.
+    pub async fn run_next(
+        &self,
+        repository_id: &str,
+        target_ref: &str,
+        repo_path: &Path,
+        integration_root: &Path,
+        verification_policy: &IntegrationVerificationPolicy,
+    ) -> Result<Option<RunNextOutcome>, CoreError> {
+        // 1. Dequeue
+        let req = match self.dequeue(repository_id, target_ref).await? {
+            Some(r) => r,
+            None => return Ok(None),
+        };
+
+        // 2. Resolve commit_oid and parent_oid from CommitCandidate
+        let (commit_oid, parent_oid) = self
+            .resolve_commit_for_request(&req.commit_request_id)
+            .await?;
+
+        // 3. Start attempt (WaitingForLease → Preparing)
+        let attempt = self
+            .start_attempt(
+                &req.integration_id,
+                &req.expected_target_head,
+                &commit_oid,
+                &parent_oid,
+            )
+            .await?;
+
+        // 4. Acquire lease
+        let (lease_id, fencing_token) = match self
+            .acquire_lease(
+                &req.integration_id,
+                &attempt.attempt_id,
+                repository_id,
+                target_ref,
+                300,
+            )
+            .await?
+        {
+            Some(l) => l,
+            None => {
+                // Lease busy — re-queue
+                self.integration_repo
+                    .transition_state(
+                        &req.integration_id,
+                        &IntegrationState::WaitingForLease,
+                        &IntegrationState::Queued,
+                    )
+                    .await?;
+                return Ok(None);
+            }
+        };
+
+        // Update attempt with lease info
+        let mut attempt = attempt;
+        attempt.lease_id = Some(lease_id.clone());
+        attempt.fencing_token = Some(fencing_token);
+
+        // 5. Execute integration
+        let executor = IntegrationExecutor::new(self.pool.clone(), integration_root);
+        let exec_outcome = executor
+            .execute(
+                &req.integration_id,
+                &attempt,
+                repo_path,
+                target_ref,
+                repository_id,
+                &lease_id,
+                fencing_token,
+                verification_policy,
+            )
+            .await;
+
+        match exec_outcome {
+            Ok(outcome) => {
+                // 5. Persist result
+                let _ = self.integration_repo.insert_result(&outcome.result).await;
+
+                // 6. Transition to terminal state
+                let _ = self
+                    .integration_repo
+                    .transition_attempt_state_fenced(
+                        &attempt.attempt_id,
+                        &IntegrationState::Preparing,
+                        &outcome.result.state.clone(),
+                        fencing_token,
+                    )
+                    .await;
+
+                let _ = self
+                    .integration_repo
+                    .transition_state(
+                        &req.integration_id,
+                        &IntegrationState::WaitingForLease,
+                        &outcome.result.state.clone(),
+                    )
+                    .await;
+
+                // 7. Release lease
+                let _ = self
+                    .integration_repo
+                    .release_lease(&lease_id, fencing_token)
+                    .await;
+
+                // 8. Cleanup worktree
+                executor.cleanup_worktree(
+                    repo_path,
+                    &executor.integration_worktree_path(&req.integration_id, &attempt.attempt_id),
+                );
+
+                self.emit_event(
+                    &req.integration_id,
+                    Some(&attempt.attempt_id),
+                    "IntegrationCompleted",
+                    &serde_json::json!({"state": outcome.result.state.as_str(), "published": outcome.published}).to_string(),
+                )
+                .await;
+
+                Ok(Some(RunNextOutcome {
+                    integration_id: req.integration_id,
+                    attempt_id: attempt.attempt_id,
+                    commit_request_id: req.commit_request_id,
+                    lease_id,
+                    fencing_token,
+                    previous_target_head: outcome.result.previous_target_head,
+                    new_target_head: outcome.result.new_target_head,
+                    strategy: outcome.result.strategy,
+                    verification_status: outcome.result.verification_status,
+                    state: outcome.result.state,
+                    published: outcome.published,
+                }))
+            }
+            Err(e) => {
+                // Release lease on error
+                let _ = self
+                    .integration_repo
+                    .release_lease(&lease_id, fencing_token)
+                    .await;
+
+                let _ = self
+                    .integration_repo
+                    .transition_state(
+                        &req.integration_id,
+                        &IntegrationState::WaitingForLease,
+                        &IntegrationState::Failed,
+                    )
+                    .await;
+
+                Err(e)
+            }
         }
     }
 
@@ -174,7 +394,6 @@ impl IntegrationQueueService {
 
     /// Cancel an integration request. Only allowed from non-terminal states.
     pub async fn cancel(&self, integration_id: &IntegrationId) -> Result<bool, CoreError> {
-        // Get current state from DB
         let state_str = self
             .integration_repo
             .get_state(integration_id)
@@ -219,7 +438,6 @@ impl IntegrationQueueService {
 
     /// List all integration requests.
     pub async fn list_all(&self) -> Result<Vec<IntegrationRequest>, CoreError> {
-        // Default listing — limit to 100 most recent
         let rows: Vec<ListRow> = sqlx::query_as(
             "SELECT integration_id, commit_request_id, candidate_id, review_id, repository_id, target_ref, expected_target_head, priority, state, idempotency_key, created_at FROM integration_requests ORDER BY created_at DESC LIMIT 100",
         )
@@ -244,6 +462,29 @@ impl IntegrationQueueService {
             .collect())
     }
 
+    /// Resolve commit_oid and parent_oid from a commit_request_id.
+    async fn resolve_commit_for_request(
+        &self,
+        commit_request_id: &str,
+    ) -> Result<(String, String), CoreError> {
+        let row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT commit_oid, parent_oid, tree_oid FROM commit_candidates WHERE commit_request_id = ?",
+        )
+        .bind(commit_request_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
+
+        match row {
+            Some((commit_oid, parent_oid, _tree_oid)) => Ok((commit_oid, parent_oid)),
+            None => Err(CoreError::new(
+                ErrorCode::NotFound,
+                format!("CommitCandidate not found for request: {commit_request_id}"),
+                ErrorSource::System,
+            )),
+        }
+    }
+
     // ── Events ────────────────────────────────────────────────────────
 
     async fn emit_event(
@@ -265,6 +506,22 @@ impl IntegrationQueueService {
             )
             .await;
     }
+}
+
+/// Outcome of a `run_next` call — full integration execution result.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunNextOutcome {
+    pub integration_id: String,
+    pub attempt_id: String,
+    pub commit_request_id: String,
+    pub lease_id: String,
+    pub fencing_token: i64,
+    pub previous_target_head: String,
+    pub new_target_head: Option<String>,
+    pub strategy: Option<IntegrationStrategy>,
+    pub verification_status: Option<String>,
+    pub state: IntegrationState,
+    pub published: bool,
 }
 
 fn parse_dt(s: &str) -> chrono::DateTime<chrono::Utc> {
