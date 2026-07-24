@@ -388,6 +388,29 @@ impl LivenessOrchestrator {
 /// - active + beyond grace → eligible (stale)
 /// - completed/failed/abandoned + beyond TTL → eligible
 /// - completed/failed/abandoned + within TTL → preserve
+fn rfc3339_age_seconds(older: &str, newer: &str) -> u64 {
+    if older.len() < 19 || newer.len() < 19 {
+        return 0;
+    }
+    // RFC 3339 timestamps sort lexicographically at the second level.
+    if older[..19] >= newer[..19] {
+        return 0;
+    }
+    // Approximate using chrono for precision.
+    let parse_dt = |s: &str| -> Option<chrono::DateTime<chrono::Utc>> {
+        chrono::DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|d| d.with_timezone(&chrono::Utc))
+    };
+    if let (Some(older_dt), Some(newer_dt)) = (parse_dt(older), parse_dt(newer)) {
+        let dur = newer_dt.signed_duration_since(older_dt);
+        if dur.num_seconds() > 0 {
+            return dur.num_seconds() as u64;
+        }
+    }
+    0
+}
+
 fn scan_stale_managed_root(
     guard: &DeletionGuard,
     root: &std::path::Path,
@@ -429,12 +452,11 @@ fn scan_stale_managed_root(
             Some(m) => {
                 if !m.is_active() {
                     // Terminal state — check TTL.
-                    let completed_at = m.completed_at.unwrap_or(m.created_at);
-                    let age = chrono::Utc::now()
-                        .signed_duration_since(completed_at)
-                        .to_std()
-                        .unwrap_or(std::time::Duration::ZERO);
-                    if age >= failed_ttl {
+                    let completed_at = m.completed_at.as_deref().unwrap_or(&m.created_at);
+                    // RFC 3339 timestamps sort lexicographically.
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let age_secs = rfc3339_age_seconds(completed_at, &now);
+                    if age_secs >= failed_ttl.as_secs() {
                         true // eligible
                     } else {
                         result.entries.push(super::types::CleanupEntry {
@@ -442,7 +464,7 @@ fn scan_stale_managed_root(
                             action: super::types::CleanupAction::Preserve,
                             reason: format!(
                                 "within TTL ({:.0}s remaining)",
-                                (failed_ttl - age).as_secs()
+                                (failed_ttl.as_secs() - age_secs)
                             ),
                         });
                         result.preserved += 1;
@@ -450,11 +472,9 @@ fn scan_stale_managed_root(
                     }
                 } else {
                     // Active — check grace period.
-                    let age = chrono::Utc::now()
-                        .signed_duration_since(m.created_at)
-                        .to_std()
-                        .unwrap_or(std::time::Duration::ZERO);
-                    if age >= stale_grace {
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let age_secs = rfc3339_age_seconds(&m.created_at, &now);
+                    if age_secs >= stale_grace.as_secs() {
                         true // stale — eligible
                     } else {
                         result.entries.push(super::types::CleanupEntry {
@@ -462,7 +482,7 @@ fn scan_stale_managed_root(
                             action: super::types::CleanupAction::Preserve,
                             reason: format!(
                                 "active within grace ({:.0}s remaining)",
-                                (stale_grace - age).as_secs()
+                                (stale_grace.as_secs() - age_secs)
                             ),
                         });
                         result.preserved += 1;

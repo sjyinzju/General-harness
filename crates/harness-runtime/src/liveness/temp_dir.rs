@@ -126,7 +126,7 @@ impl HarnessTempDir {
         let mut marker: OwnershipMarker =
             serde_json::from_str(&raw).map_err(|e| temp_err(format!("parse marker: {e}")))?;
         marker.state = state;
-        marker.completed_at = Some(chrono::Utc::now());
+        marker.completed_at = Some(chrono::Utc::now().to_rfc3339());
         write_marker_atomic(&self.path, &marker)?;
         Ok(())
     }

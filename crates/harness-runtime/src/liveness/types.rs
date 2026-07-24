@@ -82,13 +82,14 @@ pub struct OwnershipMarker {
     pub kind: ManagedDirKind,
     pub run_id: String,
     pub owner_pid: u32,
-    #[serde(with = "chrono::serde::ts_seconds")]
-    pub owner_process_created_at: chrono::DateTime<chrono::Utc>,
-    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// RFC 3339 / ISO 8601 timestamp string (e.g. "2026-07-24T04:11:56Z").
+    /// Stored as a string for maximum cross-language compatibility.
+    pub owner_process_created_at: String,
+    pub created_at: String,
     pub code_head: String,
     pub state: MarkerState,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub completed_at: Option<String>,
 }
 
 impl OwnershipMarker {
@@ -99,13 +100,13 @@ impl OwnershipMarker {
         owner_pid: u32,
         code_head: String,
     ) -> Self {
-        let now = chrono::Utc::now();
+        let now = chrono::Utc::now().to_rfc3339();
         Self {
             schema_version: MARKER_SCHEMA_VERSION,
             kind,
             run_id,
             owner_pid,
-            owner_process_created_at: now,
+            owner_process_created_at: now.clone(),
             created_at: now,
             code_head,
             state: MarkerState::Active,
@@ -116,7 +117,7 @@ impl OwnershipMarker {
     /// Mark the directory as completed with the given final state.
     pub fn finalize(mut self, state: MarkerState) -> Self {
         self.state = state;
-        self.completed_at = Some(chrono::Utc::now());
+        self.completed_at = Some(chrono::Utc::now().to_rfc3339());
         self
     }
 

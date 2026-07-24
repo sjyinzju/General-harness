@@ -215,7 +215,7 @@ impl DeletionGuard {
 
                 // Compare process creation time to guard against PID reuse.
                 let creation_matches =
-                    check_process_creation_time(m.owner_pid, m.owner_process_created_at);
+                    check_process_creation_time(m.owner_pid, &m.owner_process_created_at);
 
                 if pid_alive && creation_matches {
                     // The owner process is still running. Allow only if this
@@ -497,7 +497,7 @@ fn managed_root_to_kind(root: &Path) -> ManagedDirKind {
 /// Check whether a process with the given PID was created at the expected
 /// time.  Used to guard against PID reuse.
 #[cfg(windows)]
-fn check_process_creation_time(pid: u32, _expected: chrono::DateTime<chrono::Utc>) -> bool {
+fn check_process_creation_time(pid: u32, _expected: &str) -> bool {
     // On Windows, comparing process creation times requires opening the
     // process with QUERY_LIMITED_INFORMATION and calling
     // GetProcessTimes.  For now, we return `true` when the PID is alive
@@ -508,7 +508,7 @@ fn check_process_creation_time(pid: u32, _expected: chrono::DateTime<chrono::Utc
 }
 
 #[cfg(not(windows))]
-fn check_process_creation_time(pid: u32, _expected: chrono::DateTime<chrono::Utc>) -> bool {
+fn check_process_creation_time(pid: u32, _expected: &str) -> bool {
     // On Unix we could read /proc/<pid>/stat starttime.
     is_pid_alive(pid)
 }

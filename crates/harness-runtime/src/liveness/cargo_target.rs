@@ -128,7 +128,7 @@ impl ManagedCargoRunDir {
         let mut marker: OwnershipMarker =
             serde_json::from_str(&raw).map_err(|e| cargo_err(format!("parse marker: {e}")))?;
         marker.state = state;
-        marker.completed_at = Some(chrono::Utc::now());
+        marker.completed_at = Some(chrono::Utc::now().to_rfc3339());
         super::temp_dir::write_marker_atomic(&self.path, &marker)?;
         Ok(())
     }
@@ -202,7 +202,10 @@ pub fn scan_stale_cargo_runs(
             Some(m) if m.is_active() => {
                 // Check grace period for active markers.
                 let age = chrono::Utc::now()
-                    .signed_duration_since(m.created_at)
+                    .signed_duration_since(
+                        chrono::DateTime::parse_from_rfc3339(&m.created_at)
+                            .unwrap_or_else(|_| chrono::Utc::now().into()),
+                    )
                     .to_std()
                     .unwrap_or(std::time::Duration::ZERO);
                 if age < stale_grace {

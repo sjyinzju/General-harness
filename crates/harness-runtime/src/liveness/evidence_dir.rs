@@ -268,7 +268,7 @@ fn update_marker_state(dir: &Path, state: MarkerState) -> Result<(), CoreError> 
     let mut marker: OwnershipMarker =
         serde_json::from_str(&raw).map_err(|e| evidence_err(format!("parse marker: {e}")))?;
     marker.state = state;
-    marker.completed_at = Some(chrono::Utc::now());
+    marker.completed_at = Some(chrono::Utc::now().to_rfc3339());
     crate::liveness::temp_dir::write_marker_atomic(dir, &marker)?;
     Ok(())
 }
