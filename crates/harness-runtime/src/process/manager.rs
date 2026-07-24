@@ -18,10 +18,16 @@ use tokio::sync::RwLock;
 use tokio::time::timeout as tokio_timeout;
 
 use super::capture::{spawn_stream_capture, StreamCaptureConfig, StreamCaptureHandle};
-use super::job_object::ProcessTreeGuard;
+use super::job_object::{ProcessTreeGuard, ProcessTreeTermination};
 use super::redactor::ProcessEventRedactor;
 use super::registry::ProcessRegistry;
 use super::types::*;
+
+// Windows: CREATE_SUSPENDED flag for atomic Job Object assignment.
+// The process is born suspended so it cannot execute any user code
+// before being assigned to the Job Object.
+#[cfg(windows)]
+const CREATE_SUSPENDED: u32 = 0x00000004;
 
 /// Upper bound on waiting for pipe EOF after the process tree ended.
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -51,25 +57,14 @@ impl ProcessManager {
         ));
 
         let cancel = tokio_util::sync::CancellationToken::new();
-        let mut cmd = tokio::process::Command::new(&spec.executable);
-        cmd.args(&spec.args)
-            .current_dir(&spec.working_directory)
-            .stdin(match &spec.stdin_mode {
-                StdinMode::Closed => Stdio::null(),
-                StdinMode::Pipe | StdinMode::OneShot(_) => Stdio::piped(),
-            })
-            .stdout(match spec.stdout_capture {
-                CapturePolicy::Pipe | CapturePolicy::Spool { .. } => Stdio::piped(),
-                CapturePolicy::Discard => Stdio::null(),
-            })
-            .stderr(match spec.stderr_capture {
-                CapturePolicy::Pipe | CapturePolicy::Spool { .. } => Stdio::piped(),
-                CapturePolicy::Discard => Stdio::null(),
-            });
+
+        // Build a std::process::Command first so we can set Windows platform
+        // flags (CREATE_SUSPENDED for atomic Job Object assignment).
+        let mut std_cmd = std::process::Command::new(&spec.executable);
+        std_cmd.args(&spec.args);
+        std_cmd.current_dir(&spec.working_directory);
 
         // Defense-in-depth: validate env_overrides against profile-allowed set.
-        // Any override whose name is sensitive AND not in the allowed set is
-        // rejected with a structured error (fail-closed, never silently drop).
         for k in spec.env_overrides.keys() {
             if is_sensitive_env(k) && !spec.allowed_env_var_names.contains(k) {
                 return Err(CoreError::new(
@@ -86,16 +81,16 @@ impl ProcessManager {
         let base_env: HashMap<String, String> = std::env::vars()
             .filter(|(k, _)| !spec.env_removals.contains(k) && is_safe_env(k))
             .collect();
-        cmd.env_clear();
+        std_cmd.env_clear();
         for (k, v) in &base_env {
-            cmd.env(k, v);
+            std_cmd.env(k, v);
         }
-        // Defense-in-depth re-check on overrides before injection.
         for (k, v) in &spec.env_overrides {
             if !is_sensitive_env(k) || spec.allowed_env_var_names.contains(k) {
-                cmd.env(k, v);
+                std_cmd.env(k, v);
             }
         }
+
         // Environment is logged as names + presence only — never values.
         tracing::debug!(
             execution_id = %spec.execution_id,
@@ -105,10 +100,34 @@ impl ProcessManager {
             "process_env_prepared"
         );
 
+        // I4.5 structural fix: on Windows, create the process suspended so we
+        // can atomically assign the Job Object before the process executes any
+        // user code. This eliminates the race window between spawn() and
+        // ProcessTreeGuard::attach().
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            std_cmd.creation_flags(CREATE_SUSPENDED);
+        }
+
+        // Convert to tokio::process::Command for async stdio handling.
+        let mut cmd = tokio::process::Command::from(std_cmd);
+        cmd.stdin(match &spec.stdin_mode {
+            StdinMode::Closed => Stdio::null(),
+            StdinMode::Pipe | StdinMode::OneShot(_) => Stdio::piped(),
+        })
+        .stdout(match spec.stdout_capture {
+            CapturePolicy::Pipe | CapturePolicy::Spool { .. } => Stdio::piped(),
+            CapturePolicy::Discard => Stdio::null(),
+        })
+        .stderr(match spec.stderr_capture {
+            CapturePolicy::Pipe | CapturePolicy::Spool { .. } => Stdio::piped(),
+            CapturePolicy::Discard => Stdio::null(),
+        });
+
         let mut child = cmd.spawn().map_err(|e| {
             CoreError::new(
                 ErrorCode::ProcessSpawnFailed,
-                // Redact known secrets from error text (paths/args may embed them).
                 redactor.redact_str(&format!("spawn {}: {e}", spec.executable.display())),
                 ErrorSource::System,
             )
@@ -116,6 +135,7 @@ impl ProcessManager {
         let pid = child.id().expect("process must have PID");
 
         // Tree ownership: Job Object primary on Windows (taskkill fallback).
+        // The process is still suspended — no user code has executed yet.
         let tree_guard = ProcessTreeGuard::attach(&child);
         tracing::debug!(
             execution_id = %spec.execution_id,
@@ -123,6 +143,48 @@ impl ProcessManager {
             job_object = tree_guard.job_object_active(),
             "process_tree_guard_attached"
         );
+
+        // I4.5 structural fix: on Windows the process was created with
+        // CREATE_SUSPENDED so it cannot execute user code before Job
+        // assignment.  Per ADR-007 Contract B (Degraded Fallback):
+        //
+        //   - Resume unconditionally — the process MUST be resumed.
+        //   - If Job creation succeeded → Job containment.
+        //   - If Job creation failed → taskkill /T /F fallback
+        //     (ProcessTreeGuard already handles both paths).
+        //   - Resume failure → kill + return error (no orphan).
+        #[cfg(windows)]
+        {
+            match super::job_object::resume_suspended_process(pid) {
+                Ok(()) => {
+                    if tree_guard.job_object_active() {
+                        tracing::debug!(pid, "process_resumed_with_job_containment");
+                    } else {
+                        tracing::warn!(
+                            pid,
+                            "job_unavailable_process_resumed_with_taskkill_fallback"
+                        );
+                    }
+                }
+                Err(e) => {
+                    // Resume failed — the process cannot execute.  Kill it
+                    // (via Job if available, else taskkill) and return error.
+                    // No ProcessHandle is returned → no orphan.
+                    tracing::error!(pid, error = %e, "resume_suspended_process_failed");
+                    tree_guard.kill_tree();
+                    // Bounded wait to confirm the process is dead before
+                    // returning (TerminateJobObject is synchronous, but
+                    // taskkill fallback benefits from the wait).
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), child.wait()).await;
+                    return Err(CoreError::new(
+                        ErrorCode::ProcessSpawnFailed,
+                        format!("resume suspended process {pid}: {e}"),
+                        ErrorSource::System,
+                    ));
+                }
+            }
+        }
 
         // Independent capture pipelines per stream.
         let stdout_capture = child.stdout.take().map(|out| {
@@ -176,22 +238,51 @@ impl ProcessManager {
                 Timeout,
                 Cancelled,
                 WaitFailed,
+                /// Termination could not be confirmed — the OS may still be
+                /// running the process tree.  Maps to ProcessUnknown.
+                ProcessUnknown {
+                    reason: String,
+                },
             }
 
             let end = tokio::select! {
                 _ = cancel2.cancelled() => {
-                    tree_guard.kill_tree();
+                    let term = tree_guard.kill_tree();
                     let _ = tokio_timeout(reap_timeout, child.wait()).await;
-                    End::Cancelled
+                    match term {
+                        ProcessTreeTermination::Confirmed { .. } | ProcessTreeTermination::AlreadyExited => {
+                            End::Cancelled
+                        }
+                        ProcessTreeTermination::Unconfirmed { job_error, fallback_error } => {
+                            let reason = format!(
+                                "cancel: termination unconfirmed; job_error={:?}, fallback_error={:?}",
+                                job_error, fallback_error
+                            );
+                            tracing::error!(pid, execution_id = %execution_id, "{}", reason);
+                            End::ProcessUnknown { reason }
+                        }
+                    }
                 }
                 result = tokio_timeout(timeout_dur, child.wait()) => {
                     match result {
                         Ok(Ok(status)) => End::Natural(status),
                         Ok(Err(_e)) => End::WaitFailed,
                         Err(_elapsed) => {
-                            tree_guard.kill_tree();
+                            let term = tree_guard.kill_tree();
                             let _ = tokio_timeout(reap_timeout, child.wait()).await;
-                            End::Timeout
+                            match term {
+                                ProcessTreeTermination::Confirmed { .. } | ProcessTreeTermination::AlreadyExited => {
+                                    End::Timeout
+                                }
+                                ProcessTreeTermination::Unconfirmed { job_error, fallback_error } => {
+                                    let reason = format!(
+                                        "timeout: termination unconfirmed; job_error={:?}, fallback_error={:?}",
+                                        job_error, fallback_error
+                                    );
+                                    tracing::error!(pid, execution_id = %execution_id, "{}", reason);
+                                    End::ProcessUnknown { reason }
+                                }
+                            }
                         }
                     }
                 }
@@ -228,6 +319,11 @@ impl ProcessManager {
                 End::Cancelled => {
                     ProcessOutcome::skeleton(ProcessTermination::Cancelled, None, duration_ms)
                 }
+                End::ProcessUnknown { reason } => ProcessOutcome::skeleton(
+                    ProcessTermination::ProcessUnknown { reason },
+                    None,
+                    duration_ms,
+                ),
                 End::WaitFailed => {
                     ProcessOutcome::skeleton(ProcessTermination::Lost, None, duration_ms)
                 }

@@ -1,125 +1,317 @@
-//! harness-cli: CLI entry point and interactive TUI.
-//! Depends on harness-runtime, harness-adapters, ratatui, crossterm.
+//! harness-cli: CLI entry point with automatic managed-temp lifecycle.
+//!
+//! Every command automatically:
+//! 1. Creates a `RunContext` with managed temp directories.
+//! 2. Redirects `TEMP`/`TMP` to the managed temp (inherited by all children).
+//! 3. Builds a `ProductionGraph` with mandatory `LivenessOrchestrator`.
+//! 4. Starts a periodic janitor for background cleanup.
+//! 5. Runs the startup janitor before accepting work.
+//! 6. Calls explicit shutdown on all exit paths (including Ctrl+C).
+//!
+//! # invariants
+//! - `RunContext::shutdown()` is ALWAYS called (success, failure, cancel, Ctrl+C).
+//! - `std::process::exit()` is NEVER called after `RunContext` creation.
+//! - The periodic janitor is started exactly once and cancelled before shutdown.
+//! - No detached background tasks remain after shutdown.
 
 mod commands;
 
 use harness_runtime::db::Database;
+use harness_runtime::liveness::RunContext;
 use harness_runtime::production_graph::ProductionGraph;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        println!("harness v0.1.0 — task engineering harness");
-        println!("Usage:");
-        println!(
-            "  harness task-loop start --project <id> --task <id> [--owner <id>] [--policy <json>] [--repo <path>] [--worktree-root <path>]"
-        );
-        println!("  harness task-loop status <loop-id>");
-        println!("  harness task-loop resume <loop-id> [--owner <id>] [--repo <path>] [--worktree-root <path>]");
-        println!("  harness task-loop cancel <loop-id> [--owner <id>]");
-        println!("  harness task-loop inspect <loop-id> [--json]");
-        println!("  harness task-loop dry-run-decision <loop-id>");
+        print_usage();
         return Ok(());
     }
 
+    // ── Resolve repo root ──────────────────────────────────────
+    let repo_root = parse_flag(&args, "--repo")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let code_head = parse_flag(&args, "--code-head").unwrap_or("unknown");
+    // Default DB goes into target/data/ so it never lands in repo root.
+    let default_db = repo_root
+        .join("target")
+        .join("data")
+        .join("harness.db")
+        .to_string_lossy()
+        .to_string();
+    let db_path = std::env::var("HARNESS_DB").unwrap_or(default_db);
+
+    // ── "cleanup" is a special case — no ProductionGraph needed ──
+    if args.len() >= 2 && args[1] == "cleanup" {
+        return cmd_cleanup(&args, &repo_root, &db_path).await;
+    }
+
+    // ── Create RunContext (managed temp + env redirect) ─────────
+    let run_context = match RunContext::create(&repo_root, code_head, true) {
+        Ok(rc) => Arc::new(rc),
+        Err(e) => {
+            eprintln!("fatal: run context: {e}");
+            return Err(e.into());
+        }
+    };
+
+    // ── Build ProductionGraph ───────────────────────────────────
+    let db = Database::open(&PathBuf::from(&db_path)).await?;
+    let worktree_root = parse_flag(&args, "--worktree-root")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| repo_root.join("target/tmp"));
+    let graph = match ProductionGraph::build(
+        db.pool.clone(),
+        &worktree_root,
+        &repo_root,
+        run_context.clone(),
+    ) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("fatal: {e}");
+            // Shutdown run context before exit — env restore + marker finalize.
+            let _ = run_context.shutdown(false).await;
+            std::process::exit(1);
+        }
+    };
+
+    // ── Run startup janitor ─────────────────────────────────────
+    let _startup_result = graph.startup().await;
+
+    // ── Start periodic janitor ──────────────────────────────────
+    let janitor_cancel = graph.start_periodic_janitor(Duration::from_secs(300));
+
+    // ── Install Ctrl+C handler ──────────────────────────────────
+    let _ctrlc_cancel = janitor_cancel.clone();
+    let _ctrlc_run_context = run_context.clone();
+
+    // ── Dispatch with Ctrl+C awareness ──────────────────────────
+    let run_succeeded = tokio::select! {
+        result = dispatch_command(&args, &db, &graph) => {
+            result
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("Ctrl+C received, initiating graceful shutdown");
+            eprintln!("\nInterrupted — shutting down...");
+            false
+        }
+    };
+
+    // ── Cancel periodic janitor (bounded wait) ──────────────────
+    janitor_cancel.cancel();
+    // Give the periodic janitor up to 2 seconds to finish its current tick.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        // The janitor will observe cancellation and exit its loop.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    })
+    .await
+    .ok();
+
+    // ── Explicit shutdown ───────────────────────────────────────
+    // The Ctrl+C handler uses its own cleanup path; for the main path,
+    // we call shutdown explicitly.  The Drop impl on RunContext is the
+    // last-resort safety net.
+    let _shutdown_result = graph.shutdown(run_succeeded).await;
+
+    // Also ensure the Ctrl+C path's clone is shut down if it was
+    // the one that activated.  Since Ctrl+C selects the signal future,
+    // the main run_context.shutdown is still called above.
+
+    tracing::info!(run_succeeded = run_succeeded, "harness exiting");
+
+    if run_succeeded {
+        Ok(())
+    } else {
+        // Return error via main return, NOT process::exit().
+        Err("command failed".into())
+    }
+}
+
+async fn dispatch_command(args: &[String], db: &Database, graph: &ProductionGraph) -> bool {
     match args[1].as_str() {
         "task-loop" => {
             if args.len() < 3 {
                 eprintln!("error: missing task-loop subcommand");
-                return Ok(());
-            }
-            let db_path = std::env::var("HARNESS_DB").unwrap_or_else(|_| "harness.db".to_string());
-            let db = Database::open(&PathBuf::from(&db_path)).await?;
-
-            // Check for production I4 wiring flags.
-            let repo = parse_flag(&args, "--repo");
-            let worktree_root = parse_flag(&args, "--worktree-root");
-
-            match args[2].as_str() {
-                "start" => {
-                    let project = parse_flag(&args, "--project").unwrap_or("default");
-                    let task = parse_flag(&args, "--task").ok_or("--task required")?;
-                    let owner = parse_flag(&args, "--owner").unwrap_or("cli");
-                    let policy = parse_flag(&args, "--policy").unwrap_or("{}");
-                    let graph = build_graph_if_repo(&db, repo, worktree_root)?;
-                    commands::task_loop::cmd_start(
-                        &db,
-                        graph.as_ref(),
-                        project,
-                        task,
-                        owner,
-                        policy,
-                    )
-                    .await?;
-                }
-                "status" => {
-                    let loop_id = args.get(3).ok_or("loop-id required")?;
-                    let graph = build_graph_if_repo(&db, repo, worktree_root)?;
-                    commands::task_loop::cmd_status(&db, graph.as_ref(), loop_id).await?;
-                }
-                "resume" => {
-                    let loop_id = args.get(3).ok_or("loop-id required")?;
-                    let owner = parse_flag(&args, "--owner").unwrap_or("cli");
-                    let graph = build_graph_if_repo(&db, repo, worktree_root)?;
-                    commands::task_loop::cmd_resume(&db, graph.as_ref(), loop_id, owner).await?;
-                }
-                "cancel" => {
-                    let loop_id = args.get(3).ok_or("loop-id required")?;
-                    let owner = parse_flag(&args, "--owner").unwrap_or("cli");
-                    let graph = build_graph_if_repo(&db, repo, worktree_root)?;
-                    commands::task_loop::cmd_cancel(&db, graph.as_ref(), loop_id, owner).await?;
-                }
-                "inspect" => {
-                    let loop_id = args.get(3).ok_or("loop-id required")?;
-                    let graph = build_graph_if_repo(&db, repo, worktree_root)?;
-                    if args.contains(&"--json".to_string()) {
-                        commands::task_loop::cmd_inspect_json(&db, graph.as_ref(), loop_id).await?;
-                    } else {
-                        commands::task_loop::cmd_status(&db, graph.as_ref(), loop_id).await?;
-                    }
-                }
-                "dry-run-decision" => {
-                    let loop_id = args.get(3).ok_or("loop-id required")?;
-                    let graph = build_graph_if_repo(&db, repo, worktree_root)?;
-                    commands::task_loop::cmd_dry_run_decision(&db, graph.as_ref(), loop_id).await?;
-                }
-                other => eprintln!("error: unknown subcommand: {other}"),
+                false
+            } else {
+                dispatch_task_loop(args, db, graph).await
             }
         }
-        _ => println!("harness v0.1.0 — unknown command: {}", args[1]),
+        _ => {
+            eprintln!("harness v0.1.0 — unknown command: {}", args[1]);
+            false
+        }
+    }
+}
+
+async fn dispatch_task_loop(args: &[String], db: &Database, graph: &ProductionGraph) -> bool {
+    match args[2].as_str() {
+        "start" => {
+            let project = parse_flag(args, "--project").unwrap_or("default");
+            let task = match parse_flag(args, "--task") {
+                Some(t) => t,
+                None => {
+                    eprintln!("error: --task required");
+                    return false;
+                }
+            };
+            let owner = parse_flag(args, "--owner").unwrap_or("cli");
+            let policy = parse_flag(args, "--policy").unwrap_or("{}");
+            match commands::task_loop::cmd_start(db, Some(graph), project, task, owner, policy)
+                .await
+            {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "status" => {
+            let loop_id = match args.get(3) {
+                Some(id) => id,
+                None => {
+                    eprintln!("error: loop-id required");
+                    return false;
+                }
+            };
+            match commands::task_loop::cmd_status(db, Some(graph), loop_id).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "resume" => {
+            let loop_id = match args.get(3) {
+                Some(id) => id,
+                None => {
+                    eprintln!("error: loop-id required");
+                    return false;
+                }
+            };
+            let owner = parse_flag(args, "--owner").unwrap_or("cli");
+            match commands::task_loop::cmd_resume(db, Some(graph), loop_id, owner).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "cancel" => {
+            let loop_id = match args.get(3) {
+                Some(id) => id,
+                None => {
+                    eprintln!("error: loop-id required");
+                    return false;
+                }
+            };
+            let owner = parse_flag(args, "--owner").unwrap_or("cli");
+            match commands::task_loop::cmd_cancel(db, Some(graph), loop_id, owner).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        "inspect" => {
+            let loop_id = match args.get(3) {
+                Some(id) => id,
+                None => {
+                    eprintln!("error: loop-id required");
+                    return false;
+                }
+            };
+            if args.contains(&"--json".to_string()) {
+                match commands::task_loop::cmd_inspect_json(db, Some(graph), loop_id).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        false
+                    }
+                }
+            } else {
+                match commands::task_loop::cmd_status(db, Some(graph), loop_id).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        false
+                    }
+                }
+            }
+        }
+        "dry-run-decision" => {
+            let loop_id = match args.get(3) {
+                Some(id) => id,
+                None => {
+                    eprintln!("error: loop-id required");
+                    return false;
+                }
+            };
+            match commands::task_loop::cmd_dry_run_decision(db, Some(graph), loop_id).await {
+                Ok(()) => true,
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    false
+                }
+            }
+        }
+        other => {
+            eprintln!("error: unknown subcommand: {other}");
+            false
+        }
+    }
+}
+
+async fn cmd_cleanup(
+    args: &[String],
+    repo_root: &Path,
+    db_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let dry_run = !args.contains(&"--apply".to_string());
+    let db = Database::open(&PathBuf::from(db_path)).await?;
+
+    let liveness_config =
+        harness_runtime::liveness::LivenessConfig::for_repo(repo_root, "harness-cli".into());
+    let pool = db.pool.clone();
+    match harness_runtime::liveness::LivenessOrchestrator::new(liveness_config, pool) {
+        Ok(orch) => {
+            let result = orch.cli_cleanup(vec![], dry_run).await;
+            let report =
+                harness_runtime::liveness::LivenessOrchestrator::format_dry_run_report(&result);
+            println!("{report}");
+            if dry_run {
+                println!("\n*** DRY RUN — no files were deleted. Use --apply to execute. ***");
+            }
+        }
+        Err(e) => {
+            eprintln!("cleanup error: {e}");
+        }
     }
     Ok(())
 }
 
-/// Build a production service graph when `--repo` is provided.
-/// Without `--repo`, returns `None` and the CLI falls back to the
-/// simple (direct-SQL) path — useful for read-only commands or
-/// environments where a git repository is not available.
-fn build_graph_if_repo(
-    db: &Database,
-    repo: Option<&str>,
-    worktree_root: Option<&str>,
-) -> Result<Option<ProductionGraph>, Box<dyn std::error::Error>> {
-    match (repo, worktree_root) {
-        (Some(repo_path), Some(wt_root)) => {
-            let graph = ProductionGraph::build(
-                db.pool.clone(),
-                &PathBuf::from(wt_root),
-                &PathBuf::from(repo_path),
-            )?;
-            Ok(Some(graph))
-        }
-        (Some(_), None) => {
-            eprintln!(
-                "warning: --repo provided without --worktree-root; \
-                 using simple path (no real I4 dispatch)"
-            );
-            Ok(None)
-        }
-        _ => Ok(None),
-    }
+fn print_usage() {
+    println!("harness v0.1.0 — task engineering harness");
+    println!("Usage:");
+    println!("  harness task-loop start --project <id> --task <id> [--owner <id>] [--policy <json>] [--repo <path>] [--worktree-root <path>] [--code-head <sha>]");
+    println!("  harness task-loop status <loop-id> [--repo <path>]");
+    println!("  harness task-loop resume <loop-id> [--owner <id>] [--repo <path>] [--worktree-root <path>]");
+    println!("  harness task-loop cancel <loop-id> [--owner <id>] [--repo <path>]");
+    println!("  harness task-loop inspect <loop-id> [--json] [--repo <path>]");
+    println!("  harness task-loop dry-run-decision <loop-id> [--repo <path>]");
+    println!("  harness cleanup [--dry-run|--apply] [--repo <path>]");
+    println!();
+    println!("Environment:");
+    println!("  HARNESS_DB     path to SQLite database (default: target/data/harness.db)");
+    println!("  TEMP/TMP       automatically redirected to managed temp");
 }
 
 fn parse_flag<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {

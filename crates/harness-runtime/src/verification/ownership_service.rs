@@ -90,6 +90,13 @@ pub struct VerificationOwnershipService {
     coordinator: ResourceHandoffCoordinator,
     handoff_repo: HandoffRepository,
     heartbeat_registry: Arc<HeartbeatRegistry>,
+    /// Test-only hook: when set, `start_or_resume_takeover` waits on this
+    /// notification after coordinated_takeover returns Acquired and before
+    /// the transactional lifecycle CAS.  Used to deterministically
+    /// reproduce the race where a concurrent AlreadyOwned path executes
+    /// between handoff acquisition and lifecycle transition.
+    #[cfg(test)]
+    test_pause_after_handoff: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl VerificationOwnershipService {
@@ -104,7 +111,18 @@ impl VerificationOwnershipService {
             coordinator,
             handoff_repo,
             heartbeat_registry,
+            #[cfg(test)]
+            test_pause_after_handoff: None,
         }
+    }
+
+    /// Test-only: install a pause barrier between coordinated handoff
+    /// takeover and the transactional lifecycle CAS.  The barrier is
+    /// waited on exactly once — after Acquired and before the CAS.
+    #[cfg(test)]
+    pub fn with_pause_after_handoff(mut self, gate: Arc<tokio::sync::Notify>) -> Self {
+        self.test_pause_after_handoff = Some(gate);
+        self
     }
 
     /// Attempt to take over scheduler resources for verification.
@@ -323,16 +341,22 @@ impl VerificationOwnershipService {
             .await;
 
         match takeover {
-            CoordinatedTakeoverResult::Acquired { .. } => { /* proceed */ }
-            CoordinatedTakeoverResult::AlreadyOwned => {
-                // Transition run if not already Running.
-                if run_lc == "created" {
-                    let _ = sqlx::query(
-                        "UPDATE verification_runs SET lifecycle='running', started_at=datetime('now'), version=version+1, updated_at=datetime('now') WHERE run_id=? AND lifecycle='created' AND version=?",
-                    )
-                    .bind(&req.verification_run_id).bind(run_version)
-                    .execute(&self.pool).await;
+            CoordinatedTakeoverResult::Acquired { .. } => {
+                // Test seam: allow deterministic interleaving tests to
+                // pause here so a concurrent AlreadyOwned path can run
+                // before the transactional lifecycle CAS.
+                #[cfg(test)]
+                if let Some(ref gate) = self.test_pause_after_handoff {
+                    gate.notified().await;
                 }
+                /* proceed */
+            }
+            CoordinatedTakeoverResult::AlreadyOwned => {
+                // AlreadyOwned is read-only with respect to lifecycle/version.
+                // Only the transactional CAS below (the Acquired path) may
+                // transition the run from 'created' to 'running'.  A
+                // non-transactional UPDATE here races with that CAS and can
+                // cause both sides to return AlreadyOwned (zero winners).
                 return OwnershipTakeoverResult::AlreadyOwned {
                     run_id: req.verification_run_id.clone(),
                 };
@@ -823,6 +847,177 @@ mod tests {
         let running: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM verification_runs WHERE lifecycle='running' AND run_id='run-conc'")
             .fetch_one(&ctx.db.pool).await.unwrap();
         assert_eq!(running.0, 1, "only one run must be running");
+    }
+
+    /// F2 regression: deterministic interleaving of concurrent takeover.
+    ///
+    /// Force the old broken sequence: A wins handoff → A pauses before CAS →
+    /// B runs AlreadyOwned path → B completes → release A → A's CAS succeeds.
+    /// With the fix, B's AlreadyOwned path is read-only; A's CAS must win.
+    #[tokio::test]
+    async fn test_two_pools_deterministic_interleaving_a_pauses_b_already_owned() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        let ctx = setup_ownership_test().await;
+        seed_run(&ctx.db.pool, "run-det", "ikey-det", "hash-det").await;
+
+        let db_path_str = ctx.db_path.to_string_lossy().to_string();
+        let opts2 = SqliteConnectOptions::from_str(&db_path_str)
+            .unwrap()
+            .create_if_missing(false)
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30));
+        let pool2 = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(opts2)
+            .await
+            .unwrap();
+
+        let hr_a = HandoffRepository::new(ctx.db.pool.clone());
+        let coord_a = ResourceHandoffCoordinator::new(hr_a, ctx.registry.clone());
+        let hr_b = HandoffRepository::new(pool2.clone());
+        let coord_b = ResourceHandoffCoordinator::new(hr_b, ctx.registry.clone());
+        let pause_a = Arc::new(tokio::sync::Notify::new());
+        let a_arrived = Arc::new(AtomicBool::new(false));
+
+        let svc_a = VerificationOwnershipService::new(
+            ctx.db.pool.clone(),
+            coord_a,
+            HandoffRepository::new(ctx.db.pool.clone()),
+            ctx.registry.clone(),
+        )
+        .with_pause_after_handoff(pause_a.clone());
+
+        let svc_b = VerificationOwnershipService::new(
+            pool2.clone(),
+            coord_b,
+            HandoffRepository::new(pool2.clone()),
+            ctx.registry.clone(),
+        );
+
+        let arrived = a_arrived.clone();
+        let notify = pause_a.clone();
+        let req_a = make_req("run-det", "ikey-det", "hash-det");
+        let req_b = make_req("run-det", "ikey-det", "hash-det");
+
+        // Spawn A — it will win coordinated_takeover then pause.
+        let handle_a = tokio::spawn(async move {
+            arrived.store(true, Ordering::SeqCst);
+            svc_a.start_or_resume_takeover(&req_a).await
+        });
+
+        // Wait until A has reached the pause point.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !a_arrived.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            if std::time::Instant::now() > deadline {
+                panic!("A did not reach pause point");
+            }
+        }
+        // Give A a moment to actually enter the notify wait.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // B runs — its coordinated_takeover returns AlreadyOwned.
+        // The old buggy code would have B execute a non-transactional
+        // UPDATE that steals the lifecycle transition from A.
+        // With the fix, B's path is read-only.
+        let r_b = svc_b.start_or_resume_takeover(&req_b).await;
+        assert!(
+            matches!(r_b, OwnershipTakeoverResult::AlreadyOwned { .. }),
+            "B must return AlreadyOwned, got {r_b:?}"
+        );
+
+        // Assert B did NOT modify lifecycle: it must still be 'created'.
+        let lc: (String,) =
+            sqlx::query_as("SELECT lifecycle FROM verification_runs WHERE run_id='run-det'")
+                .fetch_one(&ctx.db.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            lc.0, "created",
+            "B's AlreadyOwned path must be read-only; lifecycle must still be 'created'"
+        );
+
+        // Release A — its transactional CAS must succeed.
+        notify.notify_one();
+        let r_a = handle_a.await.unwrap();
+        assert!(
+            matches!(r_a, OwnershipTakeoverResult::Acquired { .. }),
+            "A must return Acquired, got {r_a:?}"
+        );
+
+        // Exactly one running run.
+        let running: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_runs WHERE lifecycle='running' AND run_id='run-det'",
+        )
+        .fetch_one(&ctx.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(running.0, 1, "exactly one run must be running");
+    }
+
+    /// F2 regression: reverse interleaving — B runs first and wins.
+    /// Proves exactly one Acquired regardless of scheduling order.
+    #[tokio::test]
+    async fn test_two_pools_deterministic_interleaving_b_wins_a_already_owned() {
+        use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+        use std::str::FromStr;
+        use std::time::Duration;
+
+        let ctx = setup_ownership_test().await;
+        seed_run(&ctx.db.pool, "run-rev", "ikey-rev", "hash-rev").await;
+
+        let db_path_str = ctx.db_path.to_string_lossy().to_string();
+        let opts2 = SqliteConnectOptions::from_str(&db_path_str)
+            .unwrap()
+            .create_if_missing(false)
+            .foreign_keys(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(30));
+        let pool2 = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect_with(opts2)
+            .await
+            .unwrap();
+
+        let hr_b = HandoffRepository::new(pool2.clone());
+        let coord_b = ResourceHandoffCoordinator::new(hr_b, ctx.registry.clone());
+        let svc_b = VerificationOwnershipService::new(
+            pool2.clone(),
+            coord_b,
+            HandoffRepository::new(pool2.clone()),
+            ctx.registry.clone(),
+        );
+
+        let req_a = make_req("run-rev", "ikey-rev", "hash-rev");
+        let req_b = make_req("run-rev", "ikey-rev", "hash-rev");
+
+        // B runs first — wins coordinated_takeover, returns Acquired.
+        let r_b = svc_b.start_or_resume_takeover(&req_b).await;
+        assert!(
+            matches!(r_b, OwnershipTakeoverResult::Acquired { .. }),
+            "B must return Acquired, got {r_b:?}"
+        );
+
+        // A runs second — coordinated_takeover returns AlreadyOwned.
+        let r_a = ctx.svc.start_or_resume_takeover(&req_a).await;
+        assert!(
+            matches!(r_a, OwnershipTakeoverResult::AlreadyOwned { .. }),
+            "A must return AlreadyOwned, got {r_a:?}"
+        );
+
+        // Exactly one running run.
+        let running: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM verification_runs WHERE lifecycle='running' AND run_id='run-rev'",
+        )
+        .fetch_one(&ctx.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(running.0, 1, "exactly one run must be running");
     }
 
     // ── No agent execution created ──────────────────────────────────

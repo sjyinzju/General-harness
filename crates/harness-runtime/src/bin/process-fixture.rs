@@ -73,7 +73,20 @@ fn main() {
         "spawn_child" => {
             let exe = env::current_exe().unwrap();
             let child_pid = process::Command::new(&exe).arg("sleep").arg("10").spawn();
-            println!("child_pid={}", child_pid.unwrap().id());
+            let pid = child_pid.unwrap().id();
+            // Print to stdout for backward compat with process_capture tests.
+            println!("child_pid={pid}");
+            // Write grandchild PID to grandchild.txt in the readiness dir.
+            // Uses READY_DIR if set, otherwise current directory (set by
+            // ProcessManager as the working_directory).
+            // Best-effort: write grandchild PID to grandchild.txt for
+            // the deterministic readiness protocol. Ignore errors for
+            // backward compat with spawn_grandchild mode.
+            if let Ok(rd) = env::var("READY_DIR") {
+                let _ = std::fs::write(format!("{rd}/grandchild.txt"), pid.to_string());
+            } else if let Ok(cwd) = env::current_dir() {
+                let _ = std::fs::write(cwd.join("grandchild.txt"), pid.to_string());
+            }
         }
         "spawn_grandchild" => {
             let exe = env::current_exe().unwrap();
@@ -84,15 +97,102 @@ fn main() {
             let _ = child.wait_with_output();
         }
         "spawn_tree_and_sleep" => {
-            // Spawn an intermediate that creates an orphaned grandchild
-            // (sleep 10) and exits, then stay alive. Used to verify that
-            // killing the root also kills the orphaned grandchild.
+            // Write startup marker IMMEDIATELY to verify process starts.
+            let start_marker = env::var("READY_DIR").unwrap_or_else(|_| {
+                env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            });
+            let _ = std::fs::write(
+                format!("{start_marker}/started.txt"),
+                format!("pid={} time={:?}", process::id(), std::time::Instant::now()),
+            );
+
+            // ── I4.5 structural fix ──────────────────────────────
+            // No more 50ms sleep! The ProcessManager now creates this
+            // process with CREATE_SUSPENDED and resumes it only AFTER
+            // Job Object assignment is complete. Children created here
+            // are born directly into the Job — no escape window.
+            //
+            // Previously: thread::sleep(Duration::from_millis(50));
+            // This was a race mitigation, not a structural fix.
+
             let exe = env::current_exe().unwrap();
-            let child = process::Command::new(&exe)
+            let ready_dir = env::var("READY_DIR").unwrap_or_else(|_| {
+                env::current_dir()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|_| env::temp_dir().to_string_lossy().to_string())
+            });
+            let root_pid = process::id();
+
+            // Spawn child. Child spawns grandchild (sleep 10), writes
+            // grandchild PID to READY_DIR/grandchild.txt, prints
+            // "child_pid=<grandchild>" to inherited stdout, then exits.
+            // No delay before spawning — the Job Object is already assigned.
+            let mut child = process::Command::new(&exe)
                 .arg("spawn_child")
                 .spawn()
                 .unwrap();
-            let _ = child.wait_with_output();
+            let child_pid = child.id();
+            child.wait().unwrap();
+
+            // Read grandchild PID from file written by spawn_child.
+            let gc_path = format!("{ready_dir}/grandchild.txt");
+            let grandchild_pid = std::fs::read_to_string(&gc_path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+                .unwrap_or(0);
+
+            // ── I4.5 TCP readiness channel ──────────────────────
+            // Primary control protocol: connect to the test's TCP
+            // listener, send structured TreeReady JSON, disconnect.
+            // The test blocks on accept() — no polling, no race.
+            let run_id = env::var("READY_RUN_ID").unwrap_or_else(|_| {
+                ready_dir
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
+            let ready_json = format!(
+                concat!(
+                    r#"{{"run_id":"{}","root_pid":{},"#,
+                    r#""child_pid":{},"grandchild_pid":{},"#,
+                    r#""tree_ready":true}}"#
+                ),
+                run_id, root_pid, child_pid, grandchild_pid,
+            );
+
+            // TCP readiness (primary): send to test's listener.
+            if let Ok(port_str) = env::var("READY_TCP_PORT") {
+                if let Ok(port) = port_str.parse::<u16>() {
+                    use std::io::Write;
+                    use std::net::TcpStream;
+                    let addr = format!("127.0.0.1:{port}");
+                    if let Ok(mut stream) = TcpStream::connect(&addr) {
+                        let _ = stream.write_all(ready_json.as_bytes());
+                        let _ = stream.flush();
+                        // Don't close immediately — let the test read.
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            }
+
+            // Diagnostic backup: atomic file-based ready.json.
+            // NOT used as primary readiness signal — only for post-mortem
+            // diagnostics. The test uses TCP, not file polling.
+            let tmp = format!("{ready_dir}/ready.json.tmp");
+            let final_path = format!("{ready_dir}/ready.json");
+            if let Ok(mut f) = std::fs::File::create(&tmp) {
+                use std::io::Write;
+                let _ = f.write_all(ready_json.as_bytes());
+                let _ = f.sync_all();
+                drop(f);
+                let _ = std::fs::rename(&tmp, &final_path);
+            }
+
+            // Write sleeping marker to confirm sleep reached.
+            let _ = std::fs::write(format!("{ready_dir}/sleeping.txt"), "1");
             thread::sleep(Duration::from_secs(60));
         }
         "ignore_graceful_shutdown" => {

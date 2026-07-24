@@ -109,6 +109,13 @@ pub enum ProcessTermination {
     NonZeroExit,
     Timeout,
     Cancelled,
+    /// Process was killed (Job Object / taskkill) but the kill itself
+    /// was NOT confirmed — the OS may still be running the process.
+    /// Clean Cancelled/Timeout MUST NOT be written when termination
+    /// is unconfirmed. Completion eligibility MUST be blocked.
+    ProcessUnknown {
+        reason: String,
+    },
     Killed,
     SpawnFailed,
     Lost,

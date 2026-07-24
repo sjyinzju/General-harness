@@ -277,7 +277,7 @@ pub async fn cmd_dry_run_decision(
         let svc = &g.task_loop_service;
         if let Some(info) = svc.inspect_loop(loop_id).await? {
             // Read durable execution lifecycle.
-            if let Some(ref eid) = info
+            if let Some(eid) = info
                 .active_attempt
                 .as_ref()
                 .and_then(|a| a.execution_id.as_ref())
@@ -351,7 +351,7 @@ pub async fn cmd_dry_run_decision(
                 eligibility_token: None, // set below from durable facts
             };
             // H4: validate eligibility from durable I4 facts (zero writes).
-            if let Some(ref eid) = info
+            if let Some(eid) = info
                 .active_attempt
                 .as_ref()
                 .and_then(|a| a.execution_id.as_ref())

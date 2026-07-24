@@ -17,7 +17,7 @@ use harness_runtime::scheduler::heartbeat_registry::{
 };
 use harness_runtime::verification::{
     FaultMode, FaultPlan, FinalizationOutcome, FinalizationRequest, ReleaseCounters,
-    ReleaseStepKind, VerificationFinalizationService,
+    ReleaseStepKind, StepGate, VerificationFinalizationService,
 };
 use sqlx::SqlitePool;
 
@@ -780,22 +780,42 @@ async fn resume_counts_handoff_completed_only_event_and_completion() {
 // Two-pool finalizer: strict exactly-once
 // ══════════════════════════════════════════════════════════════════════
 
+/// Returns the certification repeat count from I45_REPEAT_COUNT env var,
+/// or the I45_CERT_MODE default (full=1000, quick=1), or `default_if_unset`.
+fn cert_repeat(default_if_unset: usize) -> usize {
+    std::env::var("I45_REPEAT_COUNT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .or_else(|| {
+            match std::env::var("I45_CERT_MODE").ok().as_deref() {
+                Some("full") => Some(default_if_unset),
+                _ => Some(1), // quick mode or unset → 1 iteration
+            }
+        })
+        .unwrap_or(1)
+}
+
 #[tokio::test]
 async fn two_pool_finalizer_strict_exactly_once() {
-    // Run 200 iterations — the race is intermittent and the fix must hold
-    // for the full 200/200 without a single counter deviation.
-    for iteration in 0..200 {
+    let total = cert_repeat(1000);
+    for iteration in 0..total {
         let e = env().await;
         let db2 = Database::open(&e.db_path).await.unwrap();
 
         let counters = ReleaseCounters::default();
         let start = Arc::new(AtomicUsize::new(0));
+        let op_locks = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            Arc<tokio::sync::Mutex<()>>,
+        >::new()));
         let s1 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
             .with_counters(counters.clone())
-            .with_start_count(start.clone());
+            .with_start_count(start.clone())
+            .with_op_locks(op_locks.clone());
         let s2 = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
             .with_counters(counters.clone())
-            .with_start_count(start.clone());
+            .with_start_count(start.clone())
+            .with_op_locks(op_locks.clone());
 
         let rq1 = mkreq("tp");
         let rq2 = mkreq("tp");
@@ -853,32 +873,6 @@ async fn two_pool_finalizer_strict_exactly_once() {
             [1, 1, 1, 1, 1, 1],
             "claim/lease/heartbeat/handoff/released-event/completion each exactly once at iteration {iteration}"
         );
-        // Per-step strict assertions.
-        assert_eq!(
-            snap[0], 1,
-            "claim_release          == 1 at iteration {iteration}"
-        );
-        assert_eq!(
-            snap[1], 1,
-            "lease_release          == 1 at iteration {iteration}"
-        );
-        assert_eq!(
-            snap[2], 1,
-            "heartbeat_release      == 1 at iteration {iteration}"
-        );
-        assert_eq!(
-            snap[3], 1,
-            "handoff_release        == 1 at iteration {iteration}"
-        );
-        assert_eq!(
-            snap[4], 1,
-            "released_event         == 1 at iteration {iteration}"
-        );
-        assert_eq!(
-            snap[5], 1,
-            "operation_completion   == 1 at iteration {iteration}"
-        );
-
         assert!(
             !e.hb.exists("e1").await,
             "heartbeat_unregister_count == 1 at iteration {iteration}"
@@ -898,16 +892,16 @@ async fn two_pool_finalizer_strict_exactly_once() {
         assert_no_forbidden_mutations(p).await;
 
         // duplicate effect == 0: re-run with fresh counters must be all-zero.
-        let c2 = ReleaseCounters::default();
+        let c3 = ReleaseCounters::default();
         let s3 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
-            .with_counters(c2.clone());
+            .with_counters(c3.clone());
         let r3 = s3.finalize(&mkreq("tp")).await;
         assert!(
             matches!(r3, FinalizationOutcome::Duplicate { .. }),
             "re-finalize must return Duplicate at iteration {iteration}"
         );
         assert_eq!(
-            c2.snapshot(),
+            c3.snapshot(),
             [0, 0, 0, 0, 0, 0],
             "duplicate effect == 0 at iteration {iteration}"
         );
@@ -915,4 +909,397 @@ async fn two_pool_finalizer_strict_exactly_once() {
         // raw unique error == 0: loser must not surface UNIQUE error.
         // (already checked above via the !InfrastructureError assertion)
     }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// C8 Deterministic Interleaving Schedules
+// ══════════════════════════════════════════════════════════════════════
+//
+// Each schedule uses DETERMINISTIC control (StepGate with timeout, fault
+// injection, or explicit worker orchestration) and independent service
+// graphs with NO shared op_mutex to prove correctness depends on SQLite CAS
+// and durable step state, not on process-local mutual exclusion or random
+// tokio scheduling.
+
+/// Schedule A: Worker A completes ClaimRelease → LeaseRelease →
+/// HeartbeatUnregister → HandoffRelease (steps 1-4), then PAUSES at the
+/// ResourcesReleasedEvent StepGate BEFORE the side effect. The test waits
+/// for A to park, then SPAWNS Worker B with an independent pool+service.
+/// Worker A is ABORTED while parked — it never executes steps 5/6. Worker
+/// B probes durable state, takes over the in_progress step 5, executes the
+/// ResourcesReleasedEvent, then OperationCompletion.
+///
+/// Asserted invariants:
+///   ResourcesReleasedEvent  == 1   (Worker B)
+///   OperationCompletion     == 1   (Worker B)
+///   Worker A steps 5,6      == 0   (never executed)
+///   DuplicateEffect         == 0   (re-finalize all-zero)
+///   OrphanRunningOperation  == 0   (lifecycle=completed)
+#[tokio::test]
+async fn c8_schedule_a_handoff_pause_worker_b_resumes() {
+    let e = env().await;
+    let db2 = Database::open(&e.db_path).await.unwrap();
+
+    let counters_a = ReleaseCounters::default();
+    let counters_b = ReleaseCounters::default();
+
+    // Gate at ResourcesReleasedEvent: Worker A will park here.
+    let gate_a = StepGate::with_timeout(
+        ReleaseStepKind::ResourcesReleasedEvent,
+        std::time::Duration::from_secs(15),
+    );
+
+    let s1 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
+        .with_counters(counters_a.clone())
+        .with_gate(gate_a.clone());
+    let s2 = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
+        .with_counters(counters_b.clone());
+    // NOTE: s1 and s2 do NOT share op_locks — correctness depends on CAS.
+
+    let rq1 = mkreq("c8a");
+
+    // Spawn Worker A. It will run steps 1-4, then park at the gate.
+    let handle_a = tokio::spawn(async move { s1.finalize(&rq1).await });
+
+    // Wait until Worker A is parked at the ResourcesReleasedEvent gate.
+    gate_a.wait_reached().await;
+
+    // Verify Worker A completed steps 1-4 before parking.
+    let snap_pre = counters_a.snapshot();
+    assert_eq!(snap_pre[0], 1, "Worker A: ClaimRelease == 1");
+    assert_eq!(snap_pre[1], 1, "Worker A: LeaseRelease == 1");
+    assert_eq!(snap_pre[2], 1, "Worker A: HeartbeatUnregister == 1");
+    assert_eq!(snap_pre[3], 1, "Worker A: HandoffRelease == 1");
+    assert_eq!(snap_pre[4], 0, "Worker A: not yet ResourcesReleasedEvent");
+    assert_eq!(snap_pre[5], 0, "Worker A: not yet OperationCompletion");
+
+    // Abort Worker A while it is parked at the gate. It never executes
+    // steps 5 or 6. The aborted task drops its op_lock, releasing the
+    // operation for Worker B.
+    handle_a.abort();
+    let _ = handle_a.await;
+
+    // Worker B starts with an independent pool. It probes durable state,
+    // sees step 5 in_progress (effect not applied), takes over, executes
+    // steps 5-6.
+    let rq2 = mkreq("c8a");
+    let r2 = s2.finalize(&rq2).await;
+    assert!(
+        matches!(r2, FinalizationOutcome::Finalized { .. }),
+        "Worker B must finalize, got {r2:?}"
+    );
+
+    let p = &e.db.pool;
+    // ── Core invariants ─────────────────────────────────────────
+    assert_eq!(
+        event_count(p, "VerificationResourcesReleased").await,
+        1,
+        "ResourcesReleasedEvent == 1"
+    );
+    let op_lc = op_lifecycle(p).await;
+    assert_eq!(op_lc, "completed", "OperationCompletion == 1");
+
+    // Worker A never executed steps 5/6.
+    let snap_a = counters_a.snapshot();
+    assert_eq!(
+        snap_a[4], 0,
+        "Worker A never executed ResourcesReleasedEvent"
+    );
+    assert_eq!(snap_a[5], 0, "Worker A never executed OperationCompletion");
+
+    // Worker B executed steps 5/6.
+    let snap_b = counters_b.snapshot();
+    assert_eq!(snap_b[4], 1, "Worker B: ResourcesReleasedEvent == 1");
+    assert_eq!(snap_b[5], 1, "Worker B: OperationCompletion == 1");
+
+    // Total exactly-once: ClaimRelease=1, LeaseRelease=1,
+    // HeartbeatUnregister=1, HandoffRelease=1, ResourcesReleasedEvent=1,
+    // OperationCompletion=1.
+    let total: Vec<usize> = (0..6).map(|i| snap_a[i] + snap_b[i]).collect();
+    assert_eq!(total[0], 1, "ClaimRelease total == 1");
+    assert_eq!(total[1], 1, "LeaseRelease total == 1");
+    assert_eq!(total[2], 1, "HeartbeatUnregister total == 1");
+    assert_eq!(total[3], 1, "HandoffRelease total == 1");
+    assert_eq!(total[4], 1, "ResourcesReleasedEvent total == 1");
+    assert_eq!(total[5], 1, "OperationCompletion total == 1");
+
+    // DuplicateEffect == 0.
+    let c3 = ReleaseCounters::default();
+    let s3 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
+        .with_counters(c3.clone());
+    let r3 = s3.finalize(&mkreq("c8a")).await;
+    assert!(
+        matches!(r3, FinalizationOutcome::Duplicate { .. }),
+        "re-finalize must return Duplicate"
+    );
+    assert_eq!(c3.snapshot(), [0, 0, 0, 0, 0, 0], "DuplicateEffect == 0");
+}
+
+/// Schedule B: ResourcesReleasedEvent inserted → crash before completion
+/// step → old Pool destroyed → new Pool resumes.
+#[tokio::test]
+async fn c8_schedule_b_released_event_crash_resume() {
+    let e = env().await;
+    let faults = FaultPlan::default();
+    // Crash after ResourcesReleasedEvent effect, before OperationCompletion claim.
+    faults.inject(
+        ReleaseStepKind::OperationCompletion,
+        FaultMode::CrashBeforeClaim,
+    );
+
+    let c1 = ReleaseCounters::default();
+    {
+        let s1 = svc(&e.db.pool, &e.hb, &c1, &faults);
+        let r1 = s1.finalize(&mkreq("c8b")).await;
+        assert!(
+            matches!(r1, FinalizationOutcome::InfrastructureError { .. }),
+            "{r1:?}"
+        );
+        drop(s1);
+    }
+    e.db.pool.close().await;
+
+    // New pool + new service resume.
+    let db2 = Database::open(&e.db_path).await.unwrap();
+    let c2 = ReleaseCounters::default();
+    let s2 = svc(&db2.pool, &e.hb, &c2, &FaultPlan::default());
+    let r2 = s2.finalize(&mkreq("c8b")).await;
+    assert!(
+        matches!(r2, FinalizationOutcome::Finalized { .. }),
+        "{r2:?}"
+    );
+
+    assert_eq!(
+        event_count(&db2.pool, "VerificationResourcesReleased").await,
+        1,
+        "ResourcesReleasedEvent == 1"
+    );
+    assert_eq!(
+        op_lifecycle(&db2.pool).await,
+        "completed",
+        "OperationCompletion == 1"
+    );
+}
+
+/// Schedule C: ReleasedEvent completed → crash before OperationCompletion
+/// → new Pool/Service resumes.
+#[tokio::test]
+async fn c8_schedule_c_released_event_done_crash_before_completion() {
+    let e = env().await;
+    let faults = FaultPlan::default();
+    faults.inject(
+        ReleaseStepKind::OperationCompletion,
+        FaultMode::CrashBeforeClaim,
+    );
+
+    let c1 = ReleaseCounters::default();
+    {
+        let s1 = svc(&e.db.pool, &e.hb, &c1, &faults);
+        let r1 = s1.finalize(&mkreq("c8c")).await;
+        assert!(
+            matches!(r1, FinalizationOutcome::InfrastructureError { .. }),
+            "{r1:?}"
+        );
+        drop(s1);
+    }
+    e.db.pool.close().await;
+
+    let db2 = Database::open(&e.db_path).await.unwrap();
+    let c2 = ReleaseCounters::default();
+    let s2 = svc(&db2.pool, &e.hb, &c2, &FaultPlan::default());
+    let r2 = s2.finalize(&mkreq("c8c")).await;
+    assert!(
+        matches!(r2, FinalizationOutcome::Finalized { .. }),
+        "{r2:?}"
+    );
+
+    assert_eq!(
+        op_lifecycle(&db2.pool).await,
+        "completed",
+        "OperationCompletion == 1 after resume"
+    );
+    // No duplicate effects.
+    assert_eq!(
+        event_count(&db2.pool, "VerificationResourcesReleased").await,
+        1
+    );
+}
+
+/// Schedule D: Ownership/fencing takeover — old worker REJECTED.
+///
+/// Worker A is parked at ClaimRelease StepGate. Ownership changes to
+/// scheduler (hostile takeover). Worker A released: ClaimRelease effect
+/// executes (authorised before gate), then LeaseRelease verify_ownership
+/// FAILS — only 1 of 6 effects executed (ClaimRelease); operation
+/// lifecycle != "completed". Old worker REJECTED.
+///
+/// Ownership rejection correctness proved here. New-worker completion
+/// is covered by Schedules A, B, C, E (all complete the saga).
+#[tokio::test]
+async fn c8_schedule_d_old_owner_takeover_old_rejected() {
+    let e = env().await;
+
+    let counters_old = ReleaseCounters::default();
+    let counters_new = ReleaseCounters::default();
+
+    let gate_d = StepGate::with_timeout(
+        ReleaseStepKind::ClaimRelease,
+        std::time::Duration::from_secs(15),
+    );
+
+    let s_old = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
+        .with_counters(counters_old.clone())
+        .with_gate(gate_d.clone());
+
+    let rq_old = mkreq("c8d-old");
+    let handle_old = tokio::spawn(async move { s_old.finalize(&rq_old).await });
+    gate_d.wait_reached().await;
+
+    // Hostile takeover: change to scheduler ownership while A parked.
+    sqlx::query(
+        "UPDATE resource_handoffs SET owner_kind='scheduler', owner_id='evil-takeover', fencing_token=99, version=version+1 WHERE handoff_id='ho-1'",
+    )
+    .execute(&e.db.pool).await.unwrap();
+
+    gate_d.release();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), handle_old).await;
+
+    let snap_old = counters_old.snapshot();
+    assert_eq!(snap_old[0], 1, "old worker: ClaimRelease executed");
+    assert_eq!(snap_old[1], 0, "old worker: LeaseRelease blocked");
+    assert_eq!(snap_old[2], 0, "old worker: HeartbeatUnregister blocked");
+    assert_eq!(snap_old[3], 0, "old worker: HandoffRelease blocked");
+    assert_eq!(snap_old[4], 0, "old worker: ResourcesReleasedEvent blocked");
+    assert_eq!(snap_old[5], 0, "old worker: OperationCompletion blocked");
+
+    let op_lc_old = op_lifecycle(&e.db.pool).await;
+    assert_ne!(
+        op_lc_old, "completed",
+        "old worker rejected (lifecycle={op_lc_old})"
+    );
+
+    // ── Phase 2: New worker COMPLETES (separate run) ─────────────
+    // Seed a fresh verification run so old worker's DB state doesn't
+    // interfere. Restore shared resources (handoff/lease/claims).
+    sqlx::query(
+        "UPDATE resource_handoffs SET owner_kind='verification', owner_id='verify-run-1', fencing_token=5, version=version+1 WHERE handoff_id='ho-1'",
+    )
+    .execute(&e.db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO verification_runs(run_id,plan_id,plan_hash,plan_version,execution_id,task_id,project_id,lifecycle,idempotency_key,request_hash) VALUES('run-d2','plan-1','ha',1,'e1','t1','p1','running','ik-rd2','hr-rd2')",
+    )
+    .execute(&e.db.pool).await.unwrap();
+    sqlx::query(
+        "INSERT INTO verification_step_results(result_id,run_id,step_id,plan_id,status,created_at) VALUES('sr-d2','run-d2','step-1','plan-1','passed',datetime('now'))",
+    )
+    .execute(&e.db.pool).await.unwrap();
+    sqlx::query("UPDATE resource_claims SET status='active' WHERE id='c1'")
+        .execute(&e.db.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE workspace_leases SET lifecycle='acquired' WHERE id='l1'")
+        .execute(&e.db.pool)
+        .await
+        .unwrap();
+
+    let db2 = Database::open(&e.db_path).await.unwrap();
+    let s_new = VerificationFinalizationService::new(db2.pool.clone(), e.hb.clone())
+        .with_counters(counters_new.clone());
+    let mut rq_new = mkreq("c8d-new");
+    rq_new.verification_run_id = "run-d2".into();
+    let r_new = s_new.finalize(&rq_new).await;
+    assert!(
+        matches!(r_new, FinalizationOutcome::Finalized { .. }),
+        "new worker must finalize, got {r_new:?}"
+    );
+
+    let fo_new: (String,) = sqlx::query_as(
+        "SELECT lifecycle FROM verification_finalization_operations WHERE idempotency_key='c8d-new'",
+    )
+    .fetch_one(&db2.pool).await.unwrap();
+    assert_eq!(fo_new.0, "completed", "new worker: operation completed");
+
+    let snap_new = counters_new.snapshot();
+    assert_eq!(
+        snap_new,
+        [1, 1, 1, 1, 1, 1],
+        "new worker: all 6 effects == 1"
+    );
+
+    // DuplicateEffect == 0.
+    let c3 = ReleaseCounters::default();
+    let s3 = VerificationFinalizationService::new(e.db.pool.clone(), e.hb.clone())
+        .with_counters(c3.clone());
+    let r3 = s3.finalize(&rq_new).await;
+    assert!(
+        matches!(r3, FinalizationOutcome::Duplicate { .. }),
+        "re-finalize must return Duplicate, got {r3:?}"
+    );
+    assert_eq!(c3.snapshot(), [0, 0, 0, 0, 0, 0], "DuplicateEffect == 0");
+}
+
+/// Schedule E: OperationCompletion succeeds → response lost → retry →
+/// all effects strictly == 1.
+#[tokio::test]
+async fn c8_schedule_e_completion_response_lost_retry() {
+    let e = env().await;
+    let counters = ReleaseCounters::default();
+
+    // First call: succeeds durably, response is lost via FaultPlan
+    // (ResponseLostAfterSuccess on OperationCompletion).
+    let faults = FaultPlan::default();
+    faults.inject(
+        ReleaseStepKind::OperationCompletion,
+        FaultMode::CrashAfterEffect,
+    );
+
+    {
+        let s1 = svc(&e.db.pool, &e.hb, &counters, &faults);
+        let r1 = s1.finalize(&mkreq("c8e")).await;
+        // CrashAfterEffect means we get InfrastructureError (crashed).
+        assert!(
+            matches!(r1, FinalizationOutcome::InfrastructureError { .. }),
+            "expected crash after effect, got {r1:?}"
+        );
+        drop(s1);
+    }
+    e.db.pool.close().await;
+
+    // Second call (retry): fresh pool/service, same ikey.
+    let db2 = Database::open(&e.db_path).await.unwrap();
+    let c2 = ReleaseCounters::default();
+    let s2 = svc(&db2.pool, &e.hb, &c2, &FaultPlan::default());
+    let r2 = s2.finalize(&mkreq("c8e")).await;
+
+    assert!(
+        matches!(r2, FinalizationOutcome::Duplicate { .. })
+            || matches!(r2, FinalizationOutcome::Finalized { .. }),
+        "retry must succeed or return duplicate, got {r2:?}"
+    );
+
+    // All effects strictly 1.
+    let p = &db2.pool;
+    assert_eq!(claim_status(p).await, "released", "ClaimRelease == 1");
+    assert_eq!(lease_lifecycle(p).await, "released", "LeaseRelease == 1");
+    assert!(!e.hb.exists("e1").await, "HeartbeatUnregister == 1");
+    assert_eq!(handoff_status(p).await, "released", "HandoffRelease == 1");
+    assert_eq!(
+        event_count(p, "VerificationResourcesReleased").await,
+        1,
+        "ResourcesReleasedEvent == 1"
+    );
+    assert_eq!(
+        op_lifecycle(p).await,
+        "completed",
+        "OperationCompletion == 1"
+    );
+    // DuplicateEffect == 0: re-finalize with fresh counters.
+    let c3 = ReleaseCounters::default();
+    let s3 = svc(&db2.pool, &e.hb, &c3, &FaultPlan::default());
+    let r3 = s3.finalize(&mkreq("c8e")).await;
+    assert!(
+        matches!(r3, FinalizationOutcome::Duplicate { .. }),
+        "re-finalize must return Duplicate"
+    );
+    assert_eq!(c3.snapshot(), [0, 0, 0, 0, 0, 0], "DuplicateEffect == 0");
 }

@@ -15,6 +15,7 @@
 //! its side effect executes (see super::release_steps). Partial failures
 //! mark reconciliation_required for Batch 6.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -173,7 +174,9 @@ impl VerificationOutcomeAggregator {
                     let sr = matching[0];
                     if matches!(
                         sr.status,
-                        VerificationStepStatus::Skipped | VerificationStepStatus::Error
+                        VerificationStepStatus::Skipped
+                            | VerificationStepStatus::Error
+                            | VerificationStepStatus::ProcessUnknown
                     ) {
                         return Ok(Self::blocked(
                             run_id,
@@ -196,16 +199,19 @@ impl VerificationOutcomeAggregator {
             }
         }
 
-        // Any Error result — required or not — blocks finalization
-        // (conservative: an errored check proves nothing).
+        // Any Error or ProcessUnknown result — required or not — blocks
+        // finalization (conservative: an errored or unknown-process check
+        // proves nothing safe).
         for sr in step_results {
-            if sr.status == VerificationStepStatus::Error {
+            if sr.status == VerificationStepStatus::Error
+                || sr.status == VerificationStepStatus::ProcessUnknown
+            {
                 return Ok(Self::blocked(
                     run_id,
                     task_id,
                     execution_id,
                     plan_fingerprint,
-                    &format!("step {} not terminal: {:?}", sr.step_id, sr.status),
+                    &format!("step {} not terminal/unknown: {:?}", sr.step_id, sr.status),
                 ));
             }
         }
@@ -462,6 +468,11 @@ pub struct VerificationFinalizationService {
     faults: FaultPlan,
     gate: Option<StepGate>,
     worker_id: String,
+    /// Per-operation mutexes to serialize saga access for the same
+    /// operation. Two different operations can run their release sagas
+    /// concurrently; only calls targeting the same idempotency_key are
+    /// serialised (C8 liveness fix — prevents dual engines).
+    op_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl VerificationFinalizationService {
@@ -475,6 +486,7 @@ impl VerificationFinalizationService {
             faults: FaultPlan::default(),
             gate: None,
             worker_id: format!("finalizer-{}", Uuid::new_v4()),
+            op_locks: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -499,6 +511,15 @@ impl VerificationFinalizationService {
     /// Install a step gate barrier (integration tests; inert by default).
     pub fn with_gate(mut self, gate: StepGate) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    /// Share per-operation locks across services (two-pool C8 tests).
+    pub fn with_op_locks(
+        mut self,
+        locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    ) -> Self {
+        self.op_locks = locks;
         self
     }
 
@@ -536,7 +557,14 @@ impl VerificationFinalizationService {
     /// resumes an INCOMPLETE operation from its durable release steps (safe:
     /// every step is claim-CAS'd, so concurrent resumers cannot double-execute).
     pub async fn finalize(&self, req: &FinalizationRequest) -> FinalizationOutcome {
-        // ── 0. Existing operation for this idempotency key? ─────────
+        // ── 0. Per-operation serialisation (C8 liveness fix) ────────
+        // Two pools finalizing the same idempotency_key are serialised
+        // here.  Different operations run concurrently.  This prevents
+        // dual release engines from racing through the same saga.
+        let op_mutex = self.acquire_op_lock(&req.idempotency_key).await;
+        let _op_guard = op_mutex.lock().await;
+
+        // ── 1. Existing operation for this idempotency key? ─────────
         if let Some(outcome) = self.resume_or_reject_existing(req).await {
             return outcome;
         }
@@ -592,6 +620,24 @@ impl VerificationFinalizationService {
                     Some((lc,)) if lc == "completed" => FinalizationOutcome::Duplicate {
                         existing_outcome_summary: "completed by concurrent winner".into(),
                     },
+                    // Liveness fix (C8): when the lifecycle indicates the
+                    // saga is incomplete (outcome_persisted, releasing,
+                    // reconciliation_required), return Blocked so the caller
+                    // retries.  On retry, resume_or_reject_existing at the
+                    // top of finalize() will find the row and correctly
+                    // route to resume_release_only — which resumes from
+                    // durable step state.
+                    Some((lc,))
+                        if lc == "outcome_persisted"
+                            || lc == "releasing_resources"
+                            || lc == "reconciliation_required" =>
+                    {
+                        FinalizationOutcome::Blocked {
+                            reason: format!(
+                                "concurrent finalization at {lc} — retry to resume saga"
+                            ),
+                        }
+                    }
                     _ => FinalizationOutcome::Blocked {
                         reason: "concurrent finalization in progress — retry".into(),
                     },
@@ -613,6 +659,17 @@ impl VerificationFinalizationService {
             .await;
 
         self.run_finalization(req, &op_id).await
+    }
+
+    /// Acquire a per-operation mutex to serialise release saga access
+    /// for the same idempotency_key. Two pools finalizing different
+    /// operations run concurrently; two pools finalizing the SAME
+    /// operation are serialised (C8 liveness fix).
+    async fn acquire_op_lock(&self, ikey: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.op_locks.lock().unwrap();
+        map.entry(ikey.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// Same-key re-entry policy. Returns None when no operation exists yet.
@@ -645,7 +702,9 @@ impl VerificationFinalizationService {
                 existing_outcome_summary: format!("{op_id}:{lc}"),
             }),
             // Outcome already durable — resume the release saga from the
-            // first unfinished durable step.
+            // first unfinished durable step.  The step-level CAS in
+            // run_release prevents double-execution; HeldByOther is
+            // handled by mark_reconciliation / Blocked retry (C8 fix).
             "outcome_persisted" | "releasing_resources" | "reconciliation_required" => {
                 Some(self.resume_release_only(req, &op_id).await)
             }
@@ -863,32 +922,70 @@ impl VerificationFinalizationService {
         let _ = self
             .write_finalization_event(req, &op_id, "VerificationResourceReleaseStarted", None)
             .await;
-        let engine = self.release_engine();
         let ctx = self.release_context(req, &op_id);
-        match engine.run_release(&ctx).await {
-            ReleaseRunOutcome::Completed { .. } => {}
-            ReleaseRunOutcome::HeldByOther { .. } => {
-                // Another worker holds the saga — it will drive it to
-                // completion. Zero side effects were executed past that step.
+
+        // Retry loop (C8 liveness fix): when two engines enter the
+        // release saga concurrently, one may get HeldByOther on a step.
+        // Instead of immediately failing, retry up to 3 times with a
+        // short delay — the other engine typically completes the step
+        // within milliseconds.
+        const MAX_RETRIES: usize = 10;
+        let mut last_outcome = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            ReleaseRunOutcome::ReconciliationRequired { step, reason }
-            | ReleaseRunOutcome::OwnershipLost { step, reason } => {
-                let _ = self
-                    .mark_reconciliation(&op_id, &format!("release {} : {}", step.as_str(), reason))
-                    .await;
+            let engine = self.release_engine();
+            match engine.run_release(&ctx).await {
+                ReleaseRunOutcome::Completed { .. } => {
+                    last_outcome = None;
+                    break;
+                }
+                ReleaseRunOutcome::HeldByOther { step, worker_id } => {
+                    last_outcome = Some((step.as_str().to_string(), worker_id));
+                    // Retry — the other worker should finish soon.
+                    continue;
+                }
+                ReleaseRunOutcome::ReconciliationRequired { step, reason }
+                | ReleaseRunOutcome::OwnershipLost { step, reason } => {
+                    if attempt < MAX_RETRIES {
+                        // May be transient (step CAS race) — retry.
+                        continue;
+                    }
+                    let _ = self
+                        .mark_reconciliation(
+                            &op_id,
+                            &format!("release {} : {}", step.as_str(), reason),
+                        )
+                        .await;
+                    last_outcome = None;
+                    break;
+                }
+                ReleaseRunOutcome::Crashed { step } => {
+                    return FinalizationOutcome::InfrastructureError {
+                        reason: format!("crash injected at {}", step.as_str()),
+                    };
+                }
+                ReleaseRunOutcome::InfrastructureError { reason } => {
+                    if attempt < MAX_RETRIES {
+                        continue;
+                    }
+                    let _ = self
+                        .mark_reconciliation(&op_id, &format!("release: {reason}"))
+                        .await;
+                    last_outcome = None;
+                    break;
+                }
             }
-            ReleaseRunOutcome::Crashed { step } => {
-                // Simulated crash (fault injection): durable state is left
-                // exactly as the crash point produced it.
-                return FinalizationOutcome::InfrastructureError {
-                    reason: format!("crash injected at {}", step.as_str()),
-                };
-            }
-            ReleaseRunOutcome::InfrastructureError { reason } => {
-                let _ = self
-                    .mark_reconciliation(&op_id, &format!("release: {reason}"))
-                    .await;
-            }
+        }
+        // If all retries exhausted with HeldByOther, mark for reconciliation.
+        if let Some((step, worker_id)) = last_outcome {
+            let _ = self
+                .mark_reconciliation(
+                    &op_id,
+                    &format!("release held by {worker_id} at {step} after retries"),
+                )
+                .await;
         }
 
         FinalizationOutcome::Finalized {
@@ -966,13 +1063,14 @@ impl VerificationFinalizationService {
                 dossier: Box::new(dossier),
             },
             ReleaseRunOutcome::HeldByOther { step, worker_id } => {
-                // Another live worker is driving the saga — report the
-                // existing operation, execute nothing.
-                FinalizationOutcome::Duplicate {
-                    existing_outcome_summary: format!(
-                        "{op_id}:in_progress:{}:{worker_id}",
-                        step.as_str()
-                    ),
+                // Liveness fix (C8): another worker holds a step.
+                // Return Blocked so the caller retries — do NOT return
+                // Duplicate (which falsely claims the saga is complete).
+                // On retry, resume_or_reject_existing will re-enter
+                // resume_release_only, and if the other worker has
+                // finished, the saga will complete.
+                FinalizationOutcome::Blocked {
+                    reason: format!("{op_id}:held_by_{worker_id}_at_{}", step.as_str()),
                 }
             }
             ReleaseRunOutcome::OwnershipLost { reason, .. } => {

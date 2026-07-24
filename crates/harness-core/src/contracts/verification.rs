@@ -187,6 +187,9 @@ pub enum VerificationStepStatus {
     Skipped,
     /// Step encountered an infrastructure error.
     Error,
+    /// Process termination could not be confirmed — the OS may still be
+    /// running the process tree. Completion MUST be blocked.
+    ProcessUnknown,
 }
 
 // ── VerificationEvidence ──────────────────────────────────────────────

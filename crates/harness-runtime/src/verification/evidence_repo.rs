@@ -221,6 +221,7 @@ fn step_status_str(s: &VerificationStepStatus) -> &'static str {
         VerificationStepStatus::Blocked => "blocked",
         VerificationStepStatus::Skipped => "skipped",
         VerificationStepStatus::Error => "error",
+        VerificationStepStatus::ProcessUnknown => "process_unknown",
     }
 }
 fn parse_step_status(s: &str) -> VerificationStepStatus {
@@ -229,6 +230,7 @@ fn parse_step_status(s: &str) -> VerificationStepStatus {
         "blocked" => VerificationStepStatus::Blocked,
         "skipped" => VerificationStepStatus::Skipped,
         "error" => VerificationStepStatus::Error,
+        "process_unknown" => VerificationStepStatus::ProcessUnknown,
         _ => VerificationStepStatus::Passed,
     }
 }

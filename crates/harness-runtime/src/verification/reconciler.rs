@@ -1384,6 +1384,7 @@ impl VerificationReconciler {
 mod tests {
     use super::*;
     use crate::db::Database;
+    use crate::scheduler::heartbeat_registry::{HeartbeatEntry, HeartbeatStatus, OwnerKind};
 
     struct Ctx {
         rec: VerificationReconciler,
@@ -1411,6 +1412,29 @@ mod tests {
             hb,
             wt_dir,
         }
+    }
+
+    /// Register a heartbeat for tests that run the release saga.
+    /// The HeartbeatUnregister step increments the counter only on
+    /// Removed (not NotFound — C8 fix). Tests that expect the counter
+    /// to be incremented must register a heartbeat first.
+    async fn register_hb_for_release(hb: &HeartbeatRegistry) {
+        hb.register(HeartbeatEntry {
+            execution_id: "e1".into(),
+            task_id: "t1".into(),
+            worktree_id: "wt1".into(),
+            lease_id: "l1".into(),
+            claim_group_id: None,
+            fencing_token: 5,
+            owner_kind: OwnerKind::Verification,
+            owner_id: "verify-run-1".into(),
+            status: HeartbeatStatus::Healthy,
+            last_heartbeat_at: Some(chrono::Utc::now()),
+            cancel_token: tokio_util::sync::CancellationToken::new(),
+            last_error: None,
+        })
+        .await
+        .unwrap();
     }
 
     async fn seed(p: &SqlitePool, wt_path: &str) {
@@ -1485,6 +1509,7 @@ mod tests {
     #[tokio::test]
     async fn test_resume_release_full_recovery() {
         let c = setup().await;
+        register_hb_for_release(&c.hb).await;
         let r = c.rec.reconcile(&mkrec("ik-1", "h-1")).await;
         assert!(matches!(r, ReconciliationOutcome::Resumed { .. }), "{r:?}");
         // All four resource releases executed exactly once.
@@ -1920,6 +1945,7 @@ mod tests {
         seed(&db1.pool, wt_dir.path().to_string_lossy().as_ref()).await;
 
         let hb = Arc::new(HeartbeatRegistry::new());
+        register_hb_for_release(&hb).await;
         let counters = ReleaseCounters::default();
         let start = Arc::new(AtomicUsize::new(0));
         let rec1 = VerificationReconciler::new(db1.pool.clone(), hb.clone())
