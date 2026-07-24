@@ -14,6 +14,8 @@
 //! - The `HeartbeatRegistry` is shared across SchedulerOrchestrator,
 //!   SchedulerReconciler, and ResourceHandoffCoordinator.
 //! - All services use production constructors (never `*_for_tests`).
+//! - `LivenessOrchestrator` is MANDATORY in production; only tests may
+//!   construct a graph without it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,8 +25,7 @@ use sqlx::SqlitePool;
 
 use crate::lease::clock::SystemClock;
 use crate::lease::types::LeaseConfig;
-use crate::liveness::LivenessConfig;
-use crate::liveness::LivenessOrchestrator;
+use crate::liveness::{LivenessOrchestrator, RunContext};
 use crate::resource_claim::lease_adapter::LeaseServiceAdapter;
 use crate::resource_claim::ResourceClaimRepo;
 use crate::resource_claim::ResourceClaimService;
@@ -51,7 +52,11 @@ pub struct ProductionGraph {
     pub lease_service: Arc<crate::lease::service::WorkspaceLeaseService>,
     pub claim_service: Arc<ResourceClaimService>,
     pub heartbeat_registry: Arc<crate::scheduler::heartbeat_registry::HeartbeatRegistry>,
-    pub liveness_orchestrator: Option<Arc<LivenessOrchestrator>>,
+    /// MANDATORY in production.  The liveness orchestrator handles
+    /// startup, periodic, and shutdown cleanup of managed artifacts.
+    pub liveness_orchestrator: Arc<LivenessOrchestrator>,
+    /// The run context for this graph instance (managed temp/evidence).
+    pub run_context: Arc<RunContext>,
 }
 
 impl ProductionGraph {
@@ -60,10 +65,17 @@ impl ProductionGraph {
     /// `worktree_root` is the filesystem directory where git worktrees
     /// are created (must NOT be inside an existing worktree).
     /// `repo_root` is the git repository to dispatch Agents against.
+    /// `run_context` is the managed-temp context for this run.
+    ///
+    /// # Panics / Fail-closed
+    ///
+    /// Returns `Err` when the liveness config points at a dangerous
+    /// location (repo root, user profile, etc.) — this fails closed.
     pub fn build(
         pool: SqlitePool,
         worktree_root: &std::path::Path,
         repo_root: &std::path::Path,
+        run_context: RunContext,
     ) -> Result<Self, String> {
         // ── Clock (production: wall-clock) ──────────────────────────
         let clock: Arc<dyn crate::lease::clock::Clock + Send + Sync> = Arc::new(SystemClock);
@@ -135,21 +147,12 @@ impl ProductionGraph {
         let task_loop_service =
             TaskEngineeringLoopService::new(pool.clone()).with_i4_gateway(i4_gateway.clone());
 
-        // ── Liveness orchestrator (optional; safe failure) ────────────
-        let liveness_config = LivenessConfig::for_repo(repo_root, "harness-prod".into());
-        let liveness_orchestrator = match LivenessOrchestrator::new(liveness_config, pool.clone()) {
-            Ok(orch) => {
-                tracing::info!("liveness orchestrator initialized in production graph");
-                Some(Arc::new(orch))
-            }
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "liveness orchestrator initialization failed — cleanup disabled"
-                );
-                None
-            }
-        };
+        // ── Liveness orchestrator (MANDATORY for production) ───────
+        let liveness_config = run_context.config().clone();
+        let liveness_orchestrator = LivenessOrchestrator::new(liveness_config, pool.clone())
+            .map_err(|e| format!("liveness orchestrator: {e}"))?;
+
+        tracing::info!("liveness orchestrator initialized in production graph");
 
         Ok(Self {
             pool,
@@ -160,7 +163,27 @@ impl ProductionGraph {
             lease_service,
             claim_service,
             heartbeat_registry,
-            liveness_orchestrator,
+            liveness_orchestrator: Arc::new(liveness_orchestrator),
+            run_context: Arc::new(run_context),
         })
+    }
+
+    /// Run the startup janitor.  Call this ONCE after `build()` and
+    /// before accepting any work.  Reclaims stale owned artifacts from
+    /// previous crashed runs.
+    pub async fn startup(&self) -> crate::liveness::CleanupResult {
+        self.liveness_orchestrator.startup_janitor(vec![]).await
+    }
+
+    /// Build a production graph for tests (no managed temp env redirect).
+    /// Liveness is still mandatory but uses a test config.
+    pub fn build_for_tests(pool: SqlitePool, repo_root: &std::path::Path) -> Result<Self, String> {
+        let run_context = RunContext::create(repo_root, "test-head", false)
+            .map_err(|e| format!("run context: {e}"))?;
+        let worktree_root = run_context
+            .managed_temp()
+            .map(|t| t.path().to_path_buf())
+            .unwrap_or_else(|| repo_root.join("target/tmp"));
+        Self::build(pool, &worktree_root, repo_root, run_context)
     }
 }

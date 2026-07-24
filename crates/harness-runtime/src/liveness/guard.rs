@@ -283,6 +283,18 @@ impl DeletionGuard {
                 reason: reasons.join("; "),
             },
             SafetyVerdict::Allowed => {
+                // ── TOCTOU revalidation before deletion ─────────
+                // Re-read marker, re-canonicalize, re-check active state.
+                if let Some(toctou_denial) =
+                    self.toctou_revalidate(path, managed_root, expected_kind)
+                {
+                    return CleanupEntry {
+                        path: path.to_path_buf(),
+                        action: CleanupAction::Preserve,
+                        reason: format!("TOCTOU revalidation failed: {toctou_denial}"),
+                    };
+                }
+
                 // Measure before deleting.
                 let size = dir_size(path);
 
@@ -326,6 +338,83 @@ impl DeletionGuard {
                 }
             }
         }
+    }
+
+    /// TOCTOU revalidation: re-read the marker, re-canonicalize the
+    /// path, and re-check active state immediately before deletion.
+    /// Returns `None` if the path is still safe to delete, or `Some(reason)`
+    /// if conditions changed since the initial evaluation.
+    fn toctou_revalidate(
+        &self,
+        path: &Path,
+        managed_root: &Path,
+        expected_kind: Option<ManagedDirKind>,
+    ) -> Option<String> {
+        // 1. Path must still exist.
+        if !path.exists() {
+            return Some("path disappeared since evaluation".into());
+        }
+
+        // 2. Re-canonicalize — guards against junction/symlink swap.
+        let canonical = match path.canonicalize() {
+            Ok(c) => c,
+            Err(e) => return Some(format!("re-canonicalize failed: {e}")),
+        };
+
+        // 3. Still under managed root.
+        let managed_canonical = match managed_root.canonicalize() {
+            Ok(c) => c,
+            Err(e) => return Some(format!("managed root re-canonicalize failed: {e}")),
+        };
+        if !canonical.starts_with(&managed_canonical) {
+            return Some("path escaped managed root since evaluation".into());
+        }
+
+        // 4. Re-read the marker.
+        let marker_path = canonical.join(OWNERSHIP_MARKER_FILENAME);
+        let marker: OwnershipMarker = match std::fs::read_to_string(&marker_path) {
+            Ok(raw) => match serde_json::from_str(&raw) {
+                Ok(m) => m,
+                Err(e) => return Some(format!("marker re-parse failed: {e}")),
+            },
+            Err(e) => return Some(format!("marker disappeared: {e}")),
+        };
+
+        // 5. Kind must still match.
+        if let Some(expected) = expected_kind {
+            if marker.kind != expected {
+                return Some(format!(
+                    "marker kind changed: {:?} != {:?}",
+                    marker.kind, expected
+                ));
+            }
+        }
+
+        // 6. If the marker was switched to active by a new owner, refuse.
+        if marker.is_active() {
+            let pid_alive = is_pid_alive(marker.owner_pid);
+            if pid_alive {
+                return Some(format!(
+                    "owner PID {} became active since evaluation",
+                    marker.owner_pid
+                ));
+            }
+        }
+
+        // 7. Protected path re-check.
+        if self.config.protected.is_protected(&canonical) {
+            return Some("path became protected since evaluation".into());
+        }
+
+        // 8. Active execution re-check.
+        if self.active_execution_ids.contains(&marker.run_id) && marker.is_active() {
+            return Some(format!(
+                "run_id {} became active since evaluation",
+                marker.run_id
+            ));
+        }
+
+        None
     }
 
     /// Scan all immediate children of a managed root, evaluating each

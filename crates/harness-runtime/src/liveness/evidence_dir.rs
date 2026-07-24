@@ -364,10 +364,7 @@ mod tests {
 
         let cfg = super::super::types::LivenessConfig::for_test(tmp.path());
         let guard = super::super::guard::DeletionGuard::new(cfg, vec![]);
-        let retention = EvidenceRetention {
-            max_successful: 3,
-            max_failed: 1,
-        };
+        let retention = EvidenceRetention::default();
 
         // Dry-run only — we don't delete in a unit test without guard setup.
         let result = apply_evidence_retention(&root, &retention, &guard, false);

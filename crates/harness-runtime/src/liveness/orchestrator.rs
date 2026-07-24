@@ -18,8 +18,12 @@
 //! - StartupJanitor and CompletionJanitor are distinct; they never
 //!   race-delete the same directory.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use harness_core::CoreError;
 use sqlx::SqlitePool;
+use tokio_util::sync::CancellationToken;
 
 use super::cargo_target;
 use super::evidence_dir;
@@ -285,6 +289,57 @@ impl LivenessOrchestrator {
         );
 
         result
+    }
+
+    // ── Periodic Janitor ─────────────────────────────────────
+
+    /// Start a background periodic janitor task.  Returns a
+    /// `CancellationToken` that the caller MUST use to stop the
+    /// task before shutdown.
+    ///
+    /// The task runs every `interval` and performs a lightweight
+    /// scan of all managed roots, reclaiming stale owned artifacts.
+    /// It NEVER deletes active, unmarked, or grace-period directories.
+    ///
+    /// The task is single-instance: a new tick will not start until
+    /// the previous one completes (no concurrent re-entry).
+    pub fn start_periodic_janitor(self: &Arc<Self>, interval: Duration) -> CancellationToken {
+        let cancel = CancellationToken::new();
+        let cancel_child = cancel.clone();
+        let orch = Arc::clone(self);
+
+        tokio::spawn(async move {
+            tracing::info!(
+                interval_secs = interval.as_secs(),
+                "periodic janitor started"
+            );
+
+            loop {
+                tokio::select! {
+                    _ = cancel_child.cancelled() => {
+                        tracing::info!("periodic janitor cancelled");
+                        break;
+                    }
+                    _ = tokio::time::sleep(interval) => {}
+                }
+
+                if cancel_child.is_cancelled() {
+                    break;
+                }
+
+                tracing::debug!("periodic janitor tick");
+                let result = orch.startup_janitor(vec![]).await;
+                if result.deleted > 0 {
+                    tracing::info!(
+                        deleted = result.deleted,
+                        preserved = result.preserved,
+                        "periodic janitor reclaimed stale artifacts"
+                    );
+                }
+            }
+        });
+
+        cancel
     }
 
     // ── Dry-run report ───────────────────────────────────────

@@ -304,6 +304,12 @@ pub struct EvidenceRetention {
     pub max_successful: usize,
     /// Keep at most this many failed evidence runs.
     pub max_failed: usize,
+    /// Maximum total bytes across all retained evidence runs.
+    /// When exceeded, oldest runs are evicted first regardless of count.
+    pub max_total_bytes: u64,
+    /// Maximum bytes for a single evidence file. Larger files are
+    /// rejected with a diagnostic.
+    pub max_single_file_bytes: u64,
 }
 
 impl Default for EvidenceRetention {
@@ -311,6 +317,8 @@ impl Default for EvidenceRetention {
         Self {
             max_successful: 3,
             max_failed: 1,
+            max_total_bytes: 500 * 1024 * 1024,      // 500 MB
+            max_single_file_bytes: 50 * 1024 * 1024, // 50 MB
         }
     }
 }
