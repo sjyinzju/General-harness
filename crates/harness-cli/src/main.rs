@@ -45,9 +45,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string();
     let db_path = std::env::var("HARNESS_DB").unwrap_or(default_db);
 
-    // ── "cleanup" is a special case — no ProductionGraph needed ──
+    // ── "cleanup" and "review" are special cases — no ProductionGraph needed ──
     if args.len() >= 2 && args[1] == "cleanup" {
         return cmd_cleanup(&args, &repo_root, &db_path).await;
+    }
+    if args.len() >= 2 && args[1] == "review" {
+        return cmd_review_standalone(&args, &db_path).await;
     }
 
     // ── Create RunContext (managed temp + env redirect) ─────────
@@ -400,6 +403,19 @@ async fn dispatch_review(args: &[String], db: &Database) -> bool {
             eprintln!("Usage: harness review <create|show|run|list> [args]");
             false
         }
+    }
+}
+
+async fn cmd_review_standalone(
+    args: &[String],
+    db_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::open(&PathBuf::from(db_path)).await?;
+    let ok = dispatch_review(args, &db).await;
+    if ok {
+        Ok(())
+    } else {
+        Err("review command failed".into())
     }
 }
 

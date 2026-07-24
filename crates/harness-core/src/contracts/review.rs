@@ -354,6 +354,70 @@ pub struct PrecheckFinding {
     pub detail: String,
 }
 
+// ── Review Cache Key ───────────────────────────────────────────────────
+
+/// Composite cache key for deduplicating Reviewer invocations.
+/// Same key → same ReviewDecision; must not re-invoke Reviewer.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReviewCacheKey {
+    pub candidate_tree_hash: String,
+    pub diff_digest: String,
+    pub task_spec_digest: String,
+    pub evidence_digest: String,
+    pub review_policy_version: u32,
+    pub reviewer_profile_id: String,
+}
+
+impl ReviewCacheKey {
+    pub fn compute_digest(&self) -> String {
+        let input = format!(
+            "{}|{}|{}|{}|{}|{}",
+            self.candidate_tree_hash,
+            self.diff_digest,
+            self.task_spec_digest,
+            self.evidence_digest,
+            self.review_policy_version,
+            self.reviewer_profile_id,
+        );
+        sha256_hex(&input)
+    }
+}
+
+// ── Review Config (Bounded Dossier) ────────────────────────────────────
+
+/// Configuration for bounded review dossier enforcement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewConfig {
+    /// Maximum estimated input tokens for the review dossier.
+    pub max_review_tokens: usize,
+    /// Maximum wall-time duration for reviewer execution (seconds).
+    pub max_review_duration_secs: u64,
+    /// Maximum number of files in the changed-file list.
+    pub max_files: usize,
+    /// Maximum total diff bytes across all changed files.
+    pub max_diff_bytes: usize,
+    /// Maximum number of evidence items in the dossier.
+    pub max_evidence_items: usize,
+    /// Maximum log/context bytes included in the dossier.
+    pub max_log_bytes: usize,
+    /// Current review policy version (bumped when decision rules change).
+    pub review_policy_version: u32,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            max_review_tokens: 32_000,
+            max_review_duration_secs: 600,
+            max_files: 200,
+            max_diff_bytes: 256_000,
+            max_evidence_items: 50,
+            max_log_bytes: 64_000,
+            review_policy_version: 1,
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]

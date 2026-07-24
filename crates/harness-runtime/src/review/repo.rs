@@ -4,7 +4,9 @@
 //! Candidate snapshots are immutable once created.
 
 use harness_core::contracts::candidate::CandidateSnapshot;
-use harness_core::contracts::review::{ReviewDossier, ReviewFinding, ReviewRequest, ReviewState};
+use harness_core::contracts::review::{
+    ReviewCacheKey, ReviewDossier, ReviewFinding, ReviewRequest, ReviewState,
+};
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 
@@ -382,6 +384,156 @@ impl ReviewRepo {
         .map_err(db_err)?;
         Ok(rows.rows_affected())
     }
+
+    // ── Review Cache ──────────────────────────────────────────────
+
+    /// Look up a cached review decision by composite cache key.
+    pub async fn find_cache_entry(
+        &self,
+        cache_key: &ReviewCacheKey,
+    ) -> Result<Option<CacheEntry>, CoreError> {
+        let digest = cache_key.compute_digest();
+        let row: Option<CacheRow> = sqlx::query_as(
+            "SELECT cache_key_digest, candidate_id, review_id, decision, reviewer_output_json, invocation_count FROM review_cache WHERE cache_key_digest=?",
+        )
+        .bind(&digest)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| CacheEntry {
+            cache_key_digest: r.cache_key_digest,
+            candidate_id: r.candidate_id,
+            review_id: r.review_id,
+            decision: r.decision,
+            reviewer_output_json: r.reviewer_output_json,
+            invocation_count: r.invocation_count,
+        }))
+    }
+
+    /// Insert a cache entry (idempotent — ON CONFLICT IGNORE).
+    pub async fn insert_cache_entry(
+        &self,
+        cache_key: &ReviewCacheKey,
+        candidate_id: &str,
+        review_id: &str,
+        decision: &str,
+        reviewer_output_json: &str,
+    ) -> Result<(), CoreError> {
+        let digest = cache_key.compute_digest();
+        sqlx::query(
+            "INSERT OR IGNORE INTO review_cache (cache_key_digest, candidate_id, review_id, decision, reviewer_output_json) VALUES (?,?,?,?,?)",
+        )
+        .bind(&digest)
+        .bind(candidate_id)
+        .bind(review_id)
+        .bind(decision)
+        .bind(reviewer_output_json)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    // ── Invocation Counter ────────────────────────────────────────
+
+    /// Log a reviewer invocation. Returns true if this is the first invocation
+    /// for this review_id (not a cache hit).
+    pub async fn log_invocation(
+        &self,
+        invocation_id: &str,
+        review_id: &str,
+        candidate_id: &str,
+        reviewer_profile_id: &str,
+        cache_hit: bool,
+        dossier_digest: Option<&str>,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "INSERT INTO review_invocation_log (invocation_id, review_id, candidate_id, reviewer_profile_id, cache_hit, dossier_digest, started_at) VALUES (?,?,?,?,?,?,datetime('now'))",
+        )
+        .bind(invocation_id)
+        .bind(review_id)
+        .bind(candidate_id)
+        .bind(reviewer_profile_id)
+        .bind(if cache_hit { 1 } else { 0 })
+        .bind(dossier_digest)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Count invocations (excluding cache hits) for a review.
+    pub async fn count_real_invocations(&self, review_id: &str) -> Result<i64, CoreError> {
+        let row: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM review_invocation_log WHERE review_id=? AND cache_hit=0",
+        )
+        .bind(review_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.0)
+    }
+
+    /// Update invocation outcome.
+    pub async fn complete_invocation(
+        &self,
+        invocation_id: &str,
+        outcome: &str,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "UPDATE review_invocation_log SET completed_at=datetime('now'), outcome=? WHERE invocation_id=?",
+        )
+        .bind(outcome)
+        .bind(invocation_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    // ── Events ────────────────────────────────────────────────────
+
+    /// Append a review event (idempotent).
+    pub async fn write_event(
+        &self,
+        event_id: &str,
+        review_id: &str,
+        candidate_id: &str,
+        event_type: &str,
+        payload_json: &str,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO review_events (event_id, review_id, candidate_id, event_type, payload_json) VALUES (?,?,?,?,?)",
+        )
+        .bind(event_id)
+        .bind(review_id)
+        .bind(candidate_id)
+        .bind(event_type)
+        .bind(payload_json)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+}
+
+pub struct CacheEntry {
+    pub cache_key_digest: String,
+    pub candidate_id: String,
+    pub review_id: String,
+    pub decision: String,
+    pub reviewer_output_json: String,
+    pub invocation_count: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct CacheRow {
+    cache_key_digest: String,
+    candidate_id: String,
+    review_id: String,
+    decision: String,
+    reviewer_output_json: String,
+    invocation_count: i64,
 }
 
 // ── Row types ──────────────────────────────────────────────────────────

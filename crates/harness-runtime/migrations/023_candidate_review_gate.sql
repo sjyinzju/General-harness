@@ -109,3 +109,49 @@ CREATE TABLE review_dossier_refs (
 
 CREATE INDEX idx_dossier_review ON review_dossier_refs(review_id);
 CREATE UNIQUE INDEX idx_dossier_digest ON review_dossier_refs(dossier_digest);
+
+-- ── Review Cache (deduplication) ─────────────────────────────────────
+
+CREATE TABLE review_cache (
+    cache_key_digest TEXT PRIMARY KEY NOT NULL,
+    candidate_id TEXT NOT NULL REFERENCES candidate_snapshots(candidate_id),
+    review_id TEXT NOT NULL REFERENCES review_requests(review_id),
+    decision TEXT NOT NULL
+        CHECK (decision IN ('approved','rejected','blocked','stale')),
+    reviewer_output_json TEXT NOT NULL DEFAULT '{}',
+    invocation_count INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_review_cache_candidate ON review_cache(candidate_id);
+
+-- ── Review Invocation Counter ────────────────────────────────────────
+
+CREATE TABLE review_invocation_log (
+    invocation_id TEXT PRIMARY KEY NOT NULL,
+    review_id TEXT NOT NULL REFERENCES review_requests(review_id),
+    candidate_id TEXT NOT NULL REFERENCES candidate_snapshots(candidate_id),
+    reviewer_profile_id TEXT NOT NULL,
+    cache_hit INTEGER NOT NULL DEFAULT 0 CHECK (cache_hit IN (0,1)),
+    dossier_digest TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    outcome TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_invocation_review ON review_invocation_log(review_id);
+CREATE INDEX idx_invocation_candidate ON review_invocation_log(candidate_id);
+
+-- ── Review Events (append-only) ──────────────────────────────────────
+
+CREATE TABLE review_events (
+    event_id TEXT PRIMARY KEY NOT NULL,
+    review_id TEXT NOT NULL REFERENCES review_requests(review_id),
+    candidate_id TEXT NOT NULL REFERENCES candidate_snapshots(candidate_id),
+    event_type TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX idx_review_events_review ON review_events(review_id);

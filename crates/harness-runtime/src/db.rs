@@ -124,9 +124,12 @@ mod tests {
             "resource_claim_groups",
             "resource_claims",
             "resource_handoffs",
+            "review_cache",
             "review_decisions",
             "review_dossier_refs",
+            "review_events",
             "review_findings",
+            "review_invocation_log",
             "review_requests",
             "runtime_profiles",
             "scheduler_reconciliations",
@@ -159,7 +162,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             names, expected,
-            "47 business tables expected (001\u{2013}023)"
+            "50 business tables expected (001\u{2013}023)"
         );
     }
 

@@ -5,5 +5,7 @@
 pub mod repo;
 pub mod service;
 
-pub use repo::{CandidateRepo, ReviewRepo};
-pub use service::ReviewOrchestrationService;
+pub use repo::{CacheEntry, CandidateRepo, ReviewRepo};
+pub use service::{
+    validate_dossier_bounds, DossierBoundsCheck, ReviewOrchestrationService, REVIEW_POLICY_VERSION,
+};

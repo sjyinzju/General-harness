@@ -33,8 +33,8 @@ pub use goal_contract::{ChangeRequest, GoalContractVersion};
 pub use project::{Project, ProjectLifecycle};
 pub use review::{
     ApprovedCandidate, FindingCategory, FindingSeverity, PrecheckFinding, PrecheckResult,
-    ReviewDecision, ReviewDossier, ReviewFinding, ReviewRequest, ReviewState, ReviewerFinding,
-    ReviewerOutput,
+    ReviewCacheKey, ReviewConfig, ReviewDecision, ReviewDossier, ReviewFinding, ReviewRequest,
+    ReviewState, ReviewerFinding, ReviewerOutput,
 };
 pub use runtime_profile::{
     ActiveValidationResult as ProbeResult, CapabilitySet, CoreStatus,

@@ -76,10 +76,7 @@ pub async fn cmd_review_show(db: &Database, review_id: &str, json: bool) -> Resu
         if !findings.is_empty() {
             println!("  Findings ({}):", findings.len());
             for f in &findings {
-                println!(
-                    "    - [{:?}] {:?}: {}",
-                    f.severity, f.category, f.summary,
-                );
+                println!("    - [{:?}] {:?}: {}", f.severity, f.category, f.summary,);
             }
         }
     }

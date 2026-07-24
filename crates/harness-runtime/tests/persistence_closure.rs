@@ -71,8 +71,8 @@ async fn table_count_10_business_tables() {
     let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(
         names.len(),
-        47,
-        "Expected 47 business tables (001–023), got: {names:?}"
+        50,
+        "Expected 50 business tables (001–023), got: {names:?}"
     );
     assert_eq!(
         names,
@@ -93,9 +93,12 @@ async fn table_count_10_business_tables() {
             "resource_claim_groups",
             "resource_claims",
             "resource_handoffs",
+            "review_cache",
             "review_decisions",
             "review_dossier_refs",
+            "review_events",
             "review_findings",
+            "review_invocation_log",
             "review_requests",
             "runtime_profiles",
             "scheduler_reconciliations",

@@ -858,8 +858,8 @@ async fn test_49_table_count_18_business_tables() {
     // After migration 023 (candidate_review_gate), we should have 47 tables
     assert_eq!(
         names.len(),
-        47,
-        "Expected 47 business tables (001–023), got {}: {:?}",
+        50,
+        "Expected 50 business tables (001–023), got {}: {:?}",
         names.len(),
         names
     );
