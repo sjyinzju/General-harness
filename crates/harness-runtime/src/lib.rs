@@ -5,6 +5,7 @@ pub mod discovery;
 pub mod event_log;
 pub mod idempotency;
 pub mod lease;
+pub mod liveness;
 pub mod operation;
 pub mod policy;
 pub mod process;

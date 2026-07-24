@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("  harness task-loop cancel <loop-id> [--owner <id>]");
         println!("  harness task-loop inspect <loop-id> [--json]");
         println!("  harness task-loop dry-run-decision <loop-id>");
+        println!("  harness cleanup [--dry-run|--apply] [--repo <path>]");
         return Ok(());
     }
 
@@ -86,6 +87,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     commands::task_loop::cmd_dry_run_decision(&db, graph.as_ref(), loop_id).await?;
                 }
                 other => eprintln!("error: unknown subcommand: {other}"),
+            }
+        }
+        "cleanup" => {
+            let dry_run = !args.contains(&"--apply".to_string());
+            let repo_flag = parse_flag(&args, "--repo");
+            let repo_root = repo_flag
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let db_path = std::env::var("HARNESS_DB").unwrap_or_else(|_| "harness.db".to_string());
+            let db = Database::open(&PathBuf::from(&db_path)).await?;
+
+            let liveness_config = harness_runtime::liveness::LivenessConfig::for_repo(
+                &repo_root,
+                "harness-cli".into(),
+            );
+            let pool = db.pool.clone();
+            match harness_runtime::liveness::LivenessOrchestrator::new(liveness_config, pool) {
+                Ok(orch) => {
+                    let result = orch.cli_cleanup(vec![], dry_run).await;
+                    let report =
+                        harness_runtime::liveness::LivenessOrchestrator::format_dry_run_report(
+                            &result,
+                        );
+                    println!("{report}");
+                    if dry_run {
+                        println!(
+                            "\n*** DRY RUN — no files were deleted. Use --apply to execute. ***"
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("cleanup error: {e}");
+                }
             }
         }
         _ => println!("harness v0.1.0 — unknown command: {}", args[1]),

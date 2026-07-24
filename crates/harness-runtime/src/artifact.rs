@@ -205,6 +205,40 @@ impl ArtifactRoot {
         }
         Ok(orphans)
     }
+
+    /// Reclaim orphan artifacts: find all `active` markers from a
+    /// different supervisor and delete their directories.
+    ///
+    /// Returns the number of directories deleted.  Each deletion is
+    /// best-effort; a single failure does not stop the pass.
+    pub fn reclaim_orphans(&self, current_supervisor_id: &str) -> Result<usize, CoreError> {
+        let orphans = self.find_orphans(current_supervisor_id)?;
+        let mut reclaimed = 0usize;
+
+        for orphan in &orphans {
+            match std::fs::remove_dir_all(&orphan.path) {
+                Ok(()) => {
+                    reclaimed += 1;
+                    tracing::info!(
+                        path = %orphan.path.display(),
+                        project = %orphan.project_id,
+                        run = %orphan.run_id,
+                        execution = %orphan.execution_id,
+                        "reclaimed orphan artifact"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %orphan.path.display(),
+                        error = %e,
+                        "failed to reclaim orphan artifact"
+                    );
+                }
+            }
+        }
+
+        Ok(reclaimed)
+    }
 }
 
 /// A created, harness-owned per-execution artifact directory.

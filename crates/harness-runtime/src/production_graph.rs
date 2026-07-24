@@ -23,6 +23,8 @@ use sqlx::SqlitePool;
 
 use crate::lease::clock::SystemClock;
 use crate::lease::types::LeaseConfig;
+use crate::liveness::LivenessConfig;
+use crate::liveness::LivenessOrchestrator;
 use crate::resource_claim::lease_adapter::LeaseServiceAdapter;
 use crate::resource_claim::ResourceClaimRepo;
 use crate::resource_claim::ResourceClaimService;
@@ -49,6 +51,7 @@ pub struct ProductionGraph {
     pub lease_service: Arc<crate::lease::service::WorkspaceLeaseService>,
     pub claim_service: Arc<ResourceClaimService>,
     pub heartbeat_registry: Arc<crate::scheduler::heartbeat_registry::HeartbeatRegistry>,
+    pub liveness_orchestrator: Option<Arc<LivenessOrchestrator>>,
 }
 
 impl ProductionGraph {
@@ -132,6 +135,22 @@ impl ProductionGraph {
         let task_loop_service =
             TaskEngineeringLoopService::new(pool.clone()).with_i4_gateway(i4_gateway.clone());
 
+        // ── Liveness orchestrator (optional; safe failure) ────────────
+        let liveness_config = LivenessConfig::for_repo(repo_root, "harness-prod".into());
+        let liveness_orchestrator = match LivenessOrchestrator::new(liveness_config, pool.clone()) {
+            Ok(orch) => {
+                tracing::info!("liveness orchestrator initialized in production graph");
+                Some(Arc::new(orch))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "liveness orchestrator initialization failed — cleanup disabled"
+                );
+                None
+            }
+        };
+
         Ok(Self {
             pool,
             scheduler_services,
@@ -141,6 +160,7 @@ impl ProductionGraph {
             lease_service,
             claim_service,
             heartbeat_registry,
+            liveness_orchestrator,
         })
     }
 }
