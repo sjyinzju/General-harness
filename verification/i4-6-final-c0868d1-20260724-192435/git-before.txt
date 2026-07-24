@@ -1,0 +1,5 @@
+﻿c0868d1 fix(i4.6): close candidate review gate audit findings
+e028c1d docs(i4.6): record I4.6 Candidate Review Gate implementation report
+4f4a012 I4.6: Candidate Review Gate — core implementation
+c23e1b9 清理文件
+5937c17 Merge pull request #1 from sjyinzju/i4-5-c8-liveness
