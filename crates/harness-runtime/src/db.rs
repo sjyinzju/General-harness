@@ -172,11 +172,15 @@ mod tests {
             "supervisor_events",
             "supervisor_instances",
             "supervisor_leases",
+            // 027 — operation intents and recovery
+            "operation_intents",
+            "recovery_actions",
+            "recovery_runs",
         ];
         expected.sort();
         assert_eq!(
             names, expected,
-            "63 business tables expected (001\u{2013}026)"
+            "66 business tables expected (001\u{2013}027)"
         );
     }
 

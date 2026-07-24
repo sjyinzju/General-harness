@@ -23,9 +23,12 @@
 //! - All state transitions are durable (state update + event in same transaction).
 //! - Terminal states cannot be overwritten.
 
+pub mod command_handler;
+pub mod control_loop;
 pub mod heartbeat;
 pub mod lifecycle;
 pub mod ownership;
+pub mod recovery;
 pub mod repo;
 #[cfg(test)]
 mod tests;
