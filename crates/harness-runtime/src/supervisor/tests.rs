@@ -16,9 +16,9 @@ mod supervisor_tests {
     };
     use std::time::Duration;
 
+    use crate::db::Database;
     use crate::supervisor::lifecycle::LifecycleFsm;
     use crate::supervisor::repo::SupervisorRepo;
-    use crate::db::Database;
 
     /// Helper to create a test supervisor instance.
     fn make_test_instance(state_dir: &str, state: SupervisorState) -> SupervisorInstance {
@@ -50,7 +50,10 @@ mod supervisor_tests {
             .validate_transition(SupervisorState::Created, SupervisorState::Starting)
             .is_ok());
         assert!(fsm
-            .validate_transition(SupervisorState::Starting, SupervisorState::AcquiringOwnership)
+            .validate_transition(
+                SupervisorState::Starting,
+                SupervisorState::AcquiringOwnership
+            )
             .is_ok());
         assert!(fsm
             .validate_transition(
@@ -224,7 +227,7 @@ mod supervisor_tests {
         // Second supervisor tries to acquire — should fail due to UNIQUE index
         let instance2 = make_test_instance("test-dir", SupervisorState::Created);
         repo.insert_instance(&instance2).await.unwrap();
-        let result = repo
+        let _result = repo
             .acquire_lease(&instance2.instance_id, "test-dir", 2, expires_at)
             .await;
 
@@ -315,11 +318,7 @@ mod supervisor_tests {
             .await
             .unwrap();
 
-        let lease = repo
-            .get_active_lease("test-dir")
-            .await
-            .unwrap()
-            .unwrap();
+        let lease = repo.get_active_lease("test-dir").await.unwrap().unwrap();
         assert_eq!(lease.instance_id, instance2.instance_id.0);
         assert_eq!(lease.fencing_token, 2);
     }
@@ -404,7 +403,10 @@ mod supervisor_tests {
             .await
             .unwrap();
 
-        let allowed = repo.validate_fencing_for_write("test-dir", 1).await.unwrap();
+        let allowed = repo
+            .validate_fencing_for_write("test-dir", 1)
+            .await
+            .unwrap();
         assert!(allowed, "current fencing token should be allowed");
     }
 
@@ -421,7 +423,10 @@ mod supervisor_tests {
             .unwrap();
 
         // A newer token (from takeover) is allowed
-        let allowed = repo.validate_fencing_for_write("test-dir", 5).await.unwrap();
+        let allowed = repo
+            .validate_fencing_for_write("test-dir", 5)
+            .await
+            .unwrap();
         assert!(allowed, "newer fencing token should be allowed");
     }
 
@@ -438,7 +443,10 @@ mod supervisor_tests {
             .unwrap();
 
         // An older token (from a previous lease holder) is rejected
-        let allowed = repo.validate_fencing_for_write("test-dir", 1).await.unwrap();
+        let allowed = repo
+            .validate_fencing_for_write("test-dir", 1)
+            .await
+            .unwrap();
         assert!(!allowed, "older fencing token should be rejected");
     }
 
@@ -457,11 +465,10 @@ mod supervisor_tests {
             .unwrap();
 
         // Transition to stopped
-        let stop_event =
-            harness_core::contracts::supervisor::SupervisorEvent::SupervisorStopped {
-                instance_id: instance.instance_id.clone(),
-                occurred_at: Utc::now(),
-            };
+        let stop_event = harness_core::contracts::supervisor::SupervisorEvent::SupervisorStopped {
+            instance_id: instance.instance_id.clone(),
+            occurred_at: Utc::now(),
+        };
         repo.update_state_and_append_event(
             &instance.instance_id,
             SupervisorState::Stopped,

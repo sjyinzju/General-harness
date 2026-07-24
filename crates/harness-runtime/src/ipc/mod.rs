@@ -7,9 +7,9 @@
 //! - Event streaming with resume support
 
 pub mod framing;
-pub mod transport;
 #[cfg(test)]
 mod tests;
+pub mod transport;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -54,11 +54,7 @@ pub struct IpcServer {
 
 impl IpcServer {
     /// Create a new IPC server.
-    pub fn new(
-        config: IpcConfig,
-        handler: Arc<dyn IpcCommandHandler>,
-        pool: SqlitePool,
-    ) -> Self {
+    pub fn new(config: IpcConfig, handler: Arc<dyn IpcCommandHandler>, pool: SqlitePool) -> Self {
         let max = config.max_connections;
         Self {
             config,
@@ -196,7 +192,10 @@ async fn process_connection_loop(
                     payload: None,
                     error: Some(StructuredIpcError {
                         code: "frame_too_large".to_string(),
-                        message: format!("frame size {size} exceeds max {}", config.max_frame_bytes),
+                        message: format!(
+                            "frame size {size} exceeds max {}",
+                            config.max_frame_bytes
+                        ),
                         details: None,
                     }),
                     completed_at: Utc::now(),
@@ -253,7 +252,7 @@ async fn process_connection_loop(
         }
 
         // Parse command
-        let command = match IpcCommand::from_str(&request.command) {
+        let command = match IpcCommand::parse(&request.command) {
             Some(cmd) => cmd,
             None => {
                 let error_resp = IpcResponseEnvelope {

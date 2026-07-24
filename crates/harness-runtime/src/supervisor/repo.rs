@@ -27,10 +27,7 @@ impl SupervisorRepo {
     // ── Instance operations ────────────────────────────────────────────
 
     /// Insert a new supervisor instance record.
-    pub async fn insert_instance(
-        &self,
-        instance: &SupervisorInstance,
-    ) -> Result<(), CoreError> {
+    pub async fn insert_instance(&self, instance: &SupervisorInstance) -> Result<(), CoreError> {
         sqlx::query(
             r#"INSERT INTO supervisor_instances
                (instance_id, state_directory_id, pid, process_started_at, boot_nonce,
@@ -41,13 +38,13 @@ impl SupervisorRepo {
         .bind(&instance.instance_id.0)
         .bind(&instance.state_directory_id)
         .bind(instance.pid as i64)
-        .bind(&format_time(&instance.process_started_at))
+        .bind(format_time(&instance.process_started_at))
         .bind(&instance.boot_nonce)
-        .bind(&state_str(instance.state))
+        .bind(state_str(instance.state))
         .bind(instance.fencing_token)
-        .bind(&format_time(&instance.started_at))
-        .bind(&format_time(&instance.heartbeat_at))
-        .bind(&format_time(&instance.lease_expires_at))
+        .bind(format_time(&instance.started_at))
+        .bind(format_time(&instance.heartbeat_at))
+        .bind(format_time(&instance.lease_expires_at))
         .bind(&instance.protocol_version)
         .bind(&instance.binary_version)
         .execute(&self.pool)
@@ -123,17 +120,13 @@ impl SupervisorRepo {
         new_state: SupervisorState,
         event: &SupervisorEvent,
     ) -> Result<(), CoreError> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| {
-                CoreError::new(
-                    ErrorCode::PersistenceError,
-                    format!("begin transaction: {e}"),
-                    ErrorSource::System,
-                )
-            })?;
+        let mut tx = self.pool.begin().await.map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("begin transaction: {e}"),
+                ErrorSource::System,
+            )
+        })?;
 
         let event_type = event_type_str(event);
         let payload_json = serde_json::to_string(event).map_err(|e| {
@@ -150,7 +143,7 @@ impl SupervisorRepo {
                SET state = ?, updated_at = datetime('now')
                WHERE instance_id = ?"#,
         )
-        .bind(&state_str(new_state))
+        .bind(state_str(new_state))
         .bind(&instance_id.0)
         .execute(&mut *tx)
         .await
@@ -297,7 +290,7 @@ impl SupervisorRepo {
                  AND fencing_token = ?
                  AND state IN ('ready', 'recovering', 'draining')"#,
         )
-        .bind(&format_time(&new_lease_expires_at))
+        .bind(format_time(&new_lease_expires_at))
         .bind(&instance_id.0)
         .bind(expected_fencing_token)
         .execute(&self.pool)
@@ -337,7 +330,7 @@ impl SupervisorRepo {
         .bind(state_directory_id)
         .bind(&instance_id.0)
         .bind(fencing_token)
-        .bind(&format_time(&expires_at))
+        .bind(format_time(&expires_at))
         .execute(&self.pool)
         .await
         .map_err(|e| {
@@ -348,7 +341,9 @@ impl SupervisorRepo {
             {
                 CoreError::new(
                     ErrorCode::Conflict,
-                    format!("active lease already exists for state directory '{state_directory_id}'"),
+                    format!(
+                        "active lease already exists for state directory '{state_directory_id}'"
+                    ),
                     ErrorSource::Harness,
                 )
             } else if msg.contains("UNIQUE constraint failed") {
@@ -538,9 +533,7 @@ fn format_time(dt: &DateTime<Utc>) -> String {
 fn parse_time(s: &str) -> DateTime<Utc> {
     chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3fZ")
         .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
-        .or_else(|_| {
-            chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc))
-        })
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)))
         .unwrap_or_else(|_| Utc::now())
 }
 

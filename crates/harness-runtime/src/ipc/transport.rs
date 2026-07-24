@@ -50,13 +50,9 @@ impl IpcConnection {
         let expected = buf.len();
         let n = match &mut self.inner {
             #[cfg(windows)]
-            PipeInner::Server(pipe) => {
-                tokio::io::AsyncReadExt::read_exact(pipe, buf).await?
-            }
+            PipeInner::Server(pipe) => tokio::io::AsyncReadExt::read_exact(pipe, buf).await?,
             #[cfg(windows)]
-            PipeInner::Client(pipe) => {
-                tokio::io::AsyncReadExt::read_exact(pipe, buf).await?
-            }
+            PipeInner::Client(pipe) => tokio::io::AsyncReadExt::read_exact(pipe, buf).await?,
         };
         if n != expected {
             return Err(io::Error::new(
@@ -81,13 +77,9 @@ impl IpcConnection {
     pub async fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         match &mut self.inner {
             #[cfg(windows)]
-            PipeInner::Server(pipe) => {
-                tokio::io::AsyncWriteExt::write_all(pipe, buf).await
-            }
+            PipeInner::Server(pipe) => tokio::io::AsyncWriteExt::write_all(pipe, buf).await,
             #[cfg(windows)]
-            PipeInner::Client(pipe) => {
-                tokio::io::AsyncWriteExt::write_all(pipe, buf).await
-            }
+            PipeInner::Client(pipe) => tokio::io::AsyncWriteExt::write_all(pipe, buf).await,
         }
     }
 
@@ -95,13 +87,9 @@ impl IpcConnection {
     pub async fn flush(&mut self) -> io::Result<()> {
         match &mut self.inner {
             #[cfg(windows)]
-            PipeInner::Server(pipe) => {
-                tokio::io::AsyncWriteExt::flush(pipe).await
-            }
+            PipeInner::Server(pipe) => tokio::io::AsyncWriteExt::flush(pipe).await,
             #[cfg(windows)]
-            PipeInner::Client(pipe) => {
-                tokio::io::AsyncWriteExt::flush(pipe).await
-            }
+            PipeInner::Client(pipe) => tokio::io::AsyncWriteExt::flush(pipe).await,
         }
     }
 }
@@ -176,8 +164,7 @@ impl IpcClient {
         #[cfg(windows)]
         {
             let pipe_name = format!(r"\\.\pipe\{}", endpoint);
-            let client = tokio::net::windows::named_pipe::ClientOptions::new()
-                .open(&pipe_name)?;
+            let client = tokio::net::windows::named_pipe::ClientOptions::new().open(&pipe_name)?;
 
             let label = format!("client-pipe-{}", std::process::id());
             tracing::debug!(conn_id = %label, "connected to IPC server");

@@ -1,4 +1,5 @@
 //! Thin CLI IPC client — discovers and communicates with the Supervisor.
+#![allow(dead_code)] // IPC client wiring in progress — will be activated in I6.5+
 //!
 //! Default production mode: all CLI commands route through IPC to the
 //! running Supervisor. If no Supervisor is available, the CLI reports
@@ -13,7 +14,6 @@ use harness_core::contracts::ipc::{
 };
 use harness_runtime::ipc::framing::{read_frame, write_frame};
 use harness_runtime::ipc::transport::IpcClient;
-use std::time::Duration;
 
 /// Default IPC endpoint name.
 pub const DEFAULT_ENDPOINT: &str = "harness-supervisor";
@@ -88,10 +88,7 @@ impl SupervisorClient {
 pub enum ClientError {
     Connection(String),
     Serialization(String),
-    SupervisorError {
-        code: String,
-        message: String,
-    },
+    SupervisorError { code: String, message: String },
 }
 
 impl std::fmt::Display for ClientError {
@@ -119,10 +116,7 @@ pub enum CliMode {
 
 impl CliMode {
     /// Determine the CLI mode based on flags and supervisor availability.
-    pub async fn determine(
-        standalone_requested: bool,
-        endpoint: &str,
-    ) -> (Self, Option<String>) {
+    pub async fn determine(standalone_requested: bool, endpoint: &str) -> (Self, Option<String>) {
         if standalone_requested {
             // Check if a healthy supervisor exists — refuse writes in standalone
             let client = SupervisorClient::new(endpoint);
@@ -144,9 +138,7 @@ impl CliMode {
             Ok(true) => (CliMode::Ipc, None),
             Ok(false) => (
                 CliMode::Standalone,
-                Some(
-                    "Supervisor not reachable. Use --standalone for direct mode.".to_string(),
-                ),
+                Some("Supervisor not reachable. Use --standalone for direct mode.".to_string()),
             ),
             Err(e) => (
                 CliMode::Standalone,

@@ -28,7 +28,10 @@ pub struct OwnershipManager {
 }
 
 impl OwnershipManager {
-    pub fn new(pool: sqlx::SqlitePool, config: harness_core::contracts::supervisor::SupervisorConfig) -> Self {
+    pub fn new(
+        pool: sqlx::SqlitePool,
+        config: harness_core::contracts::supervisor::SupervisorConfig,
+    ) -> Self {
         Self {
             repo: SupervisorRepo::new(pool),
             lease_duration: Duration::from_secs(config.lease_duration_secs),
@@ -43,14 +46,8 @@ impl OwnershipManager {
     /// 2. If none → acquire with fencing_token = 1
     /// 3. If active but expired owner → takeover
     /// 4. If active and healthy → reject
-    pub async fn acquire(
-        &self,
-        instance: &SupervisorInstance,
-    ) -> Result<(), CoreError> {
-        let existing = self
-            .repo
-            .get_active_lease(&self.state_directory_id)
-            .await?;
+    pub async fn acquire(&self, instance: &SupervisorInstance) -> Result<(), CoreError> {
+        let existing = self.repo.get_active_lease(&self.state_directory_id).await?;
 
         match existing {
             None => {
@@ -74,16 +71,13 @@ impl OwnershipManager {
             }
             Some(active_lease) => {
                 // Check if the existing lease is from a dead/expired owner
-                let active_instance_id =
-                    SupervisorInstanceId(active_lease.instance_id.clone());
+                let active_instance_id = SupervisorInstanceId(active_lease.instance_id.clone());
 
                 let expired = parse_time(&active_lease.expires_at) < Utc::now();
 
                 if expired {
                     // Lease expired — verify the old owner is really dead
-                    let dead = self
-                        .verify_owner_dead(&active_instance_id)
-                        .await;
+                    let dead = self.verify_owner_dead(&active_instance_id).await;
 
                     if dead {
                         // Stale owner confirmed dead — eligible for takeover
@@ -110,9 +104,7 @@ impl OwnershipManager {
                 }
 
                 // Lease not expired — check if the owner process is still alive
-                let alive = self
-                    .verify_owner_alive(&active_instance_id)
-                    .await;
+                let alive = self.verify_owner_alive(&active_instance_id).await;
 
                 if alive {
                     Err(CoreError::new(
@@ -150,10 +142,7 @@ impl OwnershipManager {
             .force_deactivate_lease(&self.state_directory_id)
             .await?;
 
-        let old_fencing_token = old_lease
-            .as_ref()
-            .map(|l| l.fencing_token)
-            .unwrap_or(0);
+        let old_fencing_token = old_lease.as_ref().map(|l| l.fencing_token).unwrap_or(0);
         let new_fencing_token = old_fencing_token + 1;
 
         let previous_instance_id = old_lease
@@ -188,10 +177,7 @@ impl OwnershipManager {
     }
 
     /// Release the supervisor lease.
-    pub async fn release_lease(
-        &self,
-        instance: &SupervisorInstance,
-    ) -> Result<(), CoreError> {
+    pub async fn release_lease(&self, instance: &SupervisorInstance) -> Result<(), CoreError> {
         let released = self
             .repo
             .release_lease_cas(&instance.instance_id, instance.fencing_token)
@@ -227,10 +213,7 @@ impl OwnershipManager {
     // ── Process identity verification ──────────────────────────────────
 
     /// Verify that an owner process is still alive using OS-level identity.
-    async fn verify_owner_alive(
-        &self,
-        instance_id: &SupervisorInstanceId,
-    ) -> bool {
+    async fn verify_owner_alive(&self, instance_id: &SupervisorInstanceId) -> bool {
         let instance = match self.repo.get_instance(instance_id).await {
             Ok(Some(i)) => i,
             _ => return false,
@@ -240,10 +223,7 @@ impl OwnershipManager {
     }
 
     /// Verify that an owner process is definitely dead.
-    async fn verify_owner_dead(
-        &self,
-        instance_id: &SupervisorInstanceId,
-    ) -> bool {
+    async fn verify_owner_dead(&self, instance_id: &SupervisorInstanceId) -> bool {
         let instance = match self.repo.get_instance(instance_id).await {
             Ok(Some(i)) => i,
             _ => return true, // No record → treat as dead
@@ -300,8 +280,7 @@ fn is_process_alive(pid: u32, expected_start_time: DateTime<Utc>) -> bool {
                 return false;
             }
 
-            let ticks = ((creation.dwHighDateTime as u64) << 32)
-                | (creation.dwLowDateTime as u64);
+            let ticks = ((creation.dwHighDateTime as u64) << 32) | (creation.dwLowDateTime as u64);
             let unix_epoch_ticks = 11_644_473_600_000_000_000u64;
             if ticks > unix_epoch_ticks {
                 let creation_secs = (ticks - unix_epoch_ticks) / 10_000_000;
@@ -336,8 +315,6 @@ fn is_process_alive(pid: u32, expected_start_time: DateTime<Utc>) -> bool {
 fn parse_time(s: &str) -> DateTime<Utc> {
     chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.3fZ")
         .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
-        .or_else(|_| {
-            chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc))
-        })
+        .or_else(|_| chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.with_timezone(&Utc)))
         .unwrap_or_else(|_| Utc::now())
 }

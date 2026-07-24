@@ -73,7 +73,9 @@ pub async fn cmd_supervisor_start(
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
 
-    let child = cmd.spawn().map_err(|e| format!("failed to start supervisor: {e}"))?;
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start supervisor: {e}"))?;
     println!(
         "Supervisor started (PID: {}) for state directory: {}",
         child.id(),
@@ -94,7 +96,11 @@ pub async fn cmd_supervisor_status(
 
     match repo.get_active_instance_for_dir(state_directory_id).await {
         Ok(Some(instance)) => {
-            let lease = repo.get_active_lease(state_directory_id).await.ok().flatten();
+            let lease = repo
+                .get_active_lease(state_directory_id)
+                .await
+                .ok()
+                .flatten();
 
             if json {
                 let status = serde_json::json!({
@@ -122,7 +128,10 @@ pub async fn cmd_supervisor_status(
                 );
                 println!("  Fencing Token:     {}", instance.fencing_token);
                 println!("  Started At:        {}", instance.started_at.to_rfc3339());
-                println!("  Last Heartbeat:    {}", instance.heartbeat_at.to_rfc3339());
+                println!(
+                    "  Last Heartbeat:    {}",
+                    instance.heartbeat_at.to_rfc3339()
+                );
                 println!(
                     "  Lease Expires:     {}",
                     instance.lease_expires_at.to_rfc3339()

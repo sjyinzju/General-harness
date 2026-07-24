@@ -129,7 +129,7 @@ pub enum IpcCommand {
 
 impl IpcCommand {
     /// Parse a command string into an IpcCommand.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "supervisor.status" => Some(IpcCommand::SupervisorStatus),
             "supervisor.stop" => Some(IpcCommand::SupervisorStop),

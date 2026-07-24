@@ -137,8 +137,7 @@ impl Supervisor {
                     self.transition_to(SupervisorState::TakingOver, &instance)
                         .await?;
 
-                    let takeover_result =
-                        self.ownership.takeover_and_acquire(&instance).await?;
+                    let takeover_result = self.ownership.takeover_and_acquire(&instance).await?;
 
                     let mut updated_instance = instance.clone();
                     updated_instance.fencing_token = takeover_result.new_fencing_token;
@@ -267,11 +266,7 @@ impl Supervisor {
 
     /// Get current fencing token.
     pub async fn fencing_token(&self) -> Option<i64> {
-        self.instance
-            .read()
-            .await
-            .as_ref()
-            .map(|i| i.fencing_token)
+        self.instance.read().await.as_ref().map(|i| i.fencing_token)
     }
 
     /// Get the supervisor config.
@@ -347,14 +342,12 @@ impl Supervisor {
 
         // Build event for this transition
         let event = match new_state {
-            SupervisorState::AcquiringOwnership => {
-                SupervisorEvent::SupervisorStarting {
-                    instance_id: instance.instance_id.clone(),
-                    pid: instance.pid,
-                    process_started_at: instance.process_started_at,
-                    occurred_at: Utc::now(),
-                }
-            }
+            SupervisorState::AcquiringOwnership => SupervisorEvent::SupervisorStarting {
+                instance_id: instance.instance_id.clone(),
+                pid: instance.pid,
+                process_started_at: instance.process_started_at,
+                occurred_at: Utc::now(),
+            },
             SupervisorState::Ready => SupervisorEvent::SupervisorReady {
                 instance_id: instance.instance_id.clone(),
                 occurred_at: Utc::now(),
@@ -388,11 +381,7 @@ impl Supervisor {
 
         // Persist state update + event in same transaction
         self.repo
-            .update_state_and_append_event(
-                &instance.instance_id,
-                new_state,
-                &event,
-            )
+            .update_state_and_append_event(&instance.instance_id, new_state, &event)
             .await?;
 
         // Update in-memory instance
@@ -481,15 +470,23 @@ fn get_process_start_time() -> chrono::DateTime<chrono::Utc> {
             let mut _kernel: FILETIME = std::mem::zeroed();
             let mut _user: FILETIME = std::mem::zeroed();
 
-            if GetProcessTimes(process, &mut _creation, &mut _exit, &mut _kernel, &mut _user) != 0 {
-                let ticks = ((_creation.dwHighDateTime as u64) << 32) | (_creation.dwLowDateTime as u64);
+            if GetProcessTimes(
+                process,
+                &mut _creation,
+                &mut _exit,
+                &mut _kernel,
+                &mut _user,
+            ) != 0
+            {
+                let ticks =
+                    ((_creation.dwHighDateTime as u64) << 32) | (_creation.dwLowDateTime as u64);
                 // FILETIME is 100-nanosecond intervals since 1601-01-01
                 let unix_epoch_ticks = 11_644_473_600_000_000_000u64;
                 if ticks > unix_epoch_ticks {
                     let secs = (ticks - unix_epoch_ticks) / 10_000_000;
                     let nanos = ((ticks - unix_epoch_ticks) % 10_000_000) * 100;
                     return chrono::DateTime::from_timestamp(secs as i64, nanos as u32)
-                        .unwrap_or_else(|| chrono::Utc::now());
+                        .unwrap_or_else(chrono::Utc::now);
                 }
             }
         }

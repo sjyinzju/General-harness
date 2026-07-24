@@ -54,11 +54,11 @@ pub use runtime_profile::{
     CoreStatus as RuntimeProfileStatus, OptionalCapabilities, RequiredCapabilities, RuntimeProfile,
     TriState,
 };
-pub use task::{Task, TaskDependency, TaskLifecycle};
-pub use task_envelope::{FileScope, TaskBudget, TaskEnvelope};
-pub use task_result::TaskResult;
 pub use supervisor::{
     SupervisorConfig, SupervisorEvent, SupervisorInstance, SupervisorInstanceId, SupervisorLease,
     SupervisorState, SupervisorStatus,
 };
+pub use task::{Task, TaskDependency, TaskLifecycle};
+pub use task_envelope::{FileScope, TaskBudget, TaskEnvelope};
+pub use task_result::TaskResult;
 pub use workspace::{LeaseLifecycle, WorkspaceLease};

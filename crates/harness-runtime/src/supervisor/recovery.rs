@@ -39,7 +39,9 @@ pub enum RecoveryRunState {
 
 /// The recovery orchestrator.
 pub struct RecoveryOrchestrator {
+    #[allow(dead_code)]
     pool: SqlitePool,
+    #[allow(dead_code)]
     repo: SupervisorRepo,
 }
 
@@ -57,7 +59,7 @@ impl RecoveryOrchestrator {
         fencing_token: i64,
     ) -> Result<RecoverySummary, String> {
         let recovery_id = uuid::Uuid::new_v4().to_string();
-        let started_at = Utc::now();
+        let _started_at = Utc::now();
 
         tracing::info!(
             recovery_id = %recovery_id,
@@ -121,7 +123,10 @@ impl RecoveryOrchestrator {
         }
 
         // ── Phase 4: Claim/Lease recovery ──────────────────────
-        match self.recover_claims_and_leases(instance_id, fencing_token).await {
+        match self
+            .recover_claims_and_leases(instance_id, fencing_token)
+            .await
+        {
             Ok(count) => {
                 summary.claims_released = count;
             }
@@ -166,8 +171,8 @@ impl RecoveryOrchestrator {
 
     async fn recover_processes(
         &self,
-        instance_id: &SupervisorInstanceId,
-        fencing_token: i64,
+        _instance_id: &SupervisorInstanceId,
+        _fencing_token: i64,
     ) -> Result<ProcessRecoveryResult, String> {
         // Scan for orphan processes from previous supervisor instances.
         // Check execution_attempts and verification_step_processes tables
@@ -186,8 +191,8 @@ impl RecoveryOrchestrator {
 
     async fn recover_workspaces(
         &self,
-        instance_id: &SupervisorInstanceId,
-        fencing_token: i64,
+        _instance_id: &SupervisorInstanceId,
+        _fencing_token: i64,
     ) -> Result<WorkspaceRecoveryResult, String> {
         // Scan the worktrees table for records that are Active but whose
         // associated operations are stale. Use WorktreeManager's existing
@@ -201,8 +206,8 @@ impl RecoveryOrchestrator {
 
     async fn recover_integration(
         &self,
-        instance_id: &SupervisorInstanceId,
-        fencing_token: i64,
+        _instance_id: &SupervisorInstanceId,
+        _fencing_token: i64,
     ) -> Result<usize, String> {
         // Call IntegrationRecoveryService::reconcile() to handle:
         // - Expired leases → release
@@ -218,8 +223,8 @@ impl RecoveryOrchestrator {
 
     async fn recover_claims_and_leases(
         &self,
-        instance_id: &SupervisorInstanceId,
-        fencing_token: i64,
+        _instance_id: &SupervisorInstanceId,
+        _fencing_token: i64,
     ) -> Result<usize, String> {
         // Expire stale ResourceClaims whose owner supervisor instance
         // is dead. The new fencing_token ensures old writes are rejected.
@@ -227,10 +232,7 @@ impl RecoveryOrchestrator {
         Ok(0) // Placeholder
     }
 
-    async fn recover_artifacts(
-        &self,
-        instance_id: &SupervisorInstanceId,
-    ) -> Result<usize, String> {
+    async fn recover_artifacts(&self, _instance_id: &SupervisorInstanceId) -> Result<usize, String> {
         // Call LivenessOrchestrator::startup_janitor() to clean:
         // - Orphan temp directories
         // - Orphan evidence directories
@@ -288,6 +290,7 @@ impl RecoveryOrchestrator {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn record_recovery_action(
         &self,
         recovery_id: &str,

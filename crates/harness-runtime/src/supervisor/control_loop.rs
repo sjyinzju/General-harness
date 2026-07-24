@@ -10,11 +10,9 @@
 //! 7. Persist transitions
 //! 8. Clean up completed resources
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use harness_core::contracts::supervisor::SupervisorInstanceId;
 use sqlx::SqlitePool;
 use tokio::sync::{mpsc, Mutex, RwLock};
@@ -58,7 +56,9 @@ pub enum LoopWakeup {
 /// The supervisor control loop.
 pub struct ControlLoop {
     config: ControlLoopConfig,
+    #[allow(dead_code)]
     pool: SqlitePool,
+    #[allow(dead_code)]
     repo: SupervisorRepo,
     instance_id: SupervisorInstanceId,
     fencing_token: i64,
@@ -166,7 +166,6 @@ impl ControlLoop {
             }
             Err(e) => {
                 tracing::error!(error = %e, "failed to scan pending operations");
-                return;
             }
         }
 

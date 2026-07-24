@@ -7,12 +7,9 @@
 //! 3. Routed to the appropriate production service
 //! 4. Response is returned through IPC
 
-use std::sync::Arc;
-
-use harness_core::contracts::ipc::{IpcCommand, IpcResponseStatus};
+use harness_core::contracts::ipc::IpcCommand;
 use harness_core::CoreError;
 use sqlx::SqlitePool;
-use tracing;
 
 use crate::ipc::IpcCommandHandler;
 
@@ -21,6 +18,7 @@ use crate::ipc::IpcCommandHandler;
 /// In I6.3, this provides the routing layer. Full integration with
 /// each service is added incrementally.
 pub struct SupervisorCommandHandler {
+    #[allow(dead_code)]
     pool: SqlitePool,
 }
 
@@ -55,17 +53,13 @@ impl IpcCommandHandler for SupervisorCommandHandler {
             | IpcCommand::TaskResume
             | IpcCommand::TaskCancel
             | IpcCommand::TaskInspect
-            | IpcCommand::TaskDryRunDecision => {
-                self.cmd_task_loop(command, payload).await
-            }
+            | IpcCommand::TaskDryRunDecision => self.cmd_task_loop(command, payload).await,
 
             // ── Review ────────────────────────────────────────
             IpcCommand::ReviewCreate
             | IpcCommand::ReviewShow
             | IpcCommand::ReviewRun
-            | IpcCommand::ReviewList => {
-                self.cmd_review(command, payload).await
-            }
+            | IpcCommand::ReviewList => self.cmd_review(command, payload).await,
 
             // ── Integration ───────────────────────────────────
             IpcCommand::IntegrationEnqueue
@@ -73,9 +67,7 @@ impl IpcCommandHandler for SupervisorCommandHandler {
             | IpcCommand::IntegrationShow
             | IpcCommand::IntegrationList
             | IpcCommand::IntegrationCancel
-            | IpcCommand::IntegrationRecover => {
-                self.cmd_integration(command, payload).await
-            }
+            | IpcCommand::IntegrationRecover => self.cmd_integration(command, payload).await,
 
             // ── Cancellation ──────────────────────────────────
             IpcCommand::Cancel => self.cmd_cancel(payload).await,
@@ -159,7 +151,7 @@ impl SupervisorCommandHandler {
     async fn cmd_task_loop(
         &self,
         command: &IpcCommand,
-        payload: &serde_json::Value,
+        _payload: &serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
         Ok(serde_json::json!({
             "command": command.as_str(),
@@ -171,7 +163,7 @@ impl SupervisorCommandHandler {
     async fn cmd_review(
         &self,
         command: &IpcCommand,
-        payload: &serde_json::Value,
+        _payload: &serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
         Ok(serde_json::json!({
             "command": command.as_str(),
@@ -183,7 +175,7 @@ impl SupervisorCommandHandler {
     async fn cmd_integration(
         &self,
         command: &IpcCommand,
-        payload: &serde_json::Value,
+        _payload: &serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
         Ok(serde_json::json!({
             "command": command.as_str(),
@@ -194,7 +186,7 @@ impl SupervisorCommandHandler {
 
     async fn cmd_cancel(
         &self,
-        payload: &serde_json::Value,
+        _payload: &serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
         Ok(serde_json::json!({
             "cancelled": true,

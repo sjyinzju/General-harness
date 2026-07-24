@@ -2,61 +2,93 @@
 
 #[cfg(test)]
 mod ipc_tests {
-    use harness_core::contracts::ipc::{
-        IpcCommand, IpcRequestEnvelope, IpcResponseEnvelope, IpcResponseStatus,
-        StructuredIpcError, IPC_PROTOCOL_VERSION,
-    };
     use chrono::Utc;
+    use harness_core::contracts::ipc::{
+        IpcCommand, IpcRequestEnvelope, IpcResponseEnvelope, IpcResponseStatus, StructuredIpcError,
+        IPC_PROTOCOL_VERSION,
+    };
 
     // ── Command parsing ──────────────────────────────────────────
 
     #[test]
     fn test_command_whitelist() {
         // Valid commands
-        assert!(IpcCommand::from_str("supervisor.status").is_some());
-        assert!(IpcCommand::from_str("supervisor.stop").is_some());
-        assert!(IpcCommand::from_str("task.start").is_some());
-        assert!(IpcCommand::from_str("task.status").is_some());
-        assert!(IpcCommand::from_str("review.create").is_some());
-        assert!(IpcCommand::from_str("review.run").is_some());
-        assert!(IpcCommand::from_str("integration.enqueue").is_some());
-        assert!(IpcCommand::from_str("integration.run_next").is_some());
-        assert!(IpcCommand::from_str("subscribe").is_some());
-        assert!(IpcCommand::from_str("health").is_some());
-        assert!(IpcCommand::from_str("diagnostics").is_some());
-        assert!(IpcCommand::from_str("cancel").is_some());
-        assert!(IpcCommand::from_str("inspect").is_some());
+        assert!(IpcCommand::parse("supervisor.status").is_some());
+        assert!(IpcCommand::parse("supervisor.stop").is_some());
+        assert!(IpcCommand::parse("task.start").is_some());
+        assert!(IpcCommand::parse("task.status").is_some());
+        assert!(IpcCommand::parse("review.create").is_some());
+        assert!(IpcCommand::parse("review.run").is_some());
+        assert!(IpcCommand::parse("integration.enqueue").is_some());
+        assert!(IpcCommand::parse("integration.run_next").is_some());
+        assert!(IpcCommand::parse("subscribe").is_some());
+        assert!(IpcCommand::parse("health").is_some());
+        assert!(IpcCommand::parse("diagnostics").is_some());
+        assert!(IpcCommand::parse("cancel").is_some());
+        assert!(IpcCommand::parse("inspect").is_some());
 
         // Invalid commands
-        assert!(IpcCommand::from_str("").is_none());
-        assert!(IpcCommand::from_str("unknown.command").is_none());
-        assert!(IpcCommand::from_str("malicious").is_none());
-        assert!(IpcCommand::from_str("supervisor.run").is_none());
+        assert!(IpcCommand::parse("").is_none());
+        assert!(IpcCommand::parse("unknown.command").is_none());
+        assert!(IpcCommand::parse("malicious").is_none());
+        assert!(IpcCommand::parse("supervisor.run").is_none());
     }
 
     #[test]
     fn test_command_side_effects() {
         // Read-only commands
-        assert!(!IpcCommand::from_str("supervisor.status").unwrap().has_side_effects());
-        assert!(!IpcCommand::from_str("task.status").unwrap().has_side_effects());
-        assert!(!IpcCommand::from_str("review.show").unwrap().has_side_effects());
-        assert!(!IpcCommand::from_str("review.list").unwrap().has_side_effects());
-        assert!(!IpcCommand::from_str("integration.show").unwrap().has_side_effects());
-        assert!(!IpcCommand::from_str("integration.list").unwrap().has_side_effects());
-        assert!(!IpcCommand::from_str("health").unwrap().has_side_effects());
-        assert!(!IpcCommand::from_str("diagnostics").unwrap().has_side_effects());
+        assert!(!IpcCommand::parse("supervisor.status")
+            .unwrap()
+            .has_side_effects());
+        assert!(!IpcCommand::parse("task.status")
+            .unwrap()
+            .has_side_effects());
+        assert!(!IpcCommand::parse("review.show")
+            .unwrap()
+            .has_side_effects());
+        assert!(!IpcCommand::parse("review.list")
+            .unwrap()
+            .has_side_effects());
+        assert!(!IpcCommand::parse("integration.show")
+            .unwrap()
+            .has_side_effects());
+        assert!(!IpcCommand::parse("integration.list")
+            .unwrap()
+            .has_side_effects());
+        assert!(!IpcCommand::parse("health").unwrap().has_side_effects());
+        assert!(!IpcCommand::parse("diagnostics")
+            .unwrap()
+            .has_side_effects());
 
         // Write commands
-        assert!(IpcCommand::from_str("task.start").unwrap().has_side_effects());
-        assert!(IpcCommand::from_str("task.resume").unwrap().has_side_effects());
-        assert!(IpcCommand::from_str("task.cancel").unwrap().has_side_effects());
-        assert!(IpcCommand::from_str("review.create").unwrap().has_side_effects());
-        assert!(IpcCommand::from_str("review.run").unwrap().has_side_effects());
-        assert!(IpcCommand::from_str("integration.enqueue").unwrap().has_side_effects());
-        assert!(IpcCommand::from_str("integration.run_next").unwrap().has_side_effects());
-        assert!(IpcCommand::from_str("integration.cancel").unwrap().has_side_effects());
-        assert!(IpcCommand::from_str("integration.recover").unwrap().has_side_effects());
-        assert!(IpcCommand::from_str("cancel").unwrap().has_side_effects());
+        assert!(IpcCommand::parse("task.start")
+            .unwrap()
+            .has_side_effects());
+        assert!(IpcCommand::parse("task.resume")
+            .unwrap()
+            .has_side_effects());
+        assert!(IpcCommand::parse("task.cancel")
+            .unwrap()
+            .has_side_effects());
+        assert!(IpcCommand::parse("review.create")
+            .unwrap()
+            .has_side_effects());
+        assert!(IpcCommand::parse("review.run")
+            .unwrap()
+            .has_side_effects());
+        assert!(IpcCommand::parse("integration.enqueue")
+            .unwrap()
+            .has_side_effects());
+        assert!(IpcCommand::parse("integration.run_next")
+            .unwrap()
+            .has_side_effects());
+        assert!(IpcCommand::parse("integration.cancel")
+            .unwrap()
+            .has_side_effects());
+        assert!(IpcCommand::parse("integration.recover")
+            .unwrap()
+            .has_side_effects());
+        assert!(IpcCommand::parse("cancel").unwrap().has_side_effects());
     }
 
     #[test]
@@ -87,7 +119,7 @@ mod ipc_tests {
             "health",
             "diagnostics",
         ] {
-            let parsed = IpcCommand::from_str(cmd).expect("valid command");
+            let parsed = IpcCommand::parse(cmd).expect("valid command");
             assert_eq!(parsed.as_str(), *cmd, "round-trip failed for {cmd}");
         }
     }

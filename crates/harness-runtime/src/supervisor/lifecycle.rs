@@ -18,6 +18,12 @@ use harness_core::contracts::supervisor::SupervisorState;
 /// ```
 pub struct LifecycleFsm;
 
+impl Default for LifecycleFsm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LifecycleFsm {
     pub fn new() -> Self {
         Self
@@ -90,7 +96,10 @@ mod tests {
             .validate_transition(SupervisorState::Created, SupervisorState::Starting)
             .is_ok());
         assert!(fsm
-            .validate_transition(SupervisorState::Starting, SupervisorState::AcquiringOwnership)
+            .validate_transition(
+                SupervisorState::Starting,
+                SupervisorState::AcquiringOwnership
+            )
             .is_ok());
         assert!(fsm
             .validate_transition(
@@ -121,7 +130,10 @@ mod tests {
     fn test_takeover_path() {
         let fsm = LifecycleFsm::new();
         assert!(fsm
-            .validate_transition(SupervisorState::AcquiringOwnership, SupervisorState::TakingOver)
+            .validate_transition(
+                SupervisorState::AcquiringOwnership,
+                SupervisorState::TakingOver
+            )
             .is_ok());
         assert!(fsm
             .validate_transition(SupervisorState::TakingOver, SupervisorState::Recovering)

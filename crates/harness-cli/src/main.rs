@@ -172,7 +172,7 @@ async fn dispatch_command(
                 eprintln!("error: missing supervisor subcommand");
                 false
             } else {
-                dispatch_supervisor(args, db, &db_path).await
+                dispatch_supervisor(args, db, db_path).await
             }
         }
         _ => {
@@ -586,24 +586,20 @@ async fn cmd_review_standalone(
 async fn dispatch_supervisor(args: &[String], db: &Database, db_path: &str) -> bool {
     let state_dir = parse_flag(args, "--state-dir").unwrap_or("default");
     match args[2].as_str() {
-        "run" => {
-            match commands::supervisor::cmd_supervisor_run(db, state_dir).await {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    false
-                }
+        "run" => match commands::supervisor::cmd_supervisor_run(db, state_dir).await {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("error: {e}");
+                false
             }
-        }
-        "start" => {
-            match commands::supervisor::cmd_supervisor_start(db_path, state_dir).await {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    false
-                }
+        },
+        "start" => match commands::supervisor::cmd_supervisor_start(db_path, state_dir).await {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("error: {e}");
+                false
             }
-        }
+        },
         "status" => {
             let json = args.contains(&"--json".to_string());
             match commands::supervisor::cmd_supervisor_status(db, state_dir, json).await {
@@ -614,15 +610,13 @@ async fn dispatch_supervisor(args: &[String], db: &Database, db_path: &str) -> b
                 }
             }
         }
-        "stop" => {
-            match commands::supervisor::cmd_supervisor_stop(db, state_dir).await {
-                Ok(()) => true,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    false
-                }
+        "stop" => match commands::supervisor::cmd_supervisor_stop(db, state_dir).await {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("error: {e}");
+                false
             }
-        }
+        },
         _ => {
             eprintln!("error: unknown supervisor subcommand: {}", args[2]);
             eprintln!("Usage: harness supervisor <run|start|status|stop> [--state-dir <id>]");
