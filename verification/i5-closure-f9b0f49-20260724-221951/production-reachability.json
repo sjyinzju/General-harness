@@ -1,0 +1,47 @@
+{
+    "VerificationTimeout":  {
+                                "defined":  true,
+                                "tested":  true,
+                                "process_tree_kill":  true,
+                                "async_spawn":  true
+                            },
+    "ControlledCommitService":  {
+                                    "defined":  true,
+                                    "tested":  true,
+                                    "cli_reachable":  true,
+                                    "caller":  "integration_enqueue"
+                                },
+    "IntegrationRecoveryService":  {
+                                       "defined":  true,
+                                       "tested":  true,
+                                       "cli_reachable":  true,
+                                       "caller":  "recover"
+                                   },
+    "IntegrationExecutor":  {
+                                "defined":  true,
+                                "tested":  true,
+                                "cli_reachable":  true,
+                                "caller":  "run_next"
+                            },
+    "LeaseAcquisition":  {
+                             "defined":  true,
+                             "tested":  true,
+                             "cli_reachable":  true
+                         },
+    "AtomicPublish":  {
+                          "defined":  true,
+                          "tested":  true,
+                          "cas":  true
+                      },
+    "IntegrationQueueService":  {
+                                    "defined":  true,
+                                    "tested":  true,
+                                    "cli_reachable":  true,
+                                    "caller":  "all_integration_commands"
+                                },
+    "FencingValidation":  {
+                              "defined":  true,
+                              "tested":  true,
+                              "enforced":  true
+                          }
+}

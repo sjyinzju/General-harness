@@ -1,0 +1,15 @@
+{
+    "fencing_validated_before_publish":  true,
+    "verification_timeout_process_tree_terminated":  true,
+    "deep_recovery_production_reachable":  true,
+    "integration_executor_production_reachable":  true,
+    "target_ref_changed_on_failed_verification":  false,
+    "workspace_tests_skipped":  0,
+    "controlled_commit_production_reachable":  true,
+    "workspace_tests_failed":  0,
+    "workspace_tests_ignored":  0,
+    "orphan_process_count":  0,
+    "run_next_executes_integration":  true,
+    "code_candidate_head":  "f9b0f494d43f5428acc91b92e462c8cf26238f25",
+    "stale_worker_publish_rejected":  true
+}
