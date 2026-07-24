@@ -1,0 +1,27 @@
+{
+  "milestone": "I5",
+  "title": "Controlled Commit and Integration Queue",
+  "code_candidate_head": "80533fb3833026a8cbff6547cc59ac2d67584f75",
+  "completed_at": "2026-07-24T21:21:28Z",
+  "phases": {
+    "I5.1": "PASS",
+    "I5.2": "PASS",
+    "I5.3": "PASS",
+    "I5.4": "PASS"
+  },
+  "quality_gates": {
+    "cargo_fmt_check": "PASS",
+    "cargo_clippy": "PASS",
+    "cargo_test_workspace": "PASS"
+  },
+  "test_counts": {
+    "i5_1_controlled_commit": { "passed": 11, "failed": 0 },
+    "i5_2_integration_queue": { "passed": 10, "failed": 0 },
+    "i5_3_integration_e2e": { "passed": 8, "failed": 0 },
+    "total_i5": { "passed": 29, "failed": 0 }
+  },
+  "migrations": {
+    "024_controlled_commit": "commit_requests, commit_candidates, commit_creation_attempts, commit_events",
+    "025_integration_queue": "integration_requests, integration_attempts, integration_leases, integration_results, integration_verifications, integration_events"
+  }
+}

@@ -1,0 +1,10 @@
+﻿80533fb (HEAD -> main) feat(i5): add integration queue, sandboxed execution, CLI, and recovery
+7d71a96 feat(i5): add approved candidate commit admission
+70dd769 (origin/main, origin/HEAD, feat/i4-6-candidate-review-gate) docs(i4.6): record final real reviewer certification
+b32e828 test(i4.6): add real reviewer smoke tests
+e52dc84 docs(i4.6): record final candidate review certification
+c0868d1 fix(i4.6): close candidate review gate audit findings
+e028c1d docs(i4.6): record I4.6 Candidate Review Gate implementation report
+4f4a012 I4.6: Candidate Review Gate — core implementation
+c23e1b9 清理文件
+5937c17 Merge pull request #1 from sjyinzju/i4-5-c8-liveness
