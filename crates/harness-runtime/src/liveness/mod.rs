@@ -38,5 +38,5 @@ pub use run_context::{RunContext, TempPathProvider};
 pub use temp_dir::HarnessTempDir;
 pub use types::{
     CleanupAction, CleanupEntry, CleanupResult, EvidenceRetention, LivenessConfig, ManagedDirKind,
-    MarkerState, OwnershipMarker, ProtectedPaths, SafetyVerdict,
+    MarkerState, OwnershipMarker, ProtectedPaths, SafetyVerdict, OWNERSHIP_MARKER_FILENAME,
 };
