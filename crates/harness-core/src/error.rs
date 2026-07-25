@@ -57,6 +57,11 @@ pub enum ErrorCode {
     VerificationFailed { check: String },
     // Profile
     ProfileSeparationViolation,
+    // Role isolation
+    NoOperationalRuntimeProfile,
+    RoleSessionIsolationViolation,
+    RolePermissionViolation,
+    StrictProfileDiversityUnavailable,
     // Internal
     Internal,
 }

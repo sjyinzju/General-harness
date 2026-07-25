@@ -308,6 +308,45 @@ pub struct CriterionCompletionStatus {
 
 // ── Profile Separation ──────────────────────────────────────────────────
 
+/// Role isolation policy — governs which profile separation rules apply.
+///
+/// # Production default
+///
+/// `IsolatedSessions` — a single operational RuntimeProfile can drive all four
+/// roles (Planner, Executor, Reviewer, Evaluator) provided each role runs in a
+/// *fresh, independent* Agent session with role-appropriate permissions and
+/// context isolation.
+///
+/// # Optional high-assurance mode
+///
+/// `StrictProfileDiversity` — the legacy rule requiring different profiles for
+/// Planner/Evaluator and Executor/Reviewer. Only usable when two or more
+/// operational profiles are available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RoleIsolationPolicy {
+    /// Default: same profile allowed; distinct sessions required.
+    IsolatedSessions,
+    /// High-assurance: different profiles required for Planner/Evaluator
+    /// and Executor/Reviewer.
+    StrictProfileDiversity,
+}
+
+impl Default for RoleIsolationPolicy {
+    fn default() -> Self {
+        Self::IsolatedSessions
+    }
+}
+
+impl RoleIsolationPolicy {
+    /// Human-readable label.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::IsolatedSessions => "isolated_sessions",
+            Self::StrictProfileDiversity => "strict_profile_diversity",
+        }
+    }
+}
+
 /// Structured error when profile separation rules are violated.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileSeparationError {
@@ -340,6 +379,8 @@ impl std::fmt::Display for ProfileSeparationError {
 /// Runtime configuration for goal services, enforcing profile separation.
 #[derive(Debug, Clone)]
 pub struct GoalRuntimeConfig {
+    /// Which isolation policy governs this goal run.
+    pub role_isolation_policy: RoleIsolationPolicy,
     pub planner_profile_id: String,
     pub evaluator_profile_id: String,
     pub executor_profile_ids: Vec<String>,
@@ -347,52 +388,86 @@ pub struct GoalRuntimeConfig {
 }
 
 impl GoalRuntimeConfig {
-    /// Validate profile separation rules:
-    /// - planner_profile_id != evaluator_profile_id
-    /// - executor_profile_ids must not overlap with reviewer_profile_ids
-    /// - executor_profile_ids must not include planner or evaluator profiles
-    ///   (unless the same profile is explicitly allowed for both — NOT by default)
+    /// Validate profile separation rules according to the active policy.
+    ///
+    /// - `IsolatedSessions`: checks that at least one profile is configured;
+    ///   same-profile is allowed. Session isolation is enforced at runtime.
+    /// - `StrictProfileDiversity`: Planner != Evaluator AND Executor ∩ Reviewer = ∅.
     pub fn validate(&self, goal_id: Option<&str>) -> Result<(), Box<ProfileSeparationError>> {
-        // R3a: Planner != Evaluator
-        if self.planner_profile_id == self.evaluator_profile_id {
-            return Err(Box::new(ProfileSeparationError {
-                role_a: "GoalPlanner".into(),
-                profile_a: self.planner_profile_id.clone(),
-                role_b: "GoalEvaluator".into(),
-                profile_b: self.evaluator_profile_id.clone(),
-                goal_id: goal_id.map(|s| s.to_string()),
-                message: "Planner and Evaluator must use different profiles".into(),
-            }));
-        }
+        match self.role_isolation_policy {
+            RoleIsolationPolicy::IsolatedSessions => {
+                // At least one operational profile must be configured
+                if self.planner_profile_id.is_empty() || self.evaluator_profile_id.is_empty() {
+                    return Err(Box::new(ProfileSeparationError {
+                        role_a: "GoalPlanner".into(),
+                        profile_a: self.planner_profile_id.clone(),
+                        role_b: "GoalEvaluator".into(),
+                        profile_b: self.evaluator_profile_id.clone(),
+                        goal_id: goal_id.map(|s| s.to_string()),
+                        message: "At least one operational RuntimeProfile is required for IsolatedSessions mode".into(),
+                    }));
+                }
+                // Same profile is acceptable under IsolatedSessions
+                Ok(())
+            }
+            RoleIsolationPolicy::StrictProfileDiversity => {
+                // R3a: Planner != Evaluator
+                if self.planner_profile_id == self.evaluator_profile_id {
+                    return Err(Box::new(ProfileSeparationError {
+                        role_a: "GoalPlanner".into(),
+                        profile_a: self.planner_profile_id.clone(),
+                        role_b: "GoalEvaluator".into(),
+                        profile_b: self.evaluator_profile_id.clone(),
+                        goal_id: goal_id.map(|s| s.to_string()),
+                        message: "Planner and Evaluator must use different profiles under StrictProfileDiversity".into(),
+                    }));
+                }
 
-        // R3b: Executor != Reviewer (any overlap)
-        let exec_set: std::collections::HashSet<&str> = self
-            .executor_profile_ids
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
-        for rp in &self.reviewer_profile_ids {
-            if exec_set.contains(rp.as_str()) {
-                return Err(Box::new(ProfileSeparationError {
-                    role_a: "TaskExecutor".into(),
-                    profile_a: rp.clone(),
-                    role_b: "TaskReviewer".into(),
-                    profile_b: rp.clone(),
-                    goal_id: goal_id.map(|s| s.to_string()),
-                    message: format!(
-                        "profile '{}' cannot be used for both Executor and Reviewer roles",
-                        rp
-                    ),
-                }));
+                // R3b: Executor != Reviewer (any overlap)
+                let exec_set: std::collections::HashSet<&str> = self
+                    .executor_profile_ids
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect();
+                for rp in &self.reviewer_profile_ids {
+                    if exec_set.contains(rp.as_str()) {
+                        return Err(Box::new(ProfileSeparationError {
+                            role_a: "TaskExecutor".into(),
+                            profile_a: rp.clone(),
+                            role_b: "TaskReviewer".into(),
+                            profile_b: rp.clone(),
+                            goal_id: goal_id.map(|s| s.to_string()),
+                            message: format!(
+                                "profile '{}' cannot be used for both Executor and Reviewer roles under StrictProfileDiversity",
+                                rp
+                            ),
+                        }));
+                    }
+                }
+
+                Ok(())
             }
         }
-
-        Ok(())
     }
 
     /// Check if profile separation is satisfied without returning an error.
     pub fn is_separated(&self) -> bool {
         self.validate(None).is_ok()
+    }
+
+    /// Returns true if the config uses IsolatedSessions (single-profile OK).
+    pub fn is_isolated_sessions(&self) -> bool {
+        self.role_isolation_policy == RoleIsolationPolicy::IsolatedSessions
+    }
+
+    /// Returns true if the environment supports StrictProfileDiversity
+    /// (i.e., at least two distinct profiles are configured).
+    pub fn strict_diversity_operational(&self) -> bool {
+        let profiles: std::collections::HashSet<&str> = std::collections::HashSet::from_iter([
+            self.planner_profile_id.as_str(),
+            self.evaluator_profile_id.as_str(),
+        ]);
+        profiles.len() >= 2
     }
 }
 

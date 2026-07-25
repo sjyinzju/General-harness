@@ -26,7 +26,7 @@ use super::validation::{check_completion_gate, validate_plan_proposal};
 use super::{
     ApprovalRequest, ApprovalState, ApprovalType, CriterionStatus, GoalLoopRunState,
     GoalObservation, GoalRuntimeConfig, PlanProposal, ProfileSeparationError,
-    ProgressAssessmentProposal, ReplanDecision, ReplanTrigger,
+    ProgressAssessmentProposal, ReplanDecision, ReplanTrigger, RoleIsolationPolicy,
 };
 
 /// Context passed to the Goal Planner LLM.
@@ -80,13 +80,29 @@ impl GoalLoopService {
         }
     }
 
-    /// Configure the service with planner/evaluator profiles and enforce separation.
+    /// Configure the service with planner/evaluator profiles and enforce separation
+    /// according to the given isolation policy.
     pub fn with_goal_profiles(
-        mut self,
+        self,
         planner_profile: RuntimeProfile,
         evaluator_profile: RuntimeProfile,
     ) -> Result<Self, Box<ProfileSeparationError>> {
+        self.with_goal_profiles_and_policy(
+            planner_profile,
+            evaluator_profile,
+            RoleIsolationPolicy::default(),
+        )
+    }
+
+    /// Configure profiles with an explicit isolation policy.
+    pub fn with_goal_profiles_and_policy(
+        mut self,
+        planner_profile: RuntimeProfile,
+        evaluator_profile: RuntimeProfile,
+        policy: RoleIsolationPolicy,
+    ) -> Result<Self, Box<ProfileSeparationError>> {
         let config = GoalRuntimeConfig {
+            role_isolation_policy: policy,
             planner_profile_id: planner_profile.id.clone(),
             evaluator_profile_id: evaluator_profile.id.clone(),
             executor_profile_ids: vec![],
@@ -887,19 +903,19 @@ mod profile_separation_tests {
         }
     }
 
+    // ── IsolatedSessions (default) ─────────────────────────────────
+
     #[tokio::test]
-    async fn test_profile_separation_planner_equals_evaluator_rejected() {
+    async fn test_isolated_sessions_same_profile_accepted() {
         let svc = make_test_service().await;
         let profile = make_profile("claude-1", "claude");
+        // Same profile for planner and evaluator is OK under IsolatedSessions
         let result = svc.with_goal_profiles(profile.clone(), profile);
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.to_string().contains("ProfileSeparationViolation"));
-        assert!(err.role_a == "GoalPlanner" || err.role_b == "GoalPlanner");
+        assert!(result.is_ok());
     }
 
     #[tokio::test]
-    async fn test_profile_separation_different_profiles_accepted() {
+    async fn test_isolated_sessions_different_profiles_accepted() {
         let svc = make_test_service().await;
         let planner = make_profile("claude-1", "claude");
         let evaluator = make_profile("codex-1", "codex");
@@ -907,15 +923,64 @@ mod profile_separation_tests {
         assert!(result.is_ok());
         let svc = result.unwrap();
         assert!(svc.runtime_config.is_some());
-        assert!(svc.runtime_config.unwrap().is_separated());
+        let cfg = svc.runtime_config.unwrap();
+        assert!(cfg.is_separated());
+        assert!(cfg.is_isolated_sessions());
     }
 
     #[tokio::test]
-    async fn test_profile_separation_executor_equals_reviewer_rejected() {
+    async fn test_isolated_sessions_same_executor_reviewer_accepted() {
+        let svc = make_test_service().await;
+        let planner = make_profile("claude-1", "claude");
+        let evaluator = make_profile("claude-1", "claude");
+        let svc = svc.with_goal_profiles(planner, evaluator).unwrap();
+        // Same profile for executor and reviewer is OK under IsolatedSessions
+        let result = svc.with_task_profiles(vec!["claude-1".into()], vec!["claude-1".into()]);
+        assert!(result.is_ok());
+    }
+
+    // ── StrictProfileDiversity ──────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_strict_diversity_planner_equals_evaluator_rejected() {
+        let svc = make_test_service().await;
+        let profile = make_profile("claude-1", "claude");
+        let result = svc.with_goal_profiles_and_policy(
+            profile.clone(),
+            profile,
+            RoleIsolationPolicy::StrictProfileDiversity,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("ProfileSeparationViolation"));
+        assert!(err.role_a == "GoalPlanner" || err.role_b == "GoalPlanner");
+    }
+
+    #[tokio::test]
+    async fn test_strict_diversity_different_profiles_accepted() {
         let svc = make_test_service().await;
         let planner = make_profile("claude-1", "claude");
         let evaluator = make_profile("codex-1", "codex");
-        let svc = svc.with_goal_profiles(planner, evaluator).unwrap();
+        let result = svc.with_goal_profiles_and_policy(
+            planner,
+            evaluator,
+            RoleIsolationPolicy::StrictProfileDiversity,
+        );
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_strict_diversity_executor_equals_reviewer_rejected() {
+        let svc = make_test_service().await;
+        let planner = make_profile("claude-1", "claude");
+        let evaluator = make_profile("codex-1", "codex");
+        let svc = svc
+            .with_goal_profiles_and_policy(
+                planner,
+                evaluator,
+                RoleIsolationPolicy::StrictProfileDiversity,
+            )
+            .unwrap();
         let result = svc.with_task_profiles(vec!["codex-1".into()], vec!["codex-1".into()]);
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -925,13 +990,32 @@ mod profile_separation_tests {
     }
 
     #[tokio::test]
-    async fn test_profile_separation_different_executor_reviewer_accepted() {
+    async fn test_strict_diversity_different_executor_reviewer_accepted() {
         let svc = make_test_service().await;
         let planner = make_profile("claude-1", "claude");
         let evaluator = make_profile("codex-1", "codex");
-        let svc = svc.with_goal_profiles(planner, evaluator).unwrap();
+        let svc = svc
+            .with_goal_profiles_and_policy(
+                planner,
+                evaluator,
+                RoleIsolationPolicy::StrictProfileDiversity,
+            )
+            .unwrap();
         let result = svc.with_task_profiles(vec!["codex-1".into()], vec!["claude-1".into()]);
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_strict_diversity_unavailable_with_one_profile() {
+        let svc = make_test_service().await;
+        let profile = make_profile("claude-1", "claude");
+        let svc = svc.with_goal_profiles(profile.clone(), profile).unwrap();
+        let cfg = svc.runtime_config.unwrap();
+        // With only one profile, StrictProfileDiversity is not operational
+        assert!(!cfg.strict_diversity_operational());
+        // But IsolatedSessions works fine
+        assert!(cfg.is_isolated_sessions());
+        assert!(cfg.is_separated());
     }
 
     #[tokio::test]
