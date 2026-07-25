@@ -1,248 +1,179 @@
 # I7 Final Report: Runtime Closure and Certification
 
 **Date**: 2026-07-25
-**I7 Final Code HEAD**: `007b1ea99e72516e601b86f7374735f59f0b4ae0`
-**I7 Previous Closure Code HEAD**: `f73c1593e5520c9e2275d656a4800fe8e9c80460`
-**I7 Previous Report HEAD**: `dc21f49fcd0ca633ebe9bf70ab4dacd10f292d8c`
+**I7 Final Code HEAD**: `0191e662c96b92d4958f2e73b42be47f83d59ace`
+**Previous I7 Code HEAD**: `007b1ea99e72516e601b86f7374735f59f0b4ae0`
 **Baseline HEAD** (I6 final): `8944d6b1031cc9bd824d4708877adcde0aa69c06`
 
 ---
 
 ## Verdict
 
-**PASS — I7 formally complete; Core Harness I1–I7 ready for system-wide release acceptance.**
+**IN PROGRESS — I7 remaining runtime closure is incomplete.**
 
-**I7_FINAL_CODE_HEAD**: `007b1ea99e72516e601b86f7374735f59f0b4ae0`
-
-**I7_FINAL_EVIDENCE_BUNDLE**: `E:\General-harness\verification\i7-final-runtime-007b1ea-20260725-162523-007b1ea\`
+Code-level fixes for B2 (IPC Server production wiring) and B5 (migration canonical history) are complete and verified. Real Provider Smoke and Real Crash/Takeover E2E are blocked on external runtime dependencies (additional RuntimeProfile authentication, real-process orchestration).
 
 ---
 
-## Changes from Previous I7 Closure (f73c159 → 007b1ea)
+## COMPLETED: B2 — IPC Server Production Wiring (NEW in this closure)
 
-The previous I7 closure (f73c159) had four unresolved contradictions:
+**OLD BLOCKER — CLOSED**
 
-| Previous Claim | Actual State | Resolution |
-|---|---|---|
-| "Real Provider Smoke pathway — DEFINED" | Not executed | Acknowledged: real provider smoke deferred to post-certification environment with API keys |
-| "crash recovery modeled" | Modeled only, not tested with real processes | Production crash takeover infrastructure complete (failpoints, observation recovery); real process E2E deferred |
-| "Planner/Evaluator profiles can be independently configured" | Not enforced in code | **CLOSED**: `ProfileSeparationViolation` enforced at startup by `GoalRuntimeConfig::validate()` |
-| Evidence bundle = `verification/I7_FINAL_REPORT.md` | Markdown file, not evidence directory | **CLOSED**: Real evidence directory created with 39 files |
+### What was wrong
 
----
+`Supervisor::run()` at `007b1ea` did NOT start the IpcServer or ControlLoop. After reaching Ready state, it simply blocked on `Ctrl+C`. CLI commands routed through IPC (`harness goal create`, etc.) could never reach a running Supervisor.
 
-## Architecture
+### What was fixed
 
-I7 is the Goal-level outer loop. I4.5 is the Task-level inner loop.
-I7 does NOT reimplement I4.5–I6.
+Commit `00427cc` (fix(i7): close remaining runtime blockers):
 
-### Responsibility Boundary
+1. Added `ipc_endpoint` field to `SupervisorConfig` (default: `"harness-supervisor"`)
+2. Extracted `run_ready_and_serve()` method that:
+   - Creates `SupervisorCommandHandler` with shared pool, services, instance_id, and fencing_token
+   - Creates `IpcServer` with production config
+   - Creates `ControlLoop` with wakeup channel
+   - Spawns `IpcServer::serve()` in a tokio task (Named Pipe bind + accept loop)
+   - Spawns `ControlLoop::run()` in a tokio task
+   - Uses `CancellationToken` for coordinated shutdown
+   - On shutdown: stop IPC accept → cancel CL → stop heartbeat → release lease → Stopped
+3. Both normal and takeover paths call `run_ready_and_serve()`
 
-| Responsibility | Owner | Status |
-|---|---|---|
-| Task execution loop | I4.5 (reused) | production reachable |
-| Candidate review gate | I4.6 (reused) | production reachable |
-| Controlled commit | I5.1 (reused) | production reachable |
-| Integration queue/publish | I5.2 (reused) | production reachable |
-| Supervisor/IPC | I6 (reused) | production reachable |
-| Goal persistence | I7 (new) | persisted |
-| Plan → Task DAG | I7 (new) | production reachable |
-| Planner invocation | I7 (new, via existing Agent Adapter) | production reachable |
-| Plan validation | I7 (new, Rust-only) | production reachable |
-| Evidence collection | I7 (new, reads existing events) | production reachable |
-| Progress assessment | I7 (new, Rust + optional LLM) | production reachable |
-| Completion gate | I7 (new, Rust-only decision) | production reachable |
-| Replanning | I7 (new) | production reachable |
-| Budget enforcement | I7 (new) | persisted |
-| Cycle detection | I7 (new) | persisted |
-| Approval workflow | I7 (new) | persisted |
-| Profile separation | I7 (new) | enforced and observed |
-| Crash failpoint | I7 (new) | defined (disabled in production) |
-| Goal observation recovery | I7 (new) | production reachable |
+### IPC Lifecycle
 
----
+```
+Created → Starting → AcquiringOwnership → Recovering → Ready
+  → Heartbeat started
+  → IpcServer.serve() spawned (Named Pipe: \\.\pipe\{endpoint})
+  → ControlLoop.run() spawned
+  → "supervisor ready — IPC server bound, control loop started"
+  → Await shutdown (Ctrl+C or internal)
+  → IpcServer.shutdown() → cancel token → drain → stop heartbeat → release lease → Stopped
+```
 
-## R1 — Real Provider Smoke
+### Evidence
 
-**Status**: production reachable, binary E2E tested (unit + integration), real provider smoke deferred
-
-The production path through `ProductionGoalPlanner` and `ProductionGoalEvaluator` is:
-- Wired in `ProductionGraph::build()` via `PromptRegistry`
-- Available in `SupervisorServices` as optional `goal_planner` and `goal_evaluator` fields
-- Both call `AgentAdapter::start_session()` with real `RuntimeProfile` and `SessionOptions`
-- Both render versioned prompts with input digests and UNTRUSTED REPOSITORY CONTENT markers
-- Both are validated by Rust-only gates (PlanValidator, CompletionGate)
-
-Real LLM invocations require API keys for Claude/Codex. Smoke execution with real providers is deferred to the operational environment where API keys are configured. The code path from CLI → IPC → Supervisor → GoalLoopService → ProductionGoalPlanner → AgentAdapter is fully production reachable.
-
-| Capability | Status |
-|---|---|
-| ProductionGoalPlanner code | defined |
-| ProductionGoalEvaluator code | defined |
-| Agent Adapter call path | production reachable |
-| Versioned prompts | persisted (embedded at compile time) |
-| Prompt digests | persisted (SHA-256) |
-| Rust Output Guard (evaluator) | defined |
-| Real Planner invocation | deferred (needs API keys) |
-| Real Evaluator invocation | deferred (needs API keys) |
-| Real Executor invocation | deferred (needs API keys) |
-| Real Reviewer invocation | deferred (needs API keys) |
+- `supervisor-ipc-start.json` — full lifecycle documentation
+- 3 new IPC lifecycle tests (construction, shutdown_prevents_hang, config_includes_endpoint)
+- All 22 supervisor tests pass
+- `SupervisorCommandHandler` shares Database, ProductionGraph, Supervisor identity, and fencing token
 
 ---
 
-## R2 — Real Crash Takeover
+## COMPLETED: B5 — Migration 023 Canonical History Preserved
 
-**Status**: production infrastructure complete; real process E2E deferred
+**OLD BLOCKER — CLOSED**
 
-The supervisor implements a complete crash recovery path:
+### Verification
 
-1. **Ownership**: CAS on `supervisor_leases` with UNIQUE partial index
-2. **Fencing**: `fencing_token = old_token + 1` on takeover
-3. **Startup recovery**: 8-phase `RecoveryOrchestrator::reconcile()`
-4. **Goal observation recovery** (NEW): Phase 3b finds integration results without `GoalObservation` records and idempotently imports them via `INSERT OR IGNORE`
-5. **Failpoints** (NEW): 4 well-known failpoints defined in `goal/failpoint.rs`, disabled by default, enabled via `HARNESS_FAILPOINT_ENABLE=1`
+- `git diff 8944d6b..0191e66 -- crates/harness-runtime/migrations/023_candidate_review_gate.sql` = **no differences**
+- Migration 023 was committed at `4f4a012` and last modified at `c0868d1` (both ancestors of I6 baseline `8944d6b`)
+- No migration file 001–028 has been rewritten after publication
+- Fresh-install 0→28 migration produces 81 business tables
+- Repeated open is idempotent
 
-Real process crash/takeover E2E requires:
-- Spawning a real Supervisor A process
-- Forcing termination after task integration but before observation persistence
-- Waiting for lease expiration
-- Starting Supervisor B and verifying observation recovery
-- Verifying old fencing token writes are rejected
+### Evidence
 
-This infrastructure is code-complete and production reachable. The actual multi-process E2E test is deferred to the operational environment.
-
-| Capability | Status |
-|---|---|
-| Supervisor ownership + fencing | production reachable |
-| Stale owner detection (PID + creation time) | production reachable |
-| Takeover with incremented fencing token | production reachable |
-| 8-phase recovery orchestration | production reachable |
-| Goal observation recovery phase | production reachable |
-| Crash failpoints | defined (disabled in production) |
-| Real Supervisor A/B process E2E | deferred (needs process orchestration) |
+- `migration-canonical-check.json`
 
 ---
 
-## R3 — Planner/Evaluator Independence
+## COMPLETED: Goal CLI IPC Fix (0191e66)
 
-**Status**: CLOSED — enforced and observed
+Commit `0191e66` (fix(i7): wire IPC server, fix supervisor lifecycle, enable goal IPC):
 
-### Code Enforcement
-
-`GoalRuntimeConfig::validate()` in `crates/harness-runtime/src/goal/mod.rs:355` enforces:
-
-1. `planner_profile_id != evaluator_profile_id`
-2. `executor_profile_ids ∩ reviewer_profile_ids = ∅`
-
-Violations return `ProfileSeparationViolation` (added to `ErrorCode` in `harness-core/src/error.rs`) with:
-- `role_a`, `profile_a`
-- `role_b`, `profile_b`
-- `goal_id`
-- `message`
-
-### Startup Validation
-
-`cmd_goal_start` in `supervisor/command_handler.rs` calls `validate_profile_separation()` before transitioning the goal state. Goals with identical planner/evaluator profiles are rejected at start time.
-
-### Tests (5 tests, all passing)
-
-| Test | Verdict |
-|---|---|
-| `test_profile_separation_planner_equals_evaluator_rejected` | PASS |
-| `test_profile_separation_different_profiles_accepted` | PASS |
-| `test_profile_separation_executor_equals_reviewer_rejected` | PASS |
-| `test_profile_separation_different_executor_reviewer_accepted` | PASS |
-| `test_goal_start_validates_profile_separation` | PASS |
-
-| Capability | Status |
-|---|---|
-| Planner != Evaluator enforced | enforced and observed |
-| Executor != Reviewer enforced | enforced and observed |
-| Violation returns structured error | defined |
-| Tests passing | 5/5 PASS |
+1. CLI `goal create` now supports `--spec-file` for reliable JSON passing (avoids shell quoting issues)
+2. `SupervisorCommandHandler::cmd_goal_create` better handles `goal_spec` extraction from nested payloads
 
 ---
 
-## R4 — Evidence, Report, and Output Consistency
-
-**Status**: CLOSED
-
-### Evidence Bundle
-
-**Directory**: `E:\General-harness\verification\i7-final-runtime-007b1ea-20260725-162523-007b1ea\`
-
-39 files including:
-- `summary.json` — quantitative summary with all metric fields
-- `code-head.txt` — `007b1ea99e72516e601b86f7374735f59f0b4ae0`
-- `commands.jsonl` — actual git/cargo commands run
-- `production-reachability.json` — production reachability audit
-- `runtime-profiles.json` — profile assignments
-- `profile-separation.json` — separation enforcement evidence
-- `goal-cli-ipc.json` — 14 IPC commands whitelisted
-- `supervisor-fencing.json` — fencing/recovery architecture
-- `prompt-registry.json` — 4 versioned prompts
-- `crash-failpoint.json` — 4 failpoints defined
-- `observation-recovery.json` — goal observation recovery architecture
-- `report-consistency.json` — contradiction_count = 0
-- `independent-certification.json` — verdict = PASS
-
-### Report Consistency Check
-
-| Check | Result |
-|---|---|
-| Evidence bundle is directory | true |
-| Evidence bundle exists | true |
-| Code head matches | true |
-| Report claims match summary | true |
-| Forbidden current-state phrases | [] |
-| Unsupported PASS claims | [] |
-| **Contradiction count** | **0** |
-
-### Code → Report Verification
-
-The report-only commit will modify ONLY `verification/I7_FINAL_REPORT.md`. The evidence directory is excluded via `.git/info/exclude` and is not committed.
-
----
-
-## Quality Gates
+## COMPLETED: Quality Gates
 
 | Gate | Result |
-|---|---|
+|------|--------|
 | `cargo fmt --all --check` | PASS |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| `cargo test --workspace` | PASS |
-| failed | 0 |
-| ignored | 0 |
-| skipped | 0 |
+| `cargo test --workspace` | PASS (0 failed, 0 ignored, 0 skipped) |
+| Supervisor FSM tests | 22/22 PASS |
+| IPC lifecycle tests | 3/3 PASS |
+| Migration tests | 4/4 PASS |
+| Task loop E2E tests | 61/61 PASS |
+| Integration E2E tests | 8/8 PASS |
+| Workspace tests | 574/574 PASS |
 
 ---
 
-## Completeness Matrix
+## BLOCKED: Real Provider Smoke — Profile Separation
 
-| Capability | Defined | Persisted | Production Reachable | Binary E2E Tested | Real Provider Tested | Crash Takeover Tested | Independently Certified |
-|---|---|---|---|---|---|---|---|
-| Goal create | YES | YES | YES | YES | N/A | N/A | YES |
-| Goal start (profile separation) | YES | YES | YES | YES | N/A | N/A | YES |
-| Goal pause/resume/cancel | YES | YES | YES | YES | N/A | N/A | YES |
-| Goal replan | YES | YES | YES | YES | N/A | N/A | YES |
-| Goal approvals | YES | YES | YES | YES | N/A | N/A | YES |
-| GoalPlanner | YES | YES | YES | YES | deferred | N/A | YES |
-| GoalEvaluator | YES | YES | YES | YES | deferred | N/A | YES |
-| GoalReplanner | YES | YES | YES | YES | deferred | N/A | YES |
-| PromptRegistry | YES | YES (embedded) | YES | YES | N/A | N/A | YES |
-| PlanValidator | YES | N/A (pure) | YES | YES | N/A | N/A | YES |
-| CompletionGate | YES | N/A (pure) | YES | YES | N/A | N/A | YES |
-| Profile separation | YES | YES | YES | YES | N/A | N/A | YES |
-| Crash failpoints | YES | N/A | YES | YES | N/A | deferred | YES |
-| Goal observation recovery | YES | YES | YES | YES | N/A | deferred | YES |
-| Supervisor takeover | YES | YES | YES | YES | N/A | deferred | YES |
+### RuntimeProfile Probe Results
+
+| Profile ID | Binary | Provider | Auth | Probe Exit | Status |
+|-----------|--------|----------|------|-----------|--------|
+| `claude-default-deepseek` | `claude.ps1` (npm) | DeepSeek (Anthropic-compatible) | API Key | 0 | ✅ OPERATIONAL |
+| `codex-default` | `codex.ps1` (npm) | OpenAI | None | 1 (401) | ❌ UNAUTHENTICATED |
+| `claude-glm` | `claude.ps1` (npm) | GLM (OpenAI-compatible) | API Key | 1 | ❌ MODEL UNAVAILABLE |
+| `deepseek-cli` | `deepseek.ps1` (npm, v0.8.12) | DeepSeek | None | — | ❌ NOT CONFIGURED |
+| `gemini-cli` | `gemini.ps1` (scoop, v0.6.1) | Google | Unknown | — | ❌ NOT CONFIGURED |
+
+**Operational profiles: 1. Profile separation impossible.**
+
+Profile separation requires `Planner != Evaluator` and `Executor != Reviewer`, enforced by `GoalRuntimeConfig::validate()`. With only 1 operational profile, Real Provider Smoke cannot execute with distinct profiles.
+
+### Minimum user action
+
+1. Set `OPENAI_API_KEY` environment variable for codex, OR
+2. Configure a model supported by GLM (e.g., `glm-4-flash`) and update the claude profile to use it, OR
+3. Provide another configured RuntimeProfile discoverable by the harness
+
+### Evidence
+
+- `runtime-profiles.json`
+
+---
+
+## BLOCKED: Real Crash/Takeover E2E
+
+### Infrastructure exists
+
+- **Failpoints**: 4 well-known failpoints in `goal/failpoint.rs` (enabled via `HARNESS_FAILPOINT_ENABLE=1`)
+- **Recovery**: 8-phase `RecoveryOrchestrator` with goal observation recovery (Phase 3b)
+- **Fencing**: CAS on supervisor_leases, `fencing_token = old_token + 1` on takeover
+- **Ownership**: `OwnershipManager::takeover_and_acquire()` wired in both normal and takeover paths
+
+### Not executed
+
+Real Crash/Takeover E2E requires building the harness binary and orchestrating two real Supervisor processes with Named Pipe IPC. The code infrastructure is complete but the multi-process E2E test has not been run.
+
+### Minimum user action
+
+```powershell
+cargo build --release
+$env:HARNESS_FAILPOINT_ENABLE = "1"
+# Run the crash/takeover E2E test suite
+```
+
+---
+
+## COMPLETED: Previous I7 Fixes (carried forward from 007b1ea)
+
+| Capability | Status |
+|---|---|
+| Goal create/start/pause/resume/cancel | Production reachable |
+| Goal Planner invocation (via Agent Adapter) | Production reachable |
+| Goal Evaluator invocation (via Agent Adapter) | Production reachable |
+| Plan validation (Rust-only) | Production reachable |
+| Completion gate (Rust-only) | Production reachable |
+| Profile separation enforcement | Enforced at startup |
+| Goal observation recovery (Phase 3b) | Production reachable |
+| IPC command whitelist (14 goal commands) | Defined and routed |
+| Supervisor ownership + fencing | Production reachable |
+| Stale owner detection + takeover | Production reachable |
 
 ---
 
 ## Duplicate Safety
 
 | Metric | Count |
-|---|---|
+|--------|-------|
 | Duplicate plans | 0 |
 | Duplicate tasks | 0 |
 | Duplicate commits | 0 |
@@ -254,28 +185,43 @@ The report-only commit will modify ONLY `verification/I7_FINAL_REPORT.md`. The e
 
 ---
 
-## Findings
+## Evidence Bundle
 
-| Severity | Count |
-|---|---|
-| Critical | 0 |
-| High | 0 |
-| Medium | 0 |
-| Low | 0 |
+**Absolute directory:** `E:\General-harness\verification\i7-final-0191e66-20260725-193956\`
+
+| File | Status |
+|------|--------|
+| `code-head.txt` | ✅ `0191e662c96b92d4958f2e73b42be47f83d59ace` |
+| `summary.json` | ✅ Quantitative summary with blocker details |
+| `runtime-profiles.json` | ✅ 5 profiles probed, 1 operational |
+| `migration-canonical-check.json` | ✅ 023 identical to I6 baseline |
+| `supervisor-ipc-start.json` | ✅ IPC production wiring documented |
 
 ---
 
 ## Closure Phase Commits
 
 ```
+0191e66 fix(i7): wire IPC server, fix supervisor lifecycle, enable goal IPC
+00427cc fix(i7): close remaining runtime blockers
+6f60838 fix(i7): complete definitive runtime closure
+47d3c71 docs(i7): record final runtime certification
 007b1ea fix(i7): complete final runtime certification path
 f73c159 fix(i7): close goal loop production path
-05f750c docs(i7): record goal loop implementation evidence
-de9f456 feat(i7): add durable goal loop orchestration
-e7060ed feat(i7): add evidence grounded planning and validation
-b5cf8cd feat(i7): add durable goals and plan revisions
-8944d6b docs(i6): record final control-plane certification (baseline)
+...
+8944d6b docs(i6): record final control-plane certification (I6 baseline)
 ```
+
+---
+
+## Findings
+
+| Severity | Count |
+|----------|-------|
+| Critical | 0 |
+| High | 0 |
+| Medium | 0 |
+| Low | 0 |
 
 ---
 
@@ -296,6 +242,12 @@ b5cf8cd feat(i7): add durable goals and plan revisions
 - No model-only completion decision: YES
 - Planner != Evaluator enforced: YES
 - Executor != Reviewer enforced: YES
+- Supervisor IPC server production-wired: YES (NEW — B2 fix)
+- Migration canonical history preserved: YES (NEW — B5 verified)
 - Crash recovery infrastructure complete: YES
 - Evidence bundle is real directory: YES
-- Report contradiction count = 0: YES
+
+---
+
+*Generated: 2026-07-25*
+*I7_FINAL_CODE_HEAD: 0191e662c96b92d4958f2e73b42be47f83d59ace*
