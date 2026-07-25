@@ -156,11 +156,26 @@ impl Supervisor {
         let instance = self.create_instance(state_directory_id).await?;
         *self.instance.write().await = Some(instance.clone());
 
-        // 2. Starting → AcquiringOwnership
+        // 2. Created → Starting
+        self.transition_to(SupervisorState::Starting, &instance)
+            .await?;
+
+        // Refresh instance state (transition_to updates self.instance, not local var)
+        let instance = {
+            let guard = self.instance.read().await;
+            guard.as_ref().unwrap().clone()
+        };
+
+        // 3. Starting → AcquiringOwnership
         self.transition_to(SupervisorState::AcquiringOwnership, &instance)
             .await?;
 
-        // 3. Acquire ownership (CAS on supervisor_leases)
+        let instance = {
+            let guard = self.instance.read().await;
+            guard.as_ref().unwrap().clone()
+        };
+
+        // 4. Acquire ownership (CAS on supervisor_leases)
         let result = self.ownership.acquire(&instance).await;
 
         match result {
@@ -183,6 +198,17 @@ impl Supervisor {
                     fencing_token = instance.fencing_token,
                     "supervisor ready"
                 );
+
+                // Block until shutdown signal (Ctrl+C)
+                tracing::info!("supervisor waiting for shutdown signal...");
+                tokio::signal::ctrl_c().await.map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::Internal,
+                        format!("signal error: {e}"),
+                        ErrorSource::System,
+                    )
+                })?;
+                tracing::info!("shutdown signal received, draining...");
 
                 Ok(())
             }
@@ -223,6 +249,17 @@ impl Supervisor {
                         fencing_token = updated_instance.fencing_token,
                         "supervisor ready (after takeover)"
                     );
+
+                    // Block until shutdown signal
+                    tracing::info!("supervisor (takeover) waiting for shutdown signal...");
+                    tokio::signal::ctrl_c().await.map_err(|e| {
+                        CoreError::new(
+                            ErrorCode::Internal,
+                            format!("signal error: {e}"),
+                            ErrorSource::System,
+                        )
+                    })?;
+                    tracing::info!("shutdown signal received, draining...");
 
                     Ok(())
                 } else {
@@ -363,6 +400,12 @@ impl Supervisor {
         })
     }
 
+    /// Get a clone of the current instance (refreshing from in-memory state).
+    #[allow(dead_code)]
+    async fn current_instance(&self) -> SupervisorInstance {
+        self.instance.read().await.as_ref().unwrap().clone()
+    }
+
     /// Get current fencing token.
     pub async fn fencing_token(&self) -> Option<i64> {
         self.instance.read().await.as_ref().map(|i| i.fencing_token)
@@ -430,9 +473,15 @@ impl Supervisor {
         new_state: SupervisorState,
         instance: &SupervisorInstance,
     ) -> Result<(), CoreError> {
-        // Validate transition
+        // Read current state from in-memory instance (may be newer than the parameter)
+        let current_state = {
+            let guard = self.instance.read().await;
+            guard.as_ref().map(|i| i.state).unwrap_or(instance.state)
+        };
+
+        // Validate transition against the freshest state
         self.fsm
-            .validate_transition(instance.state, new_state)
+            .validate_transition(current_state, new_state)
             .map_err(|e| {
                 CoreError::new(
                     ErrorCode::InvalidStateTransition {
@@ -444,8 +493,22 @@ impl Supervisor {
                 )
             })?;
 
-        // Build event for this transition
+        // Update in-memory instance state FIRST (before potentially skipping event)
+        {
+            let mut guard = self.instance.write().await;
+            if let Some(ref mut inst) = *guard {
+                inst.state = new_state;
+            }
+        }
+
+        // Build event for this transition (some states don't need events)
         let event = match new_state {
+            SupervisorState::Starting => SupervisorEvent::SupervisorStarting {
+                instance_id: instance.instance_id.clone(),
+                pid: instance.pid,
+                process_started_at: instance.process_started_at,
+                occurred_at: Utc::now(),
+            },
             SupervisorState::AcquiringOwnership => SupervisorEvent::SupervisorStarting {
                 instance_id: instance.instance_id.clone(),
                 pid: instance.pid,
@@ -475,11 +538,18 @@ impl Supervisor {
                 occurred_at: Utc::now(),
             },
             SupervisorState::Recovering | SupervisorState::TakingOver => {
-                // These transitions are handled by the caller
+                // Persist state update without event
+                self.repo
+                    .update_state_no_event(&instance.instance_id, new_state)
+                    .await?;
                 return Ok(());
             }
             _ => {
-                return Ok(()); // No event needed for other transitions
+                // Created or other states: persist state update without event
+                self.repo
+                    .update_state_no_event(&instance.instance_id, new_state)
+                    .await?;
+                return Ok(());
             }
         };
 
@@ -487,12 +557,6 @@ impl Supervisor {
         self.repo
             .update_state_and_append_event(&instance.instance_id, new_state, &event)
             .await?;
-
-        // Update in-memory instance
-        let mut guard = self.instance.write().await;
-        if let Some(ref mut inst) = *guard {
-            inst.state = new_state;
-        }
 
         Ok(())
     }

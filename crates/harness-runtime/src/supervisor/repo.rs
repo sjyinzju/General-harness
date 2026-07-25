@@ -113,6 +113,32 @@ impl SupervisorRepo {
         Ok(row.map(|r| r.into()))
     }
 
+    /// Update the instance state without appending an event.
+    /// Used for transitions that don't need events (e.g., Starting, Recovering).
+    pub async fn update_state_no_event(
+        &self,
+        instance_id: &SupervisorInstanceId,
+        new_state: SupervisorState,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            r#"UPDATE supervisor_instances
+               SET state = ?, updated_at = datetime('now')
+               WHERE instance_id = ?"#,
+        )
+        .bind(state_str(new_state))
+        .bind(&instance_id.0)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("update supervisor state (no event): {e}"),
+                ErrorSource::System,
+            )
+        })?;
+        Ok(())
+    }
+
     /// Update the instance state and append an event in the same transaction.
     pub async fn update_state_and_append_event(
         &self,
