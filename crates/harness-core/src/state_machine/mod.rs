@@ -1,15 +1,19 @@
 pub mod commit_fsm;
 pub mod execution_fsm;
+pub mod goal_fsm;
 pub mod integration_fsm;
 pub mod lease_fsm;
+pub mod plan_fsm;
 pub mod project_fsm;
 pub mod review_fsm;
 pub mod task_fsm;
 
 pub use commit_fsm::CommitFsm;
 pub use execution_fsm::ExecutionFsm;
+pub use goal_fsm::GoalFsm;
 pub use integration_fsm::IntegrationFsm;
 pub use lease_fsm::LeaseFsm;
+pub use plan_fsm::PlanFsm;
 pub use project_fsm::ProjectFsm;
 pub use review_fsm::ReviewFsm;
 pub use task_fsm::TaskFsm;

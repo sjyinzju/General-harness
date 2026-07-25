@@ -4,6 +4,7 @@ pub mod commit;
 pub mod db;
 pub mod discovery;
 pub mod event_log;
+pub mod goal;
 pub mod idempotency;
 pub mod integration;
 pub mod ipc;

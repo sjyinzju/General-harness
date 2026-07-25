@@ -122,6 +122,22 @@ pub enum IpcCommand {
     Subscribe,
     Unsubscribe,
 
+    // Goal loop
+    GoalCreate,
+    GoalStart,
+    GoalShow,
+    GoalList,
+    GoalStatus,
+    GoalPause,
+    GoalResume,
+    GoalCancel,
+    GoalReplan,
+    GoalApprovals,
+    GoalApprove,
+    GoalReject,
+    GoalAnswer,
+    GoalEvents,
+
     // Health / Diagnostics
     Health,
     Diagnostics,
@@ -162,6 +178,22 @@ impl IpcCommand {
             "health" => Some(IpcCommand::Health),
             "diagnostics" => Some(IpcCommand::Diagnostics),
 
+            // Goal commands
+            "goal.create" => Some(IpcCommand::GoalCreate),
+            "goal.start" => Some(IpcCommand::GoalStart),
+            "goal.show" => Some(IpcCommand::GoalShow),
+            "goal.list" => Some(IpcCommand::GoalList),
+            "goal.status" => Some(IpcCommand::GoalStatus),
+            "goal.pause" => Some(IpcCommand::GoalPause),
+            "goal.resume" => Some(IpcCommand::GoalResume),
+            "goal.cancel" => Some(IpcCommand::GoalCancel),
+            "goal.replan" => Some(IpcCommand::GoalReplan),
+            "goal.approvals" => Some(IpcCommand::GoalApprovals),
+            "goal.approve" => Some(IpcCommand::GoalApprove),
+            "goal.reject" => Some(IpcCommand::GoalReject),
+            "goal.answer" => Some(IpcCommand::GoalAnswer),
+            "goal.events" => Some(IpcCommand::GoalEvents),
+
             _ => None,
         }
     }
@@ -181,6 +213,11 @@ impl IpcCommand {
                 | IpcCommand::Inspect
                 | IpcCommand::Health
                 | IpcCommand::Diagnostics
+                | IpcCommand::GoalShow
+                | IpcCommand::GoalList
+                | IpcCommand::GoalStatus
+                | IpcCommand::GoalApprovals
+                | IpcCommand::GoalEvents
         )
     }
 
@@ -211,6 +248,21 @@ impl IpcCommand {
             IpcCommand::Unsubscribe => "unsubscribe",
             IpcCommand::Health => "health",
             IpcCommand::Diagnostics => "diagnostics",
+            // Goal commands
+            IpcCommand::GoalCreate => "goal.create",
+            IpcCommand::GoalStart => "goal.start",
+            IpcCommand::GoalShow => "goal.show",
+            IpcCommand::GoalList => "goal.list",
+            IpcCommand::GoalStatus => "goal.status",
+            IpcCommand::GoalPause => "goal.pause",
+            IpcCommand::GoalResume => "goal.resume",
+            IpcCommand::GoalCancel => "goal.cancel",
+            IpcCommand::GoalReplan => "goal.replan",
+            IpcCommand::GoalApprovals => "goal.approvals",
+            IpcCommand::GoalApprove => "goal.approve",
+            IpcCommand::GoalReject => "goal.reject",
+            IpcCommand::GoalAnswer => "goal.answer",
+            IpcCommand::GoalEvents => "goal.events",
         }
     }
 }

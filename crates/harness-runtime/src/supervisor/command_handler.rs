@@ -208,6 +208,22 @@ impl IpcCommandHandler for SupervisorCommandHandler {
 
             // ── Event streaming ───────────────────────────────
             IpcCommand::Subscribe | IpcCommand::Unsubscribe => Ok(Self::unsupported(command)),
+
+            // ── Goal loop ────────────────────────────────────
+            IpcCommand::GoalCreate
+            | IpcCommand::GoalStart
+            | IpcCommand::GoalShow
+            | IpcCommand::GoalList
+            | IpcCommand::GoalStatus
+            | IpcCommand::GoalPause
+            | IpcCommand::GoalResume
+            | IpcCommand::GoalCancel
+            | IpcCommand::GoalReplan
+            | IpcCommand::GoalApprovals
+            | IpcCommand::GoalApprove
+            | IpcCommand::GoalReject
+            | IpcCommand::GoalAnswer
+            | IpcCommand::GoalEvents => Ok(Self::unsupported(command)),
         }
     }
 }

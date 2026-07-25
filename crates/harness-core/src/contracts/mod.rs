@@ -5,8 +5,10 @@ pub mod agent_identity;
 pub mod candidate;
 pub mod commit;
 pub mod discovery;
+pub mod goal;
 pub mod goal_contract;
 pub mod integration;
+pub mod plan;
 pub mod ipc;
 pub mod project;
 pub mod repository;
@@ -37,7 +39,17 @@ pub use discovery::{
     DiagnosticLevel, DiscoveredAgent, DiscoveryConfidence, DiscoveryEvidence, EvidenceKind,
     ExecutableIdentity, ProviderHint, ProviderHintSource, ValidationResult, ValidationStatus,
 };
+pub use goal::{
+    ApprovalPolicy, ConstraintType, CriterionId, CriterionSubjectivity, EvidencePolicy,
+    GoalBudget, GoalConstraint, GoalCreator, GoalId, GoalRevision, GoalSpec, GoalState,
+    SuccessCriterion, VerificationPolicy,
+};
 pub use goal_contract::{ChangeRequest, GoalContractVersion};
+pub use plan::{
+    compute_task_fingerprint, validate_dag_no_cycles, Milestone, MilestoneId, MilestoneState,
+    PlanRevision, PlanRevisionId, PlanState, PlannedTask, PlannedTaskId, PlannedTaskState,
+    RiskLevel,
+};
 pub use integration::{
     ConflictInfo, IntegrationAttempt, IntegrationAttemptId, IntegrationId, IntegrationRequest,
     IntegrationResult, IntegrationState, IntegrationStrategy, IntegrationVerificationPolicy,
