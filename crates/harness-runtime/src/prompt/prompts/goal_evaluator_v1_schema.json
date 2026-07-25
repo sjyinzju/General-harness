@@ -1,0 +1,29 @@
+{
+  "type": "object",
+  "required": ["schema_version", "overall_assessment", "criteria_assessments", "plan_sufficient", "replan_recommended", "completion_recommended", "recommendation", "summary"],
+  "properties": {
+    "schema_version": {"type": "string", "const": "1.0"},
+    "overall_assessment": {"type": "string"},
+    "criteria_assessments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["criterion_id", "status", "evidence_refs", "reason"],
+        "properties": {
+          "criterion_id": {"type": "string"},
+          "status": {"type": "string", "enum": ["satisfied", "partially_satisfied", "unsatisfied", "unknown", "blocked"]},
+          "evidence_refs": {"type": "array", "items": {"type": "string"}},
+          "reason": {"type": "string"},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "requires_human_confirmation": {"type": "boolean"}
+        }
+      }
+    },
+    "plan_sufficient": {"type": "boolean"},
+    "replan_recommended": {"type": "boolean"},
+    "completion_recommended": {"type": "boolean"},
+    "blockers": {"type": "array", "items": {"type": "string"}},
+    "recommendation": {"type": "string", "enum": ["continue", "replan", "wait_for_approval", "recommend_completion", "block"]},
+    "summary": {"type": "string"}
+  }
+}

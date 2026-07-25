@@ -14,6 +14,7 @@ pub mod operation;
 pub mod policy;
 pub mod process;
 pub mod production_graph;
+pub mod prompt;
 pub mod repo;
 pub mod resource_claim;
 pub mod review;

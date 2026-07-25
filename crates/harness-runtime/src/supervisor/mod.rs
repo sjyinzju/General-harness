@@ -52,6 +52,7 @@ use self::ownership::OwnershipManager;
 use self::repo::SupervisorRepo;
 
 use crate::commit::service::ControlledCommitService;
+use crate::goal::service::GoalLoopService;
 use crate::integration::executor::IntegrationExecutor;
 use crate::integration::recovery::IntegrationRecoveryService;
 use crate::integration::service::IntegrationQueueService;
@@ -86,6 +87,8 @@ pub struct SupervisorServices {
     pub run_context: Arc<RunContext>,
     /// Scheduler services (wrapped for Clone).
     pub scheduler_services: Arc<SchedulerServices>,
+    /// Goal loop service for I7 outer-loop orchestration.
+    pub goal_loop_service: Arc<GoalLoopService>,
     /// Repository root path for integration and commit operations.
     pub repo_root: std::path::PathBuf,
     /// Integration root path for sandboxed execution.

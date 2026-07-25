@@ -4,6 +4,8 @@
 //! Reuses existing I4.5 (TaskEngineeringLoop), I4.6 (Review), I5 (Commit/Integration),
 //! and I6 (Supervisor/OperationIntent) production paths.
 
+pub mod evaluator;
+pub mod planner;
 pub mod repo;
 pub mod service;
 pub mod validation;

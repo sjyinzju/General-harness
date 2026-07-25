@@ -31,6 +31,7 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
 use crate::commit::service::ControlledCommitService;
+use crate::goal::service::GoalLoopService;
 use crate::integration::executor::IntegrationExecutor;
 use crate::integration::recovery::IntegrationRecoveryService;
 use crate::integration::service::IntegrationQueueService;
@@ -208,6 +209,9 @@ impl ProductionGraph {
             Arc::new(IntegrationExecutor::new(pool.clone(), &integration_root));
         let integration_recovery = Arc::new(IntegrationRecoveryService::new(pool.clone()));
 
+        // ── I7: GoalLoopService ────────────────────────────────────
+        let goal_loop_service = Arc::new(GoalLoopService::new(pool.clone()));
+
         // ── I6: Supervisor repository ──────────────────────────────
         let supervisor_repo = SupervisorRepo::new(pool.clone());
 
@@ -230,6 +234,7 @@ impl ProductionGraph {
             liveness_orchestrator: liveness_orchestrator.clone(),
             run_context: run_context.clone(),
             scheduler_services: scheduler_services.clone(),
+            goal_loop_service: goal_loop_service.clone(),
             repo_root: repo_root_buf,
             integration_root: integration_root_buf,
         };

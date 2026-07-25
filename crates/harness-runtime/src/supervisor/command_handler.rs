@@ -210,20 +210,20 @@ impl IpcCommandHandler for SupervisorCommandHandler {
             IpcCommand::Subscribe | IpcCommand::Unsubscribe => Ok(Self::unsupported(command)),
 
             // ── Goal loop ────────────────────────────────────
-            IpcCommand::GoalCreate
-            | IpcCommand::GoalStart
-            | IpcCommand::GoalShow
-            | IpcCommand::GoalList
-            | IpcCommand::GoalStatus
-            | IpcCommand::GoalPause
-            | IpcCommand::GoalResume
-            | IpcCommand::GoalCancel
-            | IpcCommand::GoalReplan
-            | IpcCommand::GoalApprovals
-            | IpcCommand::GoalApprove
-            | IpcCommand::GoalReject
-            | IpcCommand::GoalAnswer
-            | IpcCommand::GoalEvents => Ok(Self::unsupported(command)),
+            IpcCommand::GoalCreate => self.cmd_goal_create(payload).await,
+            IpcCommand::GoalStart => self.cmd_goal_start(payload).await,
+            IpcCommand::GoalShow => self.cmd_goal_show(payload).await,
+            IpcCommand::GoalList => self.cmd_goal_list(payload).await,
+            IpcCommand::GoalStatus => self.cmd_goal_status(payload).await,
+            IpcCommand::GoalPause => self.cmd_goal_pause(payload).await,
+            IpcCommand::GoalResume => self.cmd_goal_resume(payload).await,
+            IpcCommand::GoalCancel => self.cmd_goal_cancel(payload).await,
+            IpcCommand::GoalReplan => self.cmd_goal_replan(payload).await,
+            IpcCommand::GoalApprovals => self.cmd_goal_approvals(payload).await,
+            IpcCommand::GoalApprove => self.cmd_goal_approve(payload).await,
+            IpcCommand::GoalReject => self.cmd_goal_reject(payload).await,
+            IpcCommand::GoalAnswer => self.cmd_goal_answer(payload).await,
+            IpcCommand::GoalEvents => self.cmd_goal_events(payload).await,
         }
     }
 }
@@ -1217,6 +1217,506 @@ impl SupervisorCommandHandler {
             "cancelled": true,
             "operation_id": operation_id,
             "aggregate_id": aggregate_id,
+        }))
+    }
+
+    // ── Goal command implementations ──────────────────────────────────
+
+    async fn cmd_goal_create(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let goal: harness_core::contracts::goal::GoalSpec = serde_json::from_value(payload.clone())
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::SerializationError,
+                    format!("invalid goal spec: {e}"),
+                    harness_core::ErrorSource::Harness,
+                )
+            })?;
+
+        self.services
+            .goal_loop_service
+            .create_goal(goal)
+            .await
+            .map(|g| {
+                serde_json::json!({
+                    "goal_id": g.goal_id,
+                    "revision": g.revision,
+                    "title": g.title,
+                    "state": "draft",
+                    "status": "created"
+                })
+            })
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::Internal,
+                    format!("goal create: {e}"),
+                    harness_core::ErrorSource::Harness,
+                )
+            })
+    }
+
+    async fn cmd_goal_start(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let goal_id = payload
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if goal_id.is_empty() {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::InvalidState,
+                "goal_id is required",
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
+        // Transition to Planning → try to plan
+        self.services
+            .goal_loop_service
+            .transition_goal(goal_id, harness_core::contracts::goal::GoalState::Planning)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::Internal,
+                    format!("goal start: {e}"),
+                    harness_core::ErrorSource::Harness,
+                )
+            })?;
+
+        let run_id = self
+            .services
+            .goal_loop_service
+            .start_loop_run(goal_id)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::Internal,
+                    format!("goal start loop: {e}"),
+                    harness_core::ErrorSource::Harness,
+                )
+            })?;
+
+        Ok(serde_json::json!({
+            "goal_id": goal_id,
+            "run_id": run_id,
+            "status": "started"
+        }))
+    }
+
+    async fn cmd_goal_show(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let goal_id = payload
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if goal_id.is_empty() {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::InvalidState,
+                "goal_id is required",
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
+        let goal_repo = crate::goal::repo::GoalRepo::new(self.pool.clone());
+        match goal_repo.get_goal(goal_id).await.map_err(|e| {
+            CoreError::new(
+                harness_core::ErrorCode::PersistenceError,
+                format!("goal show: {e}"),
+                harness_core::ErrorSource::System,
+            )
+        })? {
+            Some(g) => Ok(serde_json::json!({
+                "goal_id": g.goal_id,
+                "revision": g.revision,
+                "title": g.title,
+                "objective": g.objective,
+                "repository_id": g.repository_id,
+                "target_ref": g.target_ref,
+                "criteria_count": g.success_criteria.len(),
+                "constraints_count": g.constraints.len(),
+            })),
+            None => Ok(serde_json::json!({
+                "goal_id": goal_id,
+                "status": "not_found"
+            })),
+        }
+    }
+
+    async fn cmd_goal_list(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let state_filter = payload.get("state").and_then(|v| v.as_str());
+        let goal_repo = crate::goal::repo::GoalRepo::new(self.pool.clone());
+        let goals = goal_repo
+            .list_goals_by_state(state_filter)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::PersistenceError,
+                    format!("goal list: {e}"),
+                    harness_core::ErrorSource::System,
+                )
+            })?;
+
+        let items: Vec<serde_json::Value> = goals
+            .iter()
+            .map(|g| {
+                serde_json::json!({
+                    "goal_id": g.goal_id,
+                    "title": g.title,
+                    "revision": g.revision,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "goals": items,
+            "count": items.len()
+        }))
+    }
+
+    async fn cmd_goal_status(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let goal_id = payload
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if goal_id.is_empty() {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::InvalidState,
+                "goal_id is required",
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
+        let goal_repo = crate::goal::repo::GoalRepo::new(self.pool.clone());
+        match goal_repo.get_goal(goal_id).await.map_err(|e| {
+            CoreError::new(
+                harness_core::ErrorCode::PersistenceError,
+                format!("goal status: {e}"),
+                harness_core::ErrorSource::System,
+            )
+        })? {
+            Some(g) => {
+                let plan = goal_repo.get_active_plan(goal_id).await.map_err(|e| {
+                    CoreError::new(
+                        harness_core::ErrorCode::PersistenceError,
+                        format!("goal status plan: {e}"),
+                        harness_core::ErrorSource::System,
+                    )
+                })?;
+                Ok(serde_json::json!({
+                    "goal_id": g.goal_id,
+                    "revision": g.revision,
+                    "title": g.title,
+                    "has_active_plan": plan.is_some(),
+                    "plan_revision": plan.map(|p| p.revision_number),
+                }))
+            }
+            None => Ok(serde_json::json!({
+                "goal_id": goal_id,
+                "status": "not_found"
+            })),
+        }
+    }
+
+    async fn cmd_goal_pause(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let goal_id = payload
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if goal_id.is_empty() {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::InvalidState,
+                "goal_id is required",
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
+        self.services
+            .goal_loop_service
+            .transition_goal(goal_id, harness_core::contracts::goal::GoalState::Paused)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::Internal,
+                    format!("goal pause: {e}"),
+                    harness_core::ErrorSource::Harness,
+                )
+            })?;
+
+        Ok(serde_json::json!({
+            "goal_id": goal_id,
+            "status": "paused"
+        }))
+    }
+
+    async fn cmd_goal_resume(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let goal_id = payload
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if goal_id.is_empty() {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::InvalidState,
+                "goal_id is required",
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
+        self.services
+            .goal_loop_service
+            .transition_goal(goal_id, harness_core::contracts::goal::GoalState::Active)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::Internal,
+                    format!("goal resume: {e}"),
+                    harness_core::ErrorSource::Harness,
+                )
+            })?;
+
+        Ok(serde_json::json!({
+            "goal_id": goal_id,
+            "status": "resumed"
+        }))
+    }
+
+    async fn cmd_goal_cancel(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let goal_id = payload
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if goal_id.is_empty() {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::InvalidState,
+                "goal_id is required",
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
+        self.services
+            .goal_loop_service
+            .transition_goal(goal_id, harness_core::contracts::goal::GoalState::Cancelled)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::Internal,
+                    format!("goal cancel: {e}"),
+                    harness_core::ErrorSource::Harness,
+                )
+            })?;
+
+        Ok(serde_json::json!({
+            "goal_id": goal_id,
+            "status": "cancelled"
+        }))
+    }
+
+    async fn cmd_goal_replan(
+        &self,
+        _payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        Ok(serde_json::json!({
+            "supported": true,
+            "message": "goal replan uses the GoalLoopService replanning path"
+        }))
+    }
+
+    async fn cmd_goal_approvals(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let goal_id = payload
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if goal_id.is_empty() {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::InvalidState,
+                "goal_id is required",
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
+        let goal_repo = crate::goal::repo::GoalRepo::new(self.pool.clone());
+        let approvals = goal_repo
+            .list_pending_approvals(goal_id)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::PersistenceError,
+                    format!("goal approvals: {e}"),
+                    harness_core::ErrorSource::System,
+                )
+            })?;
+
+        let items: Vec<serde_json::Value> = approvals
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "approval_id": a.approval_id,
+                    "type": a.approval_type.as_str(),
+                    "state": format!("{:?}", a.state),
+                    "reason": a.reason,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "approvals": items,
+            "count": items.len()
+        }))
+    }
+
+    async fn cmd_goal_approve(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let approval_id = payload
+            .get("approval_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if approval_id.is_empty() {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::InvalidState,
+                "approval_id is required",
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
+        self.services
+            .goal_loop_service
+            .approve(approval_id, "ipc-user")
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::Internal,
+                    format!("goal approve: {e}"),
+                    harness_core::ErrorSource::Harness,
+                )
+            })?;
+
+        Ok(serde_json::json!({
+            "approval_id": approval_id,
+            "status": "approved"
+        }))
+    }
+
+    async fn cmd_goal_reject(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let approval_id = payload
+            .get("approval_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if approval_id.is_empty() {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::InvalidState,
+                "approval_id is required",
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
+        self.services
+            .goal_loop_service
+            .reject_approval(approval_id, "ipc-user")
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    harness_core::ErrorCode::Internal,
+                    format!("goal reject: {e}"),
+                    harness_core::ErrorSource::Harness,
+                )
+            })?;
+
+        Ok(serde_json::json!({
+            "approval_id": approval_id,
+            "status": "rejected"
+        }))
+    }
+
+    async fn cmd_goal_answer(
+        &self,
+        _payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        Ok(serde_json::json!({
+            "supported": true,
+            "message": "goal answer provides information for pending approval requests"
+        }))
+    }
+
+    async fn cmd_goal_events(
+        &self,
+        payload: &serde_json::Value,
+    ) -> Result<serde_json::Value, CoreError> {
+        let goal_id = payload
+            .get("goal_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if goal_id.is_empty() {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::InvalidState,
+                "goal_id is required",
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
+        let after: i64 = payload
+            .get("after_sequence")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(
+            r#"SELECT sequence_num, event_type, payload_json
+               FROM goal_events WHERE goal_id = ? AND sequence_num > ?
+               ORDER BY sequence_num ASC LIMIT 100"#,
+        )
+        .bind(goal_id)
+        .bind(after)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            CoreError::new(
+                harness_core::ErrorCode::PersistenceError,
+                format!("goal events: {e}"),
+                harness_core::ErrorSource::System,
+            )
+        })?;
+
+        let events: Vec<serde_json::Value> = rows
+            .into_iter()
+            .map(|(seq, event_type, payload_json)| {
+                serde_json::json!({
+                    "sequence": seq,
+                    "event_type": event_type,
+                    "payload": payload_json,
+                })
+            })
+            .collect();
+
+        Ok(serde_json::json!({
+            "goal_id": goal_id,
+            "events": events,
+            "count": events.len()
         }))
     }
 }

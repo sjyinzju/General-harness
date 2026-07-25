@@ -68,6 +68,11 @@ impl GoalLoopService {
         }
     }
 
+    /// Access the database pool (for CLI read operations).
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     // ── Goal Lifecycle ─────────────────────────────────────────────
 
     /// Create a new Goal from a user-provided GoalSpec.

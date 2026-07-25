@@ -234,6 +234,7 @@ async fn try_ipc_dispatch(args: &[String]) -> Result<bool, IpcDispatchResult> {
         "review" => try_ipc_review(&client, args).await,
         "integration" => try_ipc_integration(&client, args).await,
         "supervisor" => try_ipc_supervisor(&client, args).await,
+        "goal" => try_ipc_goal(&client, args).await,
         _ => Err(IpcDispatchResult::SupervisorUnavailable),
     }
 }
@@ -445,6 +446,148 @@ async fn send_ipc(
     Ok(true)
 }
 
+async fn try_ipc_goal(
+    client: &SupervisorClient,
+    args: &[String],
+) -> Result<bool, IpcDispatchResult> {
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "create" => {
+            let spec = parse_flag(args, "--spec").unwrap_or("{}");
+            send_ipc(
+                client,
+                "goal.create",
+                serde_json::json!({ "goal_spec": spec }),
+            )
+            .await
+        }
+        "start" => {
+            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "goal.start",
+                serde_json::json!({ "goal_id": goal_id }),
+            )
+            .await
+        }
+        "show" => {
+            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "goal.show",
+                serde_json::json!({ "goal_id": goal_id }),
+            )
+            .await
+        }
+        "list" => {
+            let state = parse_flag(args, "--state");
+            let mut payload = serde_json::json!({});
+            if let Some(s) = state {
+                payload["state"] = serde_json::json!(s);
+            }
+            send_ipc(client, "goal.list", payload).await
+        }
+        "status" => {
+            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "goal.status",
+                serde_json::json!({ "goal_id": goal_id }),
+            )
+            .await
+        }
+        "pause" => {
+            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "goal.pause",
+                serde_json::json!({ "goal_id": goal_id }),
+            )
+            .await
+        }
+        "resume" => {
+            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "goal.resume",
+                serde_json::json!({ "goal_id": goal_id }),
+            )
+            .await
+        }
+        "cancel" => {
+            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "goal.cancel",
+                serde_json::json!({ "goal_id": goal_id }),
+            )
+            .await
+        }
+        "replan" => {
+            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let reason = parse_flag(args, "--reason").unwrap_or("");
+            send_ipc(
+                client,
+                "goal.replan",
+                serde_json::json!({ "goal_id": goal_id, "reason": reason }),
+            )
+            .await
+        }
+        "approvals" => {
+            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "goal.approvals",
+                serde_json::json!({ "goal_id": goal_id }),
+            )
+            .await
+        }
+        "approve" => {
+            let approval_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "goal.approve",
+                serde_json::json!({ "approval_id": approval_id }),
+            )
+            .await
+        }
+        "reject" => {
+            let approval_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let reason = parse_flag(args, "--reason").unwrap_or("");
+            send_ipc(
+                client,
+                "goal.reject",
+                serde_json::json!({ "approval_id": approval_id, "reason": reason }),
+            )
+            .await
+        }
+        "answer" => {
+            let approval_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let value = parse_flag(args, "--value").unwrap_or("");
+            send_ipc(
+                client,
+                "goal.answer",
+                serde_json::json!({ "approval_id": approval_id, "value": value }),
+            )
+            .await
+        }
+        "events" => {
+            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let after =
+                parse_flag(args, "--after-sequence").map(|s: &str| s.parse::<i64>().unwrap_or(0));
+            send_ipc(
+                client,
+                "goal.events",
+                serde_json::json!({ "goal_id": goal_id, "after_sequence": after.unwrap_or(0) }),
+            )
+            .await
+        }
+        _ => Err(IpcDispatchResult::CommandFailed(format!(
+            "unknown goal subcommand: {sub}"
+        ))),
+    }
+}
+
 /// Determine if a CLI command is a production write (side-effect) command.
 fn is_production_write(args: &[String]) -> bool {
     if args.len() < 3 {
@@ -458,6 +601,18 @@ fn is_production_write(args: &[String]) -> bool {
             "enqueue" | "run-next" | "cancel" | "recover"
         ),
         "supervisor" => matches!(args[2].as_str(), "stop"),
+        "goal" => matches!(
+            args[2].as_str(),
+            "create"
+                | "start"
+                | "pause"
+                | "resume"
+                | "cancel"
+                | "replan"
+                | "approve"
+                | "reject"
+                | "answer"
+        ),
         _ => false,
     }
 }
@@ -495,6 +650,10 @@ async fn dispatch_direct(
             } else {
                 dispatch_integration(args, db, repo_path).await
             }
+        }
+        "goal" => {
+            eprintln!("error: goal commands require Supervisor IPC");
+            false
         }
         "supervisor" => {
             if args.len() < 3 {
