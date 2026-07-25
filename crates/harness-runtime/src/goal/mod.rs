@@ -5,6 +5,7 @@
 //! and I6 (Supervisor/OperationIntent) production paths.
 
 pub mod repo;
+pub mod service;
 pub mod validation;
 
 use chrono::{DateTime, Utc};
@@ -291,7 +292,7 @@ pub struct CompletionGateResult {
     pub requires_human_approval: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CriterionCompletionStatus {
     pub criterion_id: String,
     pub satisfied: bool,

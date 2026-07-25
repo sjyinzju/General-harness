@@ -176,11 +176,27 @@ mod tests {
             "operation_intents",
             "recovery_actions",
             "recovery_runs",
+            // 028 — goal loop tables
+            "approval_requests",
+            "goal_constraints",
+            "goal_events",
+            "goal_loop_runs",
+            "goal_observations",
+            "goal_progress_assessments",
+            "goal_revisions",
+            "goal_success_criteria",
+            "goals",
+            "plan_events",
+            "plan_milestones",
+            "plan_revisions",
+            "planned_task_dependencies",
+            "planned_tasks",
+            "planner_invocations",
         ];
         expected.sort();
         assert_eq!(
             names, expected,
-            "66 business tables expected (001\u{2013}027)"
+            "81 business tables expected (001\u{2013}028)"
         );
     }
 
