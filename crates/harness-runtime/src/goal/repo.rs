@@ -474,10 +474,7 @@ impl GoalRepo {
         Ok(row.map(|r| r.0))
     }
 
-    pub async fn count_completed_tasks(
-        &self,
-        plan_revision_id: &str,
-    ) -> Result<i64, CoreError> {
+    pub async fn count_completed_tasks(&self, plan_revision_id: &str) -> Result<i64, CoreError> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT COUNT(*) FROM planned_tasks WHERE plan_revision_id = ? AND state = 'completed'",
         )
@@ -488,10 +485,7 @@ impl GoalRepo {
         Ok(row.map(|r| r.0).unwrap_or(0))
     }
 
-    pub async fn count_total_tasks(
-        &self,
-        plan_revision_id: &str,
-    ) -> Result<i64, CoreError> {
+    pub async fn count_total_tasks(&self, plan_revision_id: &str) -> Result<i64, CoreError> {
         let row: Option<(i64,)> = sqlx::query_as(
             "SELECT COUNT(*) FROM planned_tasks WHERE plan_revision_id = ? AND state != 'superseded'",
         )

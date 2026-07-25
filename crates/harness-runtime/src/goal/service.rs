@@ -876,10 +876,7 @@ impl GoalLoopService {
             );
 
             // Simple completion policy: all planned tasks completed → Succeeded
-            let total_tasks = self
-                .repo
-                .count_total_tasks(&plan.plan_revision_id)
-                .await?;
+            let total_tasks = self.repo.count_total_tasks(&plan.plan_revision_id).await?;
 
             if completed_count >= total_tasks && total_tasks > 0 {
                 self.transition_goal(goal_id, GoalState::Succeeded).await?;
