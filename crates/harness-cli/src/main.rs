@@ -65,7 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .join("harness.db")
         .to_string_lossy()
         .to_string();
-    let db_path = std::env::var("HARNESS_DB").unwrap_or(default_db);
+    let db_path = parse_flag(&args, "--db")
+        .map(|s| s.to_string())
+        .or_else(|| std::env::var("HARNESS_DB").ok())
+        .unwrap_or(default_db);
 
     // ── Commands that don't need ProductionGraph ─────────────────
     // cleanup and supervisor start don't require the graph
@@ -134,6 +137,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db = Database::open(&PathBuf::from(&db_path)).await?;
     let worktree_root = parse_flag(&args, "--worktree-root")
         .map(PathBuf::from)
+        .or_else(|| {
+            // If not explicit, try HARNESS_WORKTREE_ROOT env var
+            std::env::var("HARNESS_WORKTREE_ROOT")
+                .ok()
+                .map(PathBuf::from)
+        })
         .unwrap_or_else(|| repo_root.join("target/tmp"));
     let graph = match ProductionGraph::build(
         db.pool.clone(),
