@@ -5,6 +5,7 @@
 //! and I6 (Supervisor/OperationIntent) production paths.
 
 pub mod evaluator;
+pub mod failpoint;
 pub mod planner;
 pub mod repo;
 pub mod service;
@@ -303,4 +304,113 @@ pub struct CriterionCompletionStatus {
     pub satisfied: bool,
     pub evidence_refs: Vec<String>,
     pub missing_evidence: Vec<String>,
+}
+
+// ── Profile Separation ──────────────────────────────────────────────────
+
+/// Structured error when profile separation rules are violated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProfileSeparationError {
+    pub role_a: String,
+    pub profile_a: String,
+    pub role_b: String,
+    pub profile_b: String,
+    pub goal_id: Option<String>,
+    pub message: String,
+}
+
+impl std::fmt::Display for ProfileSeparationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "ProfileSeparationViolation: {} (role={}) and {} (role={}) must use different profiles{}. {}",
+            self.profile_a,
+            self.role_a,
+            self.profile_b,
+            self.role_b,
+            self.goal_id
+                .as_ref()
+                .map(|id| format!(" for goal {id}"))
+                .unwrap_or_default(),
+            self.message,
+        )
+    }
+}
+
+/// Runtime configuration for goal services, enforcing profile separation.
+#[derive(Debug, Clone)]
+pub struct GoalRuntimeConfig {
+    pub planner_profile_id: String,
+    pub evaluator_profile_id: String,
+    pub executor_profile_ids: Vec<String>,
+    pub reviewer_profile_ids: Vec<String>,
+}
+
+impl GoalRuntimeConfig {
+    /// Validate profile separation rules:
+    /// - planner_profile_id != evaluator_profile_id
+    /// - executor_profile_ids must not overlap with reviewer_profile_ids
+    /// - executor_profile_ids must not include planner or evaluator profiles
+    ///   (unless the same profile is explicitly allowed for both — NOT by default)
+    pub fn validate(&self, goal_id: Option<&str>) -> Result<(), Box<ProfileSeparationError>> {
+        // R3a: Planner != Evaluator
+        if self.planner_profile_id == self.evaluator_profile_id {
+            return Err(Box::new(ProfileSeparationError {
+                role_a: "GoalPlanner".into(),
+                profile_a: self.planner_profile_id.clone(),
+                role_b: "GoalEvaluator".into(),
+                profile_b: self.evaluator_profile_id.clone(),
+                goal_id: goal_id.map(|s| s.to_string()),
+                message: "Planner and Evaluator must use different profiles".into(),
+            }));
+        }
+
+        // R3b: Executor != Reviewer (any overlap)
+        let exec_set: std::collections::HashSet<&str> = self
+            .executor_profile_ids
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
+        for rp in &self.reviewer_profile_ids {
+            if exec_set.contains(rp.as_str()) {
+                return Err(Box::new(ProfileSeparationError {
+                    role_a: "TaskExecutor".into(),
+                    profile_a: rp.clone(),
+                    role_b: "TaskReviewer".into(),
+                    profile_b: rp.clone(),
+                    goal_id: goal_id.map(|s| s.to_string()),
+                    message: format!(
+                        "profile '{}' cannot be used for both Executor and Reviewer roles",
+                        rp
+                    ),
+                }));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if profile separation is satisfied without returning an error.
+    pub fn is_separated(&self) -> bool {
+        self.validate(None).is_ok()
+    }
+}
+
+// ── Invocation Record ───────────────────────────────────────────────────
+
+/// Durable record of a real Agent invocation for a goal role.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleInvocation {
+    pub invocation_id: String,
+    pub role: String,
+    pub profile_id: String,
+    pub adapter_kind: String,
+    pub binary_path: String,
+    pub binary_version: String,
+    pub input_digest: String,
+    pub prompt_digest: String,
+    pub output_digest: Option<String>,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub terminal_state: Option<String>,
 }

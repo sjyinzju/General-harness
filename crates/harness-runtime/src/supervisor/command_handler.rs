@@ -1273,6 +1273,19 @@ impl SupervisorCommandHandler {
             ));
         }
 
+        // Validate profile separation before starting
+        if let Err(sep_err) = self
+            .services
+            .goal_loop_service
+            .validate_profile_separation(goal_id)
+        {
+            return Err(CoreError::new(
+                harness_core::ErrorCode::ProfileSeparationViolation,
+                sep_err.to_string(),
+                harness_core::ErrorSource::Harness,
+            ));
+        }
+
         // Transition to Planning → try to plan
         self.services
             .goal_loop_service

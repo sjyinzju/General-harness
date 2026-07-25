@@ -52,11 +52,14 @@ use self::ownership::OwnershipManager;
 use self::repo::SupervisorRepo;
 
 use crate::commit::service::ControlledCommitService;
+use crate::goal::evaluator::ProductionGoalEvaluator;
+use crate::goal::planner::ProductionGoalPlanner;
 use crate::goal::service::GoalLoopService;
 use crate::integration::executor::IntegrationExecutor;
 use crate::integration::recovery::IntegrationRecoveryService;
 use crate::integration::service::IntegrationQueueService;
 use crate::liveness::{LivenessOrchestrator, RunContext};
+use crate::prompt::PromptRegistry;
 use crate::resource_claim::ResourceClaimService;
 use crate::review::service::ReviewOrchestrationService;
 use crate::scheduler::composition::SchedulerServices;
@@ -89,6 +92,12 @@ pub struct SupervisorServices {
     pub scheduler_services: Arc<SchedulerServices>,
     /// Goal loop service for I7 outer-loop orchestration.
     pub goal_loop_service: Arc<GoalLoopService>,
+    /// Goal Planner (production, optional — wired when profiles available).
+    pub goal_planner: Option<Arc<ProductionGoalPlanner>>,
+    /// Goal Evaluator (production, optional — wired when profiles available).
+    pub goal_evaluator: Option<Arc<ProductionGoalEvaluator>>,
+    /// Prompt registry for versioned goal prompts.
+    pub prompt_registry: Arc<PromptRegistry>,
     /// Repository root path for integration and commit operations.
     pub repo_root: std::path::PathBuf,
     /// Integration root path for sandboxed execution.

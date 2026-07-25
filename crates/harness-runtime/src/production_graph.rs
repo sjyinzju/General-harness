@@ -31,6 +31,8 @@ use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
 use crate::commit::service::ControlledCommitService;
+use crate::goal::evaluator::ProductionGoalEvaluator;
+use crate::goal::planner::ProductionGoalPlanner;
 use crate::goal::service::GoalLoopService;
 use crate::integration::executor::IntegrationExecutor;
 use crate::integration::recovery::IntegrationRecoveryService;
@@ -38,6 +40,7 @@ use crate::integration::service::IntegrationQueueService;
 use crate::lease::clock::SystemClock;
 use crate::lease::types::LeaseConfig;
 use crate::liveness::{LivenessOrchestrator, RunContext};
+use crate::prompt::PromptRegistry;
 use crate::resource_claim::lease_adapter::LeaseServiceAdapter;
 use crate::resource_claim::ResourceClaimRepo;
 use crate::resource_claim::ResourceClaimService;
@@ -90,6 +93,10 @@ pub struct ProductionGraph {
     pub supervisor_repo: SupervisorRepo,
     /// Bundled supervisor services for the daemon (IPC, control loop, recovery).
     pub supervisor_services: SupervisorServices,
+
+    // ── I7 goal services ─────────────────────────────────────────
+    /// Prompt registry for versioned goal prompts.
+    pub prompt_registry: Arc<PromptRegistry>,
 
     // ── Paths ────────────────────────────────────────────────────
     /// Repository root path.
@@ -210,7 +217,12 @@ impl ProductionGraph {
         let integration_recovery = Arc::new(IntegrationRecoveryService::new(pool.clone()));
 
         // ── I7: GoalLoopService ────────────────────────────────────
+        let prompt_registry = Arc::new(PromptRegistry::new());
         let goal_loop_service = Arc::new(GoalLoopService::new(pool.clone()));
+
+        // ── I7: Goal planner/evaluator (wired when adapters/profiles available) ─
+        let goal_planner: Option<Arc<ProductionGoalPlanner>> = None;
+        let goal_evaluator: Option<Arc<ProductionGoalEvaluator>> = None;
 
         // ── I6: Supervisor repository ──────────────────────────────
         let supervisor_repo = SupervisorRepo::new(pool.clone());
@@ -235,6 +247,9 @@ impl ProductionGraph {
             run_context: run_context.clone(),
             scheduler_services: scheduler_services.clone(),
             goal_loop_service: goal_loop_service.clone(),
+            goal_planner: goal_planner.clone(),
+            goal_evaluator: goal_evaluator.clone(),
+            prompt_registry: prompt_registry.clone(),
             repo_root: repo_root_buf,
             integration_root: integration_root_buf,
         };
@@ -259,6 +274,7 @@ impl ProductionGraph {
             integration_recovery,
             supervisor_repo,
             supervisor_services,
+            prompt_registry,
             repo_root: repo_root.to_path_buf(),
             integration_root,
         })

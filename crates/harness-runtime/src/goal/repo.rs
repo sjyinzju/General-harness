@@ -21,6 +21,7 @@ use super::{
 
 // ── Goal Repo ─────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 pub struct GoalRepo {
     pool: SqlitePool,
 }

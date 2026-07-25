@@ -55,6 +55,8 @@ pub enum ErrorCode {
     SerializationError,
     // Verification
     VerificationFailed { check: String },
+    // Profile
+    ProfileSeparationViolation,
     // Internal
     Internal,
 }

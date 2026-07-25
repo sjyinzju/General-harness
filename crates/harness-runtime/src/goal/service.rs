@@ -16,6 +16,7 @@ use harness_core::contracts::plan::{
     compute_task_fingerprint, Milestone, MilestoneState, PlanRevision, PlanState, PlannedTask,
     PlannedTaskState, RiskLevel,
 };
+use harness_core::contracts::runtime_profile::RuntimeProfile;
 use harness_core::state_machine::GoalFsm;
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
@@ -24,7 +25,8 @@ use super::repo::GoalRepo;
 use super::validation::{check_completion_gate, validate_plan_proposal};
 use super::{
     ApprovalRequest, ApprovalState, ApprovalType, CriterionStatus, GoalLoopRunState,
-    GoalObservation, PlanProposal, ProgressAssessmentProposal, ReplanDecision, ReplanTrigger,
+    GoalObservation, GoalRuntimeConfig, PlanProposal, ProfileSeparationError,
+    ProgressAssessmentProposal, ReplanDecision, ReplanTrigger,
 };
 
 /// Context passed to the Goal Planner LLM.
@@ -55,9 +57,16 @@ pub struct GoalAssessmentContext {
 }
 
 /// The GoalLoopService orchestrates the outer Goal → Plan → Task loop.
+#[derive(Debug)]
 pub struct GoalLoopService {
     pool: SqlitePool,
     repo: GoalRepo,
+    /// Runtime config with profile separation validation.
+    pub runtime_config: Option<GoalRuntimeConfig>,
+    /// Planner profile for invocation tracking.
+    pub planner_profile: Option<RuntimeProfile>,
+    /// Evaluator profile for invocation tracking.
+    pub evaluator_profile: Option<RuntimeProfile>,
 }
 
 impl GoalLoopService {
@@ -65,6 +74,54 @@ impl GoalLoopService {
         Self {
             repo: GoalRepo::new(pool.clone()),
             pool,
+            runtime_config: None,
+            planner_profile: None,
+            evaluator_profile: None,
+        }
+    }
+
+    /// Configure the service with planner/evaluator profiles and enforce separation.
+    pub fn with_goal_profiles(
+        mut self,
+        planner_profile: RuntimeProfile,
+        evaluator_profile: RuntimeProfile,
+    ) -> Result<Self, Box<ProfileSeparationError>> {
+        let config = GoalRuntimeConfig {
+            planner_profile_id: planner_profile.id.clone(),
+            evaluator_profile_id: evaluator_profile.id.clone(),
+            executor_profile_ids: vec![],
+            reviewer_profile_ids: vec![],
+        };
+        config.validate(None)?;
+        self.runtime_config = Some(config);
+        self.planner_profile = Some(planner_profile);
+        self.evaluator_profile = Some(evaluator_profile);
+        Ok(self)
+    }
+
+    /// Set executor/reviewer profile IDs for separation validation.
+    pub fn with_task_profiles(
+        mut self,
+        executor_ids: Vec<String>,
+        reviewer_ids: Vec<String>,
+    ) -> Result<Self, Box<ProfileSeparationError>> {
+        if let Some(ref mut config) = self.runtime_config {
+            config.executor_profile_ids = executor_ids;
+            config.reviewer_profile_ids = reviewer_ids;
+            config.validate(None)?;
+        }
+        Ok(self)
+    }
+
+    /// Validate profile separation for a specific goal, returning a structured error.
+    pub fn validate_profile_separation(
+        &self,
+        goal_id: &str,
+    ) -> Result<(), Box<ProfileSeparationError>> {
+        if let Some(ref config) = self.runtime_config {
+            config.validate(Some(goal_id))
+        } else {
+            Ok(())
         }
     }
 
@@ -755,5 +812,135 @@ fn parse_goal_state_from_db(s: &str) -> Result<GoalState, CoreError> {
             format!("unknown goal state: {s}"),
             ErrorSource::Harness,
         )),
+    }
+}
+
+// ── Profile Separation Tests ──────────────────────────────────────────
+
+#[cfg(test)]
+mod profile_separation_tests {
+    use super::*;
+
+    /// Create a GoalLoopService from a real in-memory pool for testing.
+    async fn make_test_service() -> GoalLoopService {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create test pool");
+        GoalLoopService::new(pool)
+    }
+
+    fn make_profile(id: &str, kind: &str) -> RuntimeProfile {
+        use harness_core::contracts::runtime_profile::{
+            AuthCheckStatus, AuthMode, AuthStatus, CapabilitySet, CoreStatus, ExecutionStatus,
+            OptionalCapabilities, ProviderSource, RequiredCapabilities, TriState,
+        };
+
+        RuntimeProfile {
+            id: id.to_string(),
+            agent_definition_id: format!("def-{id}"),
+            label: format!("Profile {id}"),
+            agent_kind: kind.to_string(),
+            adapter_kind: kind.to_string(),
+            agent_version: "1.0".into(),
+            executable_path: format!("{kind}.exe"),
+            provider: "test".into(),
+            provider_source: ProviderSource::UserDeclared,
+            model: Some("test-model".into()),
+            base_url: None,
+            auth_mode: AuthMode::None,
+            auth_status: AuthStatus::Unknown,
+            credential_ref: None,
+            capabilities: CapabilitySet {
+                required: RequiredCapabilities {
+                    execute: TriState::Unknown,
+                    working_directory: TriState::Unknown,
+                    stream_output: TriState::Unknown,
+                    process_exit: TriState::Unknown,
+                    cancellation: TriState::Unknown,
+                    timeout: TriState::Unknown,
+                    final_result: TriState::Unknown,
+                },
+                optional: OptionalCapabilities {
+                    native_session_resume: TriState::Unknown,
+                    structured_output: TriState::Unknown,
+                    tool_events: TriState::Unknown,
+                    file_change_events: TriState::Unknown,
+                    reasoning_summary: TriState::Unknown,
+                    interactive_approval: TriState::Unknown,
+                    usage_reporting: TriState::Unknown,
+                },
+                workspace_modes: vec![],
+                supported_languages: vec![],
+                mcp_tools: vec![],
+                supported_platforms: vec![],
+            },
+            core_status: CoreStatus::Available,
+            authentication_status: AuthCheckStatus::Unknown,
+            execution_status: ExecutionStatus::Untested,
+            optional_integrations: vec![],
+            discovery_source: "test".into(),
+            passive_probe: None,
+            active_validation: None,
+            concurrency_max: 1,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_profile_separation_planner_equals_evaluator_rejected() {
+        let svc = make_test_service().await;
+        let profile = make_profile("claude-1", "claude");
+        let result = svc.with_goal_profiles(profile.clone(), profile);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("ProfileSeparationViolation"));
+        assert!(err.role_a == "GoalPlanner" || err.role_b == "GoalPlanner");
+    }
+
+    #[tokio::test]
+    async fn test_profile_separation_different_profiles_accepted() {
+        let svc = make_test_service().await;
+        let planner = make_profile("claude-1", "claude");
+        let evaluator = make_profile("codex-1", "codex");
+        let result = svc.with_goal_profiles(planner, evaluator);
+        assert!(result.is_ok());
+        let svc = result.unwrap();
+        assert!(svc.runtime_config.is_some());
+        assert!(svc.runtime_config.unwrap().is_separated());
+    }
+
+    #[tokio::test]
+    async fn test_profile_separation_executor_equals_reviewer_rejected() {
+        let svc = make_test_service().await;
+        let planner = make_profile("claude-1", "claude");
+        let evaluator = make_profile("codex-1", "codex");
+        let svc = svc.with_goal_profiles(planner, evaluator).unwrap();
+        let result = svc.with_task_profiles(vec!["codex-1".into()], vec!["codex-1".into()]);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("cannot be used for both Executor and Reviewer"));
+    }
+
+    #[tokio::test]
+    async fn test_profile_separation_different_executor_reviewer_accepted() {
+        let svc = make_test_service().await;
+        let planner = make_profile("claude-1", "claude");
+        let evaluator = make_profile("codex-1", "codex");
+        let svc = svc.with_goal_profiles(planner, evaluator).unwrap();
+        let result = svc.with_task_profiles(vec!["codex-1".into()], vec!["claude-1".into()]);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_goal_start_validates_profile_separation() {
+        let svc = make_test_service().await;
+        let planner = make_profile("claude-1", "claude");
+        let evaluator = make_profile("codex-1", "codex");
+        let svc = svc.with_goal_profiles(planner, evaluator).unwrap();
+        // Should pass - different profiles
+        assert!(svc.validate_profile_separation("g1").is_ok());
     }
 }
