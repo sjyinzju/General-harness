@@ -491,7 +491,7 @@ async fn try_ipc_goal(
             send_ipc(client, "goal.create", spec_val).await
         }
         "start" => {
-            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let goal_id = parse_flag(args, "--goal-id").unwrap_or("");
             send_ipc(
                 client,
                 "goal.start",
@@ -500,7 +500,7 @@ async fn try_ipc_goal(
             .await
         }
         "show" => {
-            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let goal_id = parse_flag(args, "--goal-id").unwrap_or("");
             send_ipc(
                 client,
                 "goal.show",
@@ -517,7 +517,7 @@ async fn try_ipc_goal(
             send_ipc(client, "goal.list", payload).await
         }
         "status" => {
-            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let goal_id = parse_flag(args, "--goal-id").unwrap_or("");
             send_ipc(
                 client,
                 "goal.status",
@@ -526,7 +526,7 @@ async fn try_ipc_goal(
             .await
         }
         "pause" => {
-            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let goal_id = parse_flag(args, "--goal-id").unwrap_or("");
             send_ipc(
                 client,
                 "goal.pause",
@@ -535,7 +535,7 @@ async fn try_ipc_goal(
             .await
         }
         "resume" => {
-            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let goal_id = parse_flag(args, "--goal-id").unwrap_or("");
             send_ipc(
                 client,
                 "goal.resume",
@@ -544,7 +544,7 @@ async fn try_ipc_goal(
             .await
         }
         "cancel" => {
-            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let goal_id = parse_flag(args, "--goal-id").unwrap_or("");
             send_ipc(
                 client,
                 "goal.cancel",
@@ -553,7 +553,7 @@ async fn try_ipc_goal(
             .await
         }
         "replan" => {
-            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let goal_id = parse_flag(args, "--goal-id").unwrap_or("");
             let reason = parse_flag(args, "--reason").unwrap_or("");
             send_ipc(
                 client,
@@ -563,7 +563,7 @@ async fn try_ipc_goal(
             .await
         }
         "approvals" => {
-            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let goal_id = parse_flag(args, "--goal-id").unwrap_or("");
             send_ipc(
                 client,
                 "goal.approvals",
@@ -572,7 +572,7 @@ async fn try_ipc_goal(
             .await
         }
         "approve" => {
-            let approval_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let approval_id = parse_flag(args, "--approval-id").unwrap_or("");
             send_ipc(
                 client,
                 "goal.approve",
@@ -581,7 +581,7 @@ async fn try_ipc_goal(
             .await
         }
         "reject" => {
-            let approval_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let approval_id = parse_flag(args, "--approval-id").unwrap_or("");
             let reason = parse_flag(args, "--reason").unwrap_or("");
             send_ipc(
                 client,
@@ -591,7 +591,7 @@ async fn try_ipc_goal(
             .await
         }
         "answer" => {
-            let approval_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let approval_id = parse_flag(args, "--approval-id").unwrap_or("");
             let value = parse_flag(args, "--value").unwrap_or("");
             send_ipc(
                 client,
@@ -601,7 +601,7 @@ async fn try_ipc_goal(
             .await
         }
         "events" => {
-            let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let goal_id = parse_flag(args, "--goal-id").unwrap_or("");
             let after =
                 parse_flag(args, "--after-sequence").map(|s: &str| s.parse::<i64>().unwrap_or(0));
             send_ipc(
