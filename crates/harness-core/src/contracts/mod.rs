@@ -8,8 +8,8 @@ pub mod discovery;
 pub mod goal;
 pub mod goal_contract;
 pub mod integration;
-pub mod plan;
 pub mod ipc;
+pub mod plan;
 pub mod project;
 pub mod repository;
 pub mod review;
@@ -40,20 +40,20 @@ pub use discovery::{
     ExecutableIdentity, ProviderHint, ProviderHintSource, ValidationResult, ValidationStatus,
 };
 pub use goal::{
-    ApprovalPolicy, ConstraintType, CriterionId, CriterionSubjectivity, EvidencePolicy,
-    GoalBudget, GoalConstraint, GoalCreator, GoalId, GoalRevision, GoalSpec, GoalState,
-    SuccessCriterion, VerificationPolicy,
+    ApprovalPolicy, ConstraintType, CriterionId, CriterionSubjectivity, EvidencePolicy, GoalBudget,
+    GoalConstraint, GoalCreator, GoalId, GoalRevision, GoalSpec, GoalState, SuccessCriterion,
+    VerificationPolicy,
 };
 pub use goal_contract::{ChangeRequest, GoalContractVersion};
-pub use plan::{
-    compute_task_fingerprint, validate_dag_no_cycles, Milestone, MilestoneId, MilestoneState,
-    PlanRevision, PlanRevisionId, PlanState, PlannedTask, PlannedTaskId, PlannedTaskState,
-    RiskLevel,
-};
 pub use integration::{
     ConflictInfo, IntegrationAttempt, IntegrationAttemptId, IntegrationId, IntegrationRequest,
     IntegrationResult, IntegrationState, IntegrationStrategy, IntegrationVerificationPolicy,
     VerificationCommand,
+};
+pub use plan::{
+    compute_task_fingerprint, validate_dag_no_cycles, Milestone, MilestoneId, MilestoneState,
+    PlanRevision, PlanRevisionId, PlanState, PlannedTask, PlannedTaskId, PlannedTaskState,
+    RiskLevel,
 };
 pub use project::{Project, ProjectLifecycle};
 pub use review::{

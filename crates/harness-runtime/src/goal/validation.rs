@@ -22,6 +22,12 @@ pub struct ValidationResult {
     pub proposal_digest: String,
 }
 
+impl Default for ValidationResult {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ValidationResult {
     pub fn new() -> Self {
         Self {
@@ -167,10 +173,7 @@ pub fn validate_plan_proposal(
     // 9. Expected evidence non-empty
     for t in &proposal.tasks {
         if t.expected_evidence.is_empty() {
-            result.add_error(format!(
-                "task {} has empty expected_evidence",
-                t.client_ref
-            ));
+            result.add_error(format!("task {} has empty expected_evidence", t.client_ref));
         }
     }
 
@@ -179,9 +182,7 @@ pub fn validate_plan_proposal(
     if existing_task_count + proposed_task_count > goal.budget.max_total_tasks {
         result.add_error(format!(
             "proposed {} tasks + existing {} exceeds budget max_total_tasks {}",
-            proposed_task_count,
-            existing_task_count,
-            goal.budget.max_total_tasks
+            proposed_task_count, existing_task_count, goal.budget.max_total_tasks
         ));
     }
 
@@ -213,7 +214,9 @@ pub fn validate_plan_proposal(
 
     // 14. Base HEAD must be non-empty
     if goal.initial_base_head.is_empty() {
-        result.add_warning("goal initial_base_head is empty — plan may be based on unresolved ref".into());
+        result.add_warning(
+            "goal initial_base_head is empty — plan may be based on unresolved ref".into(),
+        );
     }
 
     result
@@ -254,6 +257,7 @@ fn compute_proposal_digest(proposal: &PlanProposal) -> String {
 /// Check whether a Goal can be marked Succeeded.
 /// This is a Rust-only check — the GoalEvaluator's recommendation is an
 /// input, not the decision.
+#[allow(clippy::too_many_arguments)]
 pub fn check_completion_gate(
     goal: &GoalSpec,
     criteria_statuses: &HashMap<String, CriterionStatus>,
@@ -365,16 +369,14 @@ mod tests {
             repository_id: "repo-1".into(),
             target_ref: "refs/heads/main".into(),
             initial_base_head: "abc123".into(),
-            success_criteria: vec![
-                SuccessCriterion {
-                    criterion_id: "c1".into(),
-                    description: "All tests pass".into(),
-                    evidence_policy: EvidencePolicy::TaskTerminalResult,
-                    verification_policy: VerificationPolicy::ExistenceOnly,
-                    subjectivity: CriterionSubjectivity::Objective,
-                    required: true,
-                },
-            ],
+            success_criteria: vec![SuccessCriterion {
+                criterion_id: "c1".into(),
+                description: "All tests pass".into(),
+                evidence_policy: EvidencePolicy::TaskTerminalResult,
+                verification_policy: VerificationPolicy::ExistenceOnly,
+                subjectivity: CriterionSubjectivity::Objective,
+                required: true,
+            }],
             constraints: vec![],
             non_goals: vec!["Do not modify CI config".into()],
             budget: GoalBudget::default(),
@@ -422,7 +424,11 @@ mod tests {
         let goal = make_test_goal();
         let proposal = make_valid_proposal();
         let result = validate_plan_proposal(&proposal, &goal, 0);
-        assert!(result.valid, "expected valid, got errors: {:?}", result.errors);
+        assert!(
+            result.valid,
+            "expected valid, got errors: {:?}",
+            result.errors
+        );
     }
 
     #[test]
@@ -568,8 +574,14 @@ mod tests {
         evidence_refs.insert("ev-c1-task1".into());
 
         let result = check_completion_gate(
-            &goal, &statuses, &evidence_refs,
-            0, true, true, false, false,
+            &goal,
+            &statuses,
+            &evidence_refs,
+            0,
+            true,
+            true,
+            false,
+            false,
         );
         assert!(result.can_complete);
         assert!(result.blocking_reasons.is_empty());
@@ -582,8 +594,14 @@ mod tests {
         let evidence_refs = HashSet::new();
 
         let result = check_completion_gate(
-            &goal, &statuses, &evidence_refs,
-            0, true, true, false, false,
+            &goal,
+            &statuses,
+            &evidence_refs,
+            0,
+            true,
+            true,
+            false,
+            false,
         );
         assert!(!result.can_complete);
         assert!(!result.blocking_reasons.is_empty());
@@ -598,8 +616,14 @@ mod tests {
         evidence_refs.insert("ev-c1".into());
 
         let result = check_completion_gate(
-            &goal, &statuses, &evidence_refs,
-            2, true, true, false, false,
+            &goal,
+            &statuses,
+            &evidence_refs,
+            2,
+            true,
+            true,
+            false,
+            false,
         );
         assert!(!result.can_complete);
     }

@@ -113,11 +113,9 @@ impl GoalLoopService {
         goal_id: &str,
         new_state: GoalState,
     ) -> Result<(), CoreError> {
-        let _goal = self
-            .repo
-            .get_goal(goal_id)
-            .await?
-            .ok_or_else(|| CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness))?;
+        let _goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
+            CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
+        })?;
 
         // Validate state transition using domain FSM
         let current_state = self.parse_current_goal_state(goal_id).await?;
@@ -165,11 +163,9 @@ impl GoalLoopService {
         base_head: &str,
         goal_revision: i64,
     ) -> Result<PlanRevision, CoreError> {
-        let goal = self
-            .repo
-            .get_goal(goal_id)
-            .await?
-            .ok_or_else(|| CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness))?;
+        let goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
+            CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
+        })?;
 
         // 1. Validate the proposal
         let validation =
@@ -237,7 +233,9 @@ impl GoalLoopService {
             let pt = PlannedTask {
                 planned_task_id: format!("pt-{}", uuid::Uuid::new_v4()),
                 plan_revision_id: plan_revision_id.clone(),
-                milestone_id: self.resolve_milestone_id(&plan_revision_id, &t.milestone_ref).await?,
+                milestone_id: self
+                    .resolve_milestone_id(&plan_revision_id, &t.milestone_ref)
+                    .await?,
                 client_ref: t.client_ref.clone(),
                 title: t.title.clone(),
                 objective: t.objective.clone(),
@@ -245,7 +243,7 @@ impl GoalLoopService {
                 dependency_refs: t.dependencies.clone(),
                 expected_evidence: t.expected_evidence.clone(),
                 expected_resource_scope: t.expected_resource_scope.clone(),
-                risk_level: RiskLevel::from_str(&t.risk_level).unwrap_or(RiskLevel::Low),
+                risk_level: RiskLevel::parse(&t.risk_level).unwrap_or(RiskLevel::Low),
                 requires_approval: t.requires_approval,
                 task_fingerprint: fingerprint,
                 state: PlannedTaskState::Pending,
@@ -259,7 +257,11 @@ impl GoalLoopService {
             .supersede_active_plans(goal_id, &plan_revision_id)
             .await?;
         self.repo
-            .update_plan_state(&plan_revision_id, PlanState::Active, Some(&validation.proposal_digest))
+            .update_plan_state(
+                &plan_revision_id,
+                PlanState::Active,
+                Some(&validation.proposal_digest),
+            )
             .await?;
 
         self.repo
@@ -281,12 +283,19 @@ impl GoalLoopService {
     }
 
     async fn next_plan_revision_number(&self, goal_id: &str) -> Result<i64, CoreError> {
-        let row: Option<(i64,)> =
-            sqlx::query_as("SELECT COALESCE(MAX(revision_number), 0) + 1 FROM plan_revisions WHERE goal_id = ?")
-                .bind(goal_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT COALESCE(MAX(revision_number), 0) + 1 FROM plan_revisions WHERE goal_id = ?",
+        )
+        .bind(goal_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                e.to_string(),
+                ErrorSource::System,
+            )
+        })?;
         Ok(row.map(|r| r.0).unwrap_or(1))
     }
 
@@ -312,8 +321,13 @@ impl GoalLoopService {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
-        row.map(|r| r.0)
-            .ok_or_else(|| CoreError::new(ErrorCode::NotFound, format!("milestone not found: {client_ref}"), ErrorSource::Harness))
+        row.map(|r| r.0).ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::NotFound,
+                format!("milestone not found: {client_ref}"),
+                ErrorSource::Harness,
+            )
+        })
     }
 
     // ── Task Selection ─────────────────────────────────────────────
@@ -329,19 +343,22 @@ impl GoalLoopService {
         goal_id: &str,
         max_count: usize,
     ) -> Result<Vec<PlannedTask>, CoreError> {
-        let plan = self
-            .repo
-            .get_active_plan(goal_id)
-            .await?
-            .ok_or_else(|| CoreError::new(ErrorCode::NotFound, "no active plan", ErrorSource::Harness))?;
+        let plan = self.repo.get_active_plan(goal_id).await?.ok_or_else(|| {
+            CoreError::new(ErrorCode::NotFound, "no active plan", ErrorSource::Harness)
+        })?;
 
-        let pending = self.repo.get_pending_tasks_ordered(&plan.plan_revision_id).await?;
+        let pending = self
+            .repo
+            .get_pending_tasks_ordered(&plan.plan_revision_id)
+            .await?;
         let _goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
             CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
         })?;
 
         // Get all completed task client_refs for this plan
-        let completed_refs = self.get_completed_client_refs(&plan.plan_revision_id).await?;
+        let completed_refs = self
+            .get_completed_client_refs(&plan.plan_revision_id)
+            .await?;
         let completed_set: HashSet<&str> = completed_refs.iter().map(|s| s.as_str()).collect();
 
         let mut ready = Vec::new();
@@ -412,6 +429,7 @@ impl GoalLoopService {
 
     /// Import an observation from a source event (Task completion, Review decision,
     /// Commit OID, Integration result). Idempotent by source event.
+    #[allow(clippy::too_many_arguments)]
     pub async fn import_observation(
         &self,
         goal_id: &str,
@@ -461,11 +479,9 @@ impl GoalLoopService {
         goal_id: &str,
         evaluator_proposal: Option<&ProgressAssessmentProposal>,
     ) -> Result<super::CompletionGateResult, CoreError> {
-        let goal = self
-            .repo
-            .get_goal(goal_id)
-            .await?
-            .ok_or_else(|| CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness))?;
+        let goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
+            CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
+        })?;
 
         let plan = self.repo.get_active_plan(goal_id).await?;
 
@@ -485,7 +501,10 @@ impl GoalLoopService {
 
         // Count pending tasks
         let pending_count = if let Some(ref p) = plan {
-            let tasks = self.repo.get_pending_tasks_ordered(&p.plan_revision_id).await?;
+            let tasks = self
+                .repo
+                .get_pending_tasks_ordered(&p.plan_revision_id)
+                .await?;
             tasks.len()
         } else {
             0
@@ -500,7 +519,7 @@ impl GoalLoopService {
             &criteria_statuses,
             &evidence_refs,
             pending_count,
-            true,  // target_head_verified — TODO: actually verify
+            true, // target_head_verified — TODO: actually verify
             evaluator_ok,
             false, // has_unresolved_critical_findings
             false, // has_pending_approvals
@@ -519,11 +538,9 @@ impl GoalLoopService {
         consecutive_failures: u32,
         no_progress_iterations: u32,
     ) -> Result<ReplanDecision, CoreError> {
-        let goal = self
-            .repo
-            .get_goal(goal_id)
-            .await?
-            .ok_or_else(|| CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness))?;
+        let goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
+            CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
+        })?;
 
         // Check budget exhaustion
         let plan_count = self.next_plan_revision_number(goal_id).await? - 1;
@@ -548,7 +565,9 @@ impl GoalLoopService {
             | ReplanTrigger::IntegrationConflict { .. }
             | ReplanTrigger::PlanInvalidated { .. }
             | ReplanTrigger::UserRequestedReplan { .. }
-            | ReplanTrigger::EvaluatorRecommendation { .. } => Ok(ReplanDecision::CreatePlanRevision),
+            | ReplanTrigger::EvaluatorRecommendation { .. } => {
+                Ok(ReplanDecision::CreatePlanRevision)
+            }
 
             ReplanTrigger::CandidateStale { .. } => Ok(ReplanDecision::CreatePlanRevision),
 
@@ -603,7 +622,11 @@ impl GoalLoopService {
     ) -> Result<ApprovalRequest, CoreError> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
-        hasher.update(serde_json::to_string(&action).unwrap_or_default().as_bytes());
+        hasher.update(
+            serde_json::to_string(&action)
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         let payload_digest = format!("{:x}", hasher.finalize());
 
         let approval = ApprovalRequest {
@@ -625,7 +648,9 @@ impl GoalLoopService {
     }
 
     pub async fn approve(&self, approval_id: &str, resolved_by: &str) -> Result<(), CoreError> {
-        self.repo.resolve_approval(approval_id, "approved", resolved_by).await
+        self.repo
+            .resolve_approval(approval_id, "approved", resolved_by)
+            .await
     }
 
     pub async fn reject_approval(
@@ -633,18 +658,25 @@ impl GoalLoopService {
         approval_id: &str,
         resolved_by: &str,
     ) -> Result<(), CoreError> {
-        self.repo.resolve_approval(approval_id, "rejected", resolved_by).await
+        self.repo
+            .resolve_approval(approval_id, "rejected", resolved_by)
+            .await
     }
 
     // ── Goal Completion ────────────────────────────────────────────
 
     /// Check if the Goal can be marked Succeeded.
     /// This is the authoritative Rust gate — not the LLM's recommendation.
-    pub async fn try_complete_goal(&self, goal_id: &str) -> Result<super::CompletionGateResult, CoreError> {
+    pub async fn try_complete_goal(
+        &self,
+        goal_id: &str,
+    ) -> Result<super::CompletionGateResult, CoreError> {
         let result = self.assess_progress(goal_id, None).await?;
 
         if result.can_complete {
-            self.repo.update_goal_state(goal_id, GoalState::Succeeded).await?;
+            self.repo
+                .update_goal_state(goal_id, GoalState::Succeeded)
+                .await?;
             self.repo
                 .append_goal_event(
                     goal_id,
@@ -679,13 +711,17 @@ impl GoalLoopService {
 
 // Goal state lookup — reads from DB
 async fn get_goal_state(pool: &SqlitePool, goal_id: &str) -> Result<GoalState, CoreError> {
-    let row: Option<(String,)> = sqlx::query_as(
-        "SELECT state FROM goals WHERE goal_id = ?",
-    )
-    .bind(goal_id)
-    .fetch_optional(pool)
-    .await
-    .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
+    let row: Option<(String,)> = sqlx::query_as("SELECT state FROM goals WHERE goal_id = ?")
+        .bind(goal_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                e.to_string(),
+                ErrorSource::System,
+            )
+        })?;
 
     match row {
         Some((state_str,)) => parse_goal_state_from_db(&state_str),

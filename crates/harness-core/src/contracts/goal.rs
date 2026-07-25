@@ -325,10 +325,7 @@ pub enum GoalCreator {
         user_name: Option<String>,
     },
     /// Created programmatically (e.g., by another system).
-    System {
-        component: String,
-        reason: String,
-    },
+    System { component: String, reason: String },
 }
 
 // ── GoalRevision ───────────────────────────────────────────────────────

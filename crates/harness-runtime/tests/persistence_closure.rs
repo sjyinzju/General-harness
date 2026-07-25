@@ -71,14 +71,15 @@ async fn table_count_10_business_tables() {
     let names: Vec<&str> = rows.iter().map(|r| r.0.as_str()).collect();
     assert_eq!(
         names.len(),
-        66,
-        "Expected 66 business tables (001–026), got: {names:?}"
+        81,
+        "Expected 81 business tables (001–028), got: {names:?}"
     );
     assert_eq!(
         names,
         vec![
             "agent_definitions",
             "agent_provider_hints",
+            "approval_requests",
             "candidate_snapshots",
             "commit_candidates",
             "commit_creation_attempts",
@@ -88,6 +89,14 @@ async fn table_count_10_business_tables() {
             "dispatch_operations",
             "event_log",
             "execution_attempts",
+            "goal_constraints",
+            "goal_events",
+            "goal_loop_runs",
+            "goal_observations",
+            "goal_progress_assessments",
+            "goal_revisions",
+            "goal_success_criteria",
+            "goals",
             "idempotency_records",
             "integration_attempts",
             "integration_events",
@@ -97,6 +106,12 @@ async fn table_count_10_business_tables() {
             "integration_verifications",
             "operation_intents",
             "operations",
+            "plan_events",
+            "plan_milestones",
+            "plan_revisions",
+            "planned_task_dependencies",
+            "planned_tasks",
+            "planner_invocations",
             "policy_approvals",
             "policy_evaluations",
             "policy_findings",

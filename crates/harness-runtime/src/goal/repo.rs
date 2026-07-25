@@ -6,18 +6,17 @@
 
 use chrono::Utc;
 use harness_core::contracts::goal::{
-    GoalConstraint, GoalCreator, GoalId, GoalSpec, GoalState, SuccessCriterion,
+    GoalConstraint, GoalCreator, GoalSpec, GoalState, SuccessCriterion,
 };
 use harness_core::contracts::plan::{
-    Milestone, MilestoneState, PlanRevision, PlanRevisionId, PlanState,
-    PlannedTask, PlannedTaskState, RiskLevel,
+    Milestone, MilestoneState, PlanRevision, PlanState, PlannedTask, PlannedTaskState, RiskLevel,
 };
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 
 use super::{
-    ApprovalRequest, ApprovalState, ApprovalType, GoalLoopRun, GoalLoopRunState,
-    GoalObservation, ProgressAssessmentProposal,
+    ApprovalRequest, ApprovalState, ApprovalType, GoalLoopRunState, GoalObservation,
+    ProgressAssessmentProposal,
 };
 
 // ── Goal Repo ─────────────────────────────────────────────────────────
@@ -94,7 +93,11 @@ impl GoalRepo {
         .bind(serde_json::to_string(&c.evidence_policy).unwrap_or_default())
         .bind(verification_policy_str(&c.verification_policy))
         .bind(serde_json::to_string(&c.verification_policy).unwrap_or_default())
-        .bind(if c.subjectivity.requires_human_approval() { "subjective" } else { "objective" })
+        .bind(if c.subjectivity.requires_human_approval() {
+            "subjective"
+        } else {
+            "objective"
+        })
         .bind(c.required as i32)
         .execute(&self.pool)
         .await
@@ -102,11 +105,7 @@ impl GoalRepo {
         Ok(())
     }
 
-    async fn insert_constraint(
-        &self,
-        goal_id: &str,
-        c: &GoalConstraint,
-    ) -> Result<(), CoreError> {
+    async fn insert_constraint(&self, goal_id: &str, c: &GoalConstraint) -> Result<(), CoreError> {
         sqlx::query(
             r#"INSERT INTO goal_constraints (constraint_id, goal_id, description,
                constraint_type, constraint_config, blocking)
@@ -168,13 +167,16 @@ impl GoalRepo {
             Some(r) => {
                 let criteria = self.get_success_criteria(goal_id).await?;
                 let constraints = self.get_constraints(goal_id).await?;
-                Ok(Some(r.to_goal_spec(criteria, constraints)))
+                Ok(Some(r.into_goal_spec(criteria, constraints)))
             }
             None => Ok(None),
         }
     }
 
-    async fn get_success_criteria(&self, goal_id: &str) -> Result<Vec<SuccessCriterion>, CoreError> {
+    async fn get_success_criteria(
+        &self,
+        goal_id: &str,
+    ) -> Result<Vec<SuccessCriterion>, CoreError> {
         let rows: Vec<CriterionRow> = sqlx::query_as(
             r#"SELECT criterion_id, description, evidence_policy, evidence_policy_config,
                verification_policy, verification_policy_config, subjectivity, required
@@ -185,7 +187,7 @@ impl GoalRepo {
         .await
         .map_err(db_err)?;
 
-        Ok(rows.into_iter().map(|r| r.to_criterion()).collect())
+        Ok(rows.into_iter().map(|r| r.into_criterion()).collect())
     }
 
     async fn get_constraints(&self, goal_id: &str) -> Result<Vec<GoalConstraint>, CoreError> {
@@ -198,10 +200,13 @@ impl GoalRepo {
         .await
         .map_err(db_err)?;
 
-        Ok(rows.into_iter().map(|r| r.to_constraint()).collect())
+        Ok(rows.into_iter().map(|r| r.into_constraint()).collect())
     }
 
-    pub async fn list_goals_by_state(&self, state: Option<&str>) -> Result<Vec<GoalSpec>, CoreError> {
+    pub async fn list_goals_by_state(
+        &self,
+        state: Option<&str>,
+    ) -> Result<Vec<GoalSpec>, CoreError> {
         let rows: Vec<GoalRow> = if let Some(s) = state {
             sqlx::query_as(
                 r#"SELECT goal_id, revision, title, objective, repository_id, target_ref,
@@ -227,7 +232,7 @@ impl GoalRepo {
         for r in rows {
             let criteria = self.get_success_criteria(&r.goal_id).await?;
             let constraints = self.get_constraints(&r.goal_id).await?;
-            goals.push(r.to_goal_spec(criteria, constraints));
+            goals.push(r.into_goal_spec(criteria, constraints));
         }
         Ok(goals)
     }
@@ -252,7 +257,7 @@ impl GoalRepo {
         .bind(&revision_id)
         .bind(goal_id)
         .bind(revision_number)
-        .bind(&serde_json::to_string(spec_snapshot).unwrap_or_default())
+        .bind(serde_json::to_string(spec_snapshot).unwrap_or_default())
         .bind(spec_digest)
         .bind(created_by)
         .bind(reason)
@@ -355,7 +360,7 @@ impl GoalRepo {
         .await
         .map_err(db_err)?;
 
-        Ok(row.map(|r| r.to_plan_revision()))
+        Ok(row.map(|r| r.into_plan_revision()))
     }
 
     // ── Milestones ──────────────────────────────────────────────────
@@ -386,14 +391,12 @@ impl GoalRepo {
         milestone_id: &str,
         new_state: MilestoneState,
     ) -> Result<(), CoreError> {
-        sqlx::query(
-            r#"UPDATE plan_milestones SET state = ? WHERE milestone_id = ?"#,
-        )
-        .bind(new_state.as_str())
-        .bind(milestone_id)
-        .execute(&self.pool)
-        .await
-        .map_err(db_err)?;
+        sqlx::query(r#"UPDATE plan_milestones SET state = ? WHERE milestone_id = ?"#)
+            .bind(new_state.as_str())
+            .bind(milestone_id)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
         Ok(())
     }
 
@@ -488,7 +491,7 @@ impl GoalRepo {
         .await
         .map_err(db_err)?;
 
-        Ok(rows.into_iter().map(|r| r.to_planned_task()).collect())
+        Ok(rows.into_iter().map(|r| r.into_planned_task()).collect())
     }
 
     // ── Goal Loop Runs ──────────────────────────────────────────────
@@ -563,6 +566,7 @@ impl GoalRepo {
 
     // ── Assessments ─────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_assessment(
         &self,
         assessment_id: &str,
@@ -654,11 +658,12 @@ impl GoalRepo {
         .await
         .map_err(db_err)?;
 
-        Ok(rows.into_iter().map(|r| r.to_approval()).collect())
+        Ok(rows.into_iter().map(|r| r.into_approval()).collect())
     }
 
     // ── Invocations ─────────────────────────────────────────────────
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_invocation(
         &self,
         invocation_id: &str,
@@ -751,6 +756,7 @@ impl GoalRepo {
 
 // ── Row types for sqlx::query_as ────────────────────────────────────
 
+#[allow(dead_code)]
 #[derive(sqlx::FromRow)]
 struct GoalRow {
     goal_id: String,
@@ -769,7 +775,7 @@ struct GoalRow {
 }
 
 impl GoalRow {
-    fn to_goal_spec(
+    fn into_goal_spec(
         self,
         criteria: Vec<SuccessCriterion>,
         constraints: Vec<GoalConstraint>,
@@ -787,13 +793,18 @@ impl GoalRow {
             non_goals: serde_json::from_str(&self.non_goals_json).unwrap_or_default(),
             budget: serde_json::from_str(&self.budget_json).unwrap_or_default(),
             approval_policy: serde_json::from_str(&self.approval_policy_json).unwrap_or_default(),
-            created_by: serde_json::from_str(&self.created_by_json)
-                .unwrap_or(GoalCreator::System { component: "unknown".into(), reason: "deserialized".into() }),
+            created_by: serde_json::from_str(&self.created_by_json).unwrap_or(
+                GoalCreator::System {
+                    component: "unknown".into(),
+                    reason: "deserialized".into(),
+                },
+            ),
             created_at: parse_dt(&self.created_at),
         }
     }
 }
 
+#[allow(dead_code)]
 #[derive(sqlx::FromRow)]
 struct CriterionRow {
     criterion_id: String,
@@ -807,19 +818,28 @@ struct CriterionRow {
 }
 
 impl CriterionRow {
-    fn to_criterion(self) -> SuccessCriterion {
-        use harness_core::contracts::goal::{CriterionSubjectivity, EvidencePolicy, VerificationPolicy};
+    fn into_criterion(self) -> SuccessCriterion {
+        use harness_core::contracts::goal::{
+            CriterionSubjectivity, EvidencePolicy, VerificationPolicy,
+        };
         SuccessCriterion {
             criterion_id: self.criterion_id,
             description: self.description,
-            evidence_policy: serde_json::from_str(&self.evidence_policy_config).unwrap_or(EvidencePolicy::TaskTerminalResult),
-            verification_policy: serde_json::from_str(&self.verification_policy_config).unwrap_or(VerificationPolicy::ExistenceOnly),
-            subjectivity: if self.subjectivity == "subjective" { CriterionSubjectivity::Subjective } else { CriterionSubjectivity::Objective },
+            evidence_policy: serde_json::from_str(&self.evidence_policy_config)
+                .unwrap_or(EvidencePolicy::TaskTerminalResult),
+            verification_policy: serde_json::from_str(&self.verification_policy_config)
+                .unwrap_or(VerificationPolicy::ExistenceOnly),
+            subjectivity: if self.subjectivity == "subjective" {
+                CriterionSubjectivity::Subjective
+            } else {
+                CriterionSubjectivity::Objective
+            },
             required: self.required != 0,
         }
     }
 }
 
+#[allow(dead_code)]
 #[derive(sqlx::FromRow)]
 struct ConstraintRow {
     constraint_id: String,
@@ -830,12 +850,17 @@ struct ConstraintRow {
 }
 
 impl ConstraintRow {
-    fn to_constraint(self) -> GoalConstraint {
+    fn into_constraint(self) -> GoalConstraint {
         use harness_core::contracts::goal::ConstraintType;
         GoalConstraint {
             constraint_id: self.constraint_id,
             description: self.description,
-            constraint_type: serde_json::from_str(&self.constraint_config).unwrap_or(ConstraintType::Custom { name: "unknown".into(), spec: "{}".into() }),
+            constraint_type: serde_json::from_str(&self.constraint_config).unwrap_or(
+                ConstraintType::Custom {
+                    name: "unknown".into(),
+                    spec: "{}".into(),
+                },
+            ),
             blocking: self.blocking != 0,
         }
     }
@@ -859,7 +884,7 @@ struct PlanRow {
 }
 
 impl PlanRow {
-    fn to_plan_revision(self) -> PlanRevision {
+    fn into_plan_revision(self) -> PlanRevision {
         PlanRevision {
             plan_revision_id: self.plan_revision_id,
             goal_id: self.goal_id,
@@ -898,7 +923,7 @@ struct PlannedTaskRow {
 }
 
 impl PlannedTaskRow {
-    fn to_planned_task(self) -> PlannedTask {
+    fn into_planned_task(self) -> PlannedTask {
         PlannedTask {
             planned_task_id: self.planned_task_id,
             plan_revision_id: self.plan_revision_id,
@@ -906,11 +931,14 @@ impl PlannedTaskRow {
             client_ref: self.client_ref,
             title: self.title,
             objective: self.objective,
-            acceptance_criteria: serde_json::from_str(&self.acceptance_criteria_json).unwrap_or_default(),
+            acceptance_criteria: serde_json::from_str(&self.acceptance_criteria_json)
+                .unwrap_or_default(),
             dependency_refs: serde_json::from_str(&self.dependency_refs_json).unwrap_or_default(),
-            expected_evidence: serde_json::from_str(&self.expected_evidence_json).unwrap_or_default(),
-            expected_resource_scope: serde_json::from_str(&self.expected_resource_scope_json).unwrap_or_default(),
-            risk_level: RiskLevel::from_str(&self.risk_level).unwrap_or(RiskLevel::Low),
+            expected_evidence: serde_json::from_str(&self.expected_evidence_json)
+                .unwrap_or_default(),
+            expected_resource_scope: serde_json::from_str(&self.expected_resource_scope_json)
+                .unwrap_or_default(),
+            risk_level: RiskLevel::parse(&self.risk_level).unwrap_or(RiskLevel::Low),
             requires_approval: self.requires_approval != 0,
             task_fingerprint: self.task_fingerprint,
             state: parse_planned_state(&self.state),
@@ -935,12 +963,13 @@ struct ApprovalRow {
 }
 
 impl ApprovalRow {
-    fn to_approval(self) -> ApprovalRequest {
+    fn into_approval(self) -> ApprovalRequest {
         ApprovalRequest {
             approval_id: self.approval_id,
             goal_id: self.goal_id,
             plan_revision_id: self.plan_revision_id,
-            approval_type: ApprovalType::from_str(&self.approval_type).unwrap_or(ApprovalType::ApproveInitialPlan),
+            approval_type: ApprovalType::parse(&self.approval_type)
+                .unwrap_or(ApprovalType::ApproveInitialPlan),
             requested_action: serde_json::from_str(&self.requested_action_json).unwrap_or_default(),
             payload_digest: self.payload_digest,
             reason: self.reason,
@@ -965,7 +994,11 @@ fn parse_dt(s: &str) -> chrono::DateTime<Utc> {
 }
 
 fn db_err(e: sqlx::Error) -> CoreError {
-    CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System)
+    CoreError::new(
+        ErrorCode::PersistenceError,
+        e.to_string(),
+        ErrorSource::System,
+    )
 }
 
 fn evidence_policy_str(ep: &harness_core::contracts::goal::EvidencePolicy) -> &'static str {

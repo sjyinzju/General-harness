@@ -74,7 +74,11 @@ mod tests {
 
     #[test]
     fn test_terminal_no_transitions() {
-        for terminal in &[GoalState::Succeeded, GoalState::Failed, GoalState::Cancelled] {
+        for terminal in &[
+            GoalState::Succeeded,
+            GoalState::Failed,
+            GoalState::Cancelled,
+        ] {
             for target in &[
                 GoalState::Draft,
                 GoalState::Validated,
@@ -97,45 +101,87 @@ mod tests {
 
     #[test]
     fn test_draft_progression() {
-        assert!(GoalFsm::can_transition(GoalState::Draft, GoalState::Validated));
-        assert!(GoalFsm::can_transition(GoalState::Draft, GoalState::Cancelled));
-        assert!(!GoalFsm::can_transition(GoalState::Draft, GoalState::Active));
+        assert!(GoalFsm::can_transition(
+            GoalState::Draft,
+            GoalState::Validated
+        ));
+        assert!(GoalFsm::can_transition(
+            GoalState::Draft,
+            GoalState::Cancelled
+        ));
+        assert!(!GoalFsm::can_transition(
+            GoalState::Draft,
+            GoalState::Active
+        ));
     }
 
     #[test]
     fn test_validated_progression() {
-        assert!(GoalFsm::can_transition(GoalState::Validated, GoalState::Planning));
-        assert!(GoalFsm::can_transition(GoalState::Validated, GoalState::Cancelled));
-        assert!(!GoalFsm::can_transition(GoalState::Validated, GoalState::Succeeded));
+        assert!(GoalFsm::can_transition(
+            GoalState::Validated,
+            GoalState::Planning
+        ));
+        assert!(GoalFsm::can_transition(
+            GoalState::Validated,
+            GoalState::Cancelled
+        ));
+        assert!(!GoalFsm::can_transition(
+            GoalState::Validated,
+            GoalState::Succeeded
+        ));
     }
 
     #[test]
     fn test_active_to_planning_replan() {
         // Active → Planning is allowed for replan (creates new PlanRevision)
-        assert!(GoalFsm::can_transition(GoalState::Active, GoalState::Planning));
+        assert!(GoalFsm::can_transition(
+            GoalState::Active,
+            GoalState::Planning
+        ));
     }
 
     #[test]
     fn test_active_to_succeeded() {
-        assert!(GoalFsm::can_transition(GoalState::Active, GoalState::Succeeded));
+        assert!(GoalFsm::can_transition(
+            GoalState::Active,
+            GoalState::Succeeded
+        ));
     }
 
     #[test]
     fn test_paused_progression() {
-        assert!(GoalFsm::can_transition(GoalState::Paused, GoalState::Active));
-        assert!(GoalFsm::can_transition(GoalState::Paused, GoalState::Cancelled));
-        assert!(!GoalFsm::can_transition(GoalState::Paused, GoalState::Succeeded));
+        assert!(GoalFsm::can_transition(
+            GoalState::Paused,
+            GoalState::Active
+        ));
+        assert!(GoalFsm::can_transition(
+            GoalState::Paused,
+            GoalState::Cancelled
+        ));
+        assert!(!GoalFsm::can_transition(
+            GoalState::Paused,
+            GoalState::Succeeded
+        ));
     }
 
     #[test]
     fn test_blocked_progression() {
-        assert!(GoalFsm::can_transition(GoalState::Blocked, GoalState::Active));
-        assert!(GoalFsm::can_transition(GoalState::Blocked, GoalState::WaitingForApproval));
+        assert!(GoalFsm::can_transition(
+            GoalState::Blocked,
+            GoalState::Active
+        ));
+        assert!(GoalFsm::can_transition(
+            GoalState::Blocked,
+            GoalState::WaitingForApproval
+        ));
     }
 
     #[test]
     fn test_no_self_transition() {
-        assert!(!GoalFsm::can_transition(GoalState::Active, GoalState::Active));
+        assert!(!GoalFsm::can_transition(
+            GoalState::Active,
+            GoalState::Active
+        ));
         assert!(!GoalFsm::can_transition(GoalState::Draft, GoalState::Draft));
     }
 }

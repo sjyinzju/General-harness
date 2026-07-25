@@ -249,7 +249,7 @@ impl RiskLevel {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
@@ -309,7 +309,9 @@ impl PlannedTaskState {
 
 /// Validate that a DAG of dependencies has no cycles.
 /// `deps` maps each client_ref to its dependency client_refs.
-pub fn validate_dag_no_cycles(deps: &std::collections::HashMap<String, Vec<String>>) -> Result<(), Vec<String>> {
+pub fn validate_dag_no_cycles(
+    deps: &std::collections::HashMap<String, Vec<String>>,
+) -> Result<(), Vec<String>> {
     let mut cycle_paths: Vec<String> = Vec::new();
 
     // DFS-based cycle detection with recursion stack coloring.
@@ -500,8 +502,8 @@ mod tests {
 
     #[test]
     fn test_risk_level_from_str() {
-        assert_eq!(RiskLevel::from_str("low"), Some(RiskLevel::Low));
-        assert_eq!(RiskLevel::from_str("high"), Some(RiskLevel::High));
-        assert_eq!(RiskLevel::from_str("unknown"), None);
+        assert_eq!(RiskLevel::parse("low"), Some(RiskLevel::Low));
+        assert_eq!(RiskLevel::parse("high"), Some(RiskLevel::High));
+        assert_eq!(RiskLevel::parse("unknown"), None);
     }
 }

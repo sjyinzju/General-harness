@@ -79,37 +79,85 @@ mod tests {
 
     #[test]
     fn test_proposed_progression() {
-        assert!(PlanFsm::can_transition(PlanState::Proposed, PlanState::Validating));
-        assert!(PlanFsm::can_transition(PlanState::Proposed, PlanState::Rejected));
-        assert!(PlanFsm::can_transition(PlanState::Proposed, PlanState::Cancelled));
-        assert!(!PlanFsm::can_transition(PlanState::Proposed, PlanState::Active));
+        assert!(PlanFsm::can_transition(
+            PlanState::Proposed,
+            PlanState::Validating
+        ));
+        assert!(PlanFsm::can_transition(
+            PlanState::Proposed,
+            PlanState::Rejected
+        ));
+        assert!(PlanFsm::can_transition(
+            PlanState::Proposed,
+            PlanState::Cancelled
+        ));
+        assert!(!PlanFsm::can_transition(
+            PlanState::Proposed,
+            PlanState::Active
+        ));
     }
 
     #[test]
     fn test_validating_progression() {
-        assert!(PlanFsm::can_transition(PlanState::Validating, PlanState::Validated));
-        assert!(PlanFsm::can_transition(PlanState::Validating, PlanState::Invalid));
-        assert!(!PlanFsm::can_transition(PlanState::Validating, PlanState::Active));
+        assert!(PlanFsm::can_transition(
+            PlanState::Validating,
+            PlanState::Validated
+        ));
+        assert!(PlanFsm::can_transition(
+            PlanState::Validating,
+            PlanState::Invalid
+        ));
+        assert!(!PlanFsm::can_transition(
+            PlanState::Validating,
+            PlanState::Active
+        ));
     }
 
     #[test]
     fn test_validated_progression() {
-        assert!(PlanFsm::can_transition(PlanState::Validated, PlanState::Active));
-        assert!(PlanFsm::can_transition(PlanState::Validated, PlanState::Rejected));
-        assert!(!PlanFsm::can_transition(PlanState::Validated, PlanState::Superseded));
+        assert!(PlanFsm::can_transition(
+            PlanState::Validated,
+            PlanState::Active
+        ));
+        assert!(PlanFsm::can_transition(
+            PlanState::Validated,
+            PlanState::Rejected
+        ));
+        assert!(!PlanFsm::can_transition(
+            PlanState::Validated,
+            PlanState::Superseded
+        ));
     }
 
     #[test]
     fn test_active_progression() {
-        assert!(PlanFsm::can_transition(PlanState::Active, PlanState::Superseded));
-        assert!(PlanFsm::can_transition(PlanState::Active, PlanState::Completed));
-        assert!(PlanFsm::can_transition(PlanState::Active, PlanState::Cancelled));
-        assert!(!PlanFsm::can_transition(PlanState::Active, PlanState::Validating));
+        assert!(PlanFsm::can_transition(
+            PlanState::Active,
+            PlanState::Superseded
+        ));
+        assert!(PlanFsm::can_transition(
+            PlanState::Active,
+            PlanState::Completed
+        ));
+        assert!(PlanFsm::can_transition(
+            PlanState::Active,
+            PlanState::Cancelled
+        ));
+        assert!(!PlanFsm::can_transition(
+            PlanState::Active,
+            PlanState::Validating
+        ));
     }
 
     #[test]
     fn test_no_self_transition() {
-        assert!(!PlanFsm::can_transition(PlanState::Active, PlanState::Active));
-        assert!(!PlanFsm::can_transition(PlanState::Proposed, PlanState::Proposed));
+        assert!(!PlanFsm::can_transition(
+            PlanState::Active,
+            PlanState::Active
+        ));
+        assert!(!PlanFsm::can_transition(
+            PlanState::Proposed,
+            PlanState::Proposed
+        ));
     }
 }

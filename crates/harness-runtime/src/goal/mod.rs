@@ -234,7 +234,7 @@ impl ApprovalType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "approve_initial_plan" => Some(Self::ApproveInitialPlan),
             "approve_high_risk_task" => Some(Self::ApproveHighRiskTask),
@@ -260,7 +260,10 @@ pub enum ApprovalState {
 
 impl ApprovalState {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Approved | Self::Rejected | Self::Expired | Self::Cancelled)
+        matches!(
+            self,
+            Self::Approved | Self::Rejected | Self::Expired | Self::Cancelled
+        )
     }
 }
 
