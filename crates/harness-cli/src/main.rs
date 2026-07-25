@@ -172,7 +172,7 @@ async fn dispatch_command(
                 eprintln!("error: missing supervisor subcommand");
                 false
             } else {
-                dispatch_supervisor(args, db, db_path).await
+                dispatch_supervisor(args, db, db_path, graph).await
             }
         }
         _ => {
@@ -583,10 +583,21 @@ async fn cmd_review_standalone(
     }
 }
 
-async fn dispatch_supervisor(args: &[String], db: &Database, db_path: &str) -> bool {
+async fn dispatch_supervisor(
+    args: &[String],
+    db: &Database,
+    db_path: &str,
+    graph: &ProductionGraph,
+) -> bool {
     let state_dir = parse_flag(args, "--state-dir").unwrap_or("default");
     match args[2].as_str() {
-        "run" => match commands::supervisor::cmd_supervisor_run(db, state_dir).await {
+        "run" => match commands::supervisor::cmd_supervisor_run(
+            db,
+            state_dir,
+            graph.supervisor_services.clone(),
+        )
+        .await
+        {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("error: {e}");

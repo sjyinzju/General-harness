@@ -40,15 +40,9 @@ mod ipc_tests {
         assert!(!IpcCommand::parse("supervisor.status")
             .unwrap()
             .has_side_effects());
-        assert!(!IpcCommand::parse("task.status")
-            .unwrap()
-            .has_side_effects());
-        assert!(!IpcCommand::parse("review.show")
-            .unwrap()
-            .has_side_effects());
-        assert!(!IpcCommand::parse("review.list")
-            .unwrap()
-            .has_side_effects());
+        assert!(!IpcCommand::parse("task.status").unwrap().has_side_effects());
+        assert!(!IpcCommand::parse("review.show").unwrap().has_side_effects());
+        assert!(!IpcCommand::parse("review.list").unwrap().has_side_effects());
         assert!(!IpcCommand::parse("integration.show")
             .unwrap()
             .has_side_effects());
@@ -56,26 +50,16 @@ mod ipc_tests {
             .unwrap()
             .has_side_effects());
         assert!(!IpcCommand::parse("health").unwrap().has_side_effects());
-        assert!(!IpcCommand::parse("diagnostics")
-            .unwrap()
-            .has_side_effects());
+        assert!(!IpcCommand::parse("diagnostics").unwrap().has_side_effects());
 
         // Write commands
-        assert!(IpcCommand::parse("task.start")
-            .unwrap()
-            .has_side_effects());
-        assert!(IpcCommand::parse("task.resume")
-            .unwrap()
-            .has_side_effects());
-        assert!(IpcCommand::parse("task.cancel")
-            .unwrap()
-            .has_side_effects());
+        assert!(IpcCommand::parse("task.start").unwrap().has_side_effects());
+        assert!(IpcCommand::parse("task.resume").unwrap().has_side_effects());
+        assert!(IpcCommand::parse("task.cancel").unwrap().has_side_effects());
         assert!(IpcCommand::parse("review.create")
             .unwrap()
             .has_side_effects());
-        assert!(IpcCommand::parse("review.run")
-            .unwrap()
-            .has_side_effects());
+        assert!(IpcCommand::parse("review.run").unwrap().has_side_effects());
         assert!(IpcCommand::parse("integration.enqueue")
             .unwrap()
             .has_side_effects());

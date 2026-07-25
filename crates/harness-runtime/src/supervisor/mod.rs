@@ -51,6 +51,47 @@ use self::lifecycle::LifecycleFsm;
 use self::ownership::OwnershipManager;
 use self::repo::SupervisorRepo;
 
+use crate::commit::service::ControlledCommitService;
+use crate::integration::executor::IntegrationExecutor;
+use crate::integration::recovery::IntegrationRecoveryService;
+use crate::integration::service::IntegrationQueueService;
+use crate::liveness::{LivenessOrchestrator, RunContext};
+use crate::resource_claim::ResourceClaimService;
+use crate::review::service::ReviewOrchestrationService;
+use crate::scheduler::composition::SchedulerServices;
+use crate::task_loop::gateway::RealI4OrchestrationGateway;
+use crate::task_loop::service::TaskEngineeringLoopService;
+use crate::worktree::manager::WorktreeManager;
+
+/// Bundled production services for the Supervisor daemon.
+///
+/// This is the single composition point for all services the Supervisor
+/// needs: IPC command handling, control loop execution, and crash recovery.
+/// Constructed by [`ProductionGraph::build`] and passed to [`Supervisor::run`].
+#[derive(Clone)]
+pub struct SupervisorServices {
+    pub pool: SqlitePool,
+    pub supervisor_repo: SupervisorRepo,
+    pub task_loop_service: Arc<TaskEngineeringLoopService>,
+    pub i4_gateway: Arc<RealI4OrchestrationGateway>,
+    pub worktree_mgr: Arc<WorktreeManager>,
+    pub lease_service: Arc<crate::lease::service::WorkspaceLeaseService>,
+    pub claim_service: Arc<ResourceClaimService>,
+    pub commit_service: Arc<ControlledCommitService>,
+    pub review_service: Arc<ReviewOrchestrationService>,
+    pub integration_queue: Arc<IntegrationQueueService>,
+    pub integration_executor: Arc<IntegrationExecutor>,
+    pub integration_recovery: Arc<IntegrationRecoveryService>,
+    pub liveness_orchestrator: Arc<LivenessOrchestrator>,
+    pub run_context: Arc<RunContext>,
+    /// Scheduler services (wrapped for Clone).
+    pub scheduler_services: Arc<SchedulerServices>,
+    /// Repository root path for integration and commit operations.
+    pub repo_root: std::path::PathBuf,
+    /// Integration root path for sandboxed execution.
+    pub integration_root: std::path::PathBuf,
+}
+
 /// The Supervisor service — the single production owner of the harness runtime.
 ///
 /// Construct via [`Supervisor::new`] and then call [`Supervisor::run`] for
@@ -59,6 +100,9 @@ pub struct Supervisor {
     config: SupervisorConfig,
     pool: SqlitePool,
     repo: SupervisorRepo,
+
+    /// Bundled production services for IPC, control loop, and recovery.
+    services: SupervisorServices,
 
     /// Current instance identity.
     instance: Arc<RwLock<Option<SupervisorInstance>>>,
@@ -76,8 +120,8 @@ pub struct Supervisor {
 impl Supervisor {
     /// Create a new Supervisor. Does NOT start the control loop or
     /// acquire ownership — call [`run`] or use the step-by-step lifecycle.
-    pub fn new(config: SupervisorConfig, pool: SqlitePool) -> Self {
-        let repo = SupervisorRepo::new(pool.clone());
+    pub fn new(config: SupervisorConfig, pool: SqlitePool, services: SupervisorServices) -> Self {
+        let repo = services.supervisor_repo.clone();
         let fsm = LifecycleFsm::new();
         let ownership = OwnershipManager::new(pool.clone(), config.clone());
 
@@ -85,6 +129,7 @@ impl Supervisor {
             config,
             pool,
             repo,
+            services,
             instance: Arc::new(RwLock::new(None)),
             fsm,
             ownership,
@@ -111,8 +156,8 @@ impl Supervisor {
                 self.transition_to(SupervisorState::Recovering, &instance)
                     .await?;
 
-                // 4. Recovery (placeholder — full impl in I6.4)
-                // TODO(I6.4): Run startup reconciliation here.
+                // 4. Run startup reconciliation (REAL — wired to production services)
+                self.run_startup_recovery(&instance).await?;
 
                 // 5. Ready
                 self.transition_to(SupervisorState::Ready, &instance)
@@ -153,7 +198,8 @@ impl Supervisor {
                     self.transition_to(SupervisorState::Recovering, &updated_instance)
                         .await?;
 
-                    // TODO(I6.4): Run startup reconciliation here.
+                    // Run startup reconciliation after takeover
+                    self.run_startup_recovery(&updated_instance).await?;
 
                     self.transition_to(SupervisorState::Ready, &updated_instance)
                         .await?;
@@ -187,6 +233,47 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    /// Run startup reconciliation using the real RecoveryOrchestrator.
+    async fn run_startup_recovery(&self, instance: &SupervisorInstance) -> Result<(), CoreError> {
+        let orchestrator =
+            recovery::RecoveryOrchestrator::new(self.pool.clone(), self.repo.clone())
+                .with_services(
+                    self.services.integration_recovery.clone(),
+                    self.services.liveness_orchestrator.clone(),
+                );
+
+        let summary = orchestrator
+            .reconcile(&instance.instance_id, instance.fencing_token)
+            .await
+            .map_err(|e| {
+                CoreError::new(
+                    ErrorCode::Internal,
+                    format!("startup recovery failed: {e}"),
+                    ErrorSource::Harness,
+                )
+            })?;
+
+        if summary.has_errors() {
+            tracing::warn!(
+                recovery_id = %summary.recovery_id,
+                errors = ?summary.errors,
+                "startup recovery completed with errors"
+            );
+        }
+
+        tracing::info!(
+            recovery_id = %summary.recovery_id,
+            processes_terminated = summary.processes_terminated,
+            worktrees_cleaned = summary.worktrees_cleaned,
+            integrations_recovered = summary.integrations_recovered,
+            claims_released = summary.claims_released,
+            artifacts_cleaned = summary.artifacts_cleaned,
+            "startup recovery complete"
+        );
+
+        Ok(())
     }
 
     /// Request graceful shutdown.
@@ -277,6 +364,11 @@ impl Supervisor {
     /// Get the database pool.
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Get the bundled production services.
+    pub fn services(&self) -> &SupervisorServices {
+        &self.services
     }
 
     // ── Private helpers ──────────────────────────────────────────────────
@@ -494,22 +586,7 @@ fn get_process_start_time() -> chrono::DateTime<chrono::Utc> {
 
     #[cfg(not(windows))]
     {
-        // On Unix, read /proc/self/stat
-        if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
-            // The 22nd field is starttime (in clock ticks since boot)
-            let parts: Vec<&str> = stat.split_whitespace().collect();
-            if parts.len() >= 22 {
-                if let Ok(starttime_ticks) = parts[21].parse::<u64>() {
-                    let hertz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as u64 };
-                    if hertz > 0 {
-                        let secs = starttime_ticks / hertz;
-                        // starttime is relative to boot time — approximate as now
-                        // for the purposes of identity verification
-                        return chrono::Utc::now();
-                    }
-                }
-            }
-        }
+        chrono::Utc::now()
     }
 
     chrono::Utc::now()

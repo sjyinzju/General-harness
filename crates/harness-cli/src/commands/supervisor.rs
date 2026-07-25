@@ -1,24 +1,25 @@
 //! Supervisor CLI — lifecycle commands for the harness supervisor daemon.
 //!
-//! In I6.1, these commands work directly (no IPC required).
-//! In I6.2+, the default production path will route through IPC.
+//! Production path (default): routes through IPC to a running Supervisor.
+//! Supervisor run/start: creates and manages the Supervisor daemon process.
 
 use harness_core::contracts::supervisor::{SupervisorConfig, SupervisorState};
 use harness_runtime::db::Database;
 use harness_runtime::supervisor::repo::SupervisorRepo;
-use harness_runtime::supervisor::Supervisor;
+use harness_runtime::supervisor::{Supervisor, SupervisorServices};
 
 /// Run the supervisor in the foreground. Blocks until stopped or error.
 pub async fn cmd_supervisor_run(
     db: &Database,
     state_directory_id: &str,
+    services: SupervisorServices,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = SupervisorConfig {
         state_directory_id: state_directory_id.to_string(),
         ..SupervisorConfig::default()
     };
 
-    let supervisor = Supervisor::new(config, db.pool.clone());
+    let supervisor = Supervisor::new(config, db.pool.clone(), services);
 
     println!("Starting supervisor for state directory: {state_directory_id}");
     println!("Instance ID will be assigned at startup");
@@ -86,12 +87,48 @@ pub async fn cmd_supervisor_start(
     Ok(())
 }
 
-/// Show supervisor status from the database.
+/// Show supervisor status — tries IPC first, falls back to direct DB read.
 pub async fn cmd_supervisor_status(
     db: &Database,
     state_directory_id: &str,
     json: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Try IPC first
+    let ipc_result = try_ipc_status(state_directory_id).await;
+
+    match ipc_result {
+        Ok(Some(status_json)) => {
+            if json {
+                println!("{}", serde_json::to_string_pretty(&status_json)?);
+            } else {
+                println!("Supervisor Status (via IPC):");
+                if let Some(inst) = status_json.get("instance_id").and_then(|v| v.as_str()) {
+                    println!("  Instance ID:       {inst}");
+                }
+                if let Some(state) = status_json.get("state").and_then(|v| v.as_str()) {
+                    println!("  State:             {state}");
+                }
+                if let Some(pid) = status_json.get("pid") {
+                    println!("  PID:               {pid}");
+                }
+                if let Some(token) = status_json.get("fencing_token") {
+                    println!("  Fencing Token:     {token}");
+                }
+                if let Some(ts) = status_json.get("heartbeat_at").and_then(|v| v.as_str()) {
+                    println!("  Last Heartbeat:    {ts}");
+                }
+            }
+            return Ok(());
+        }
+        Ok(None) => {
+            // No supervisor reachable via IPC — fall back to DB
+        }
+        Err(_) => {
+            // IPC error — fall back to DB
+        }
+    }
+
+    // Fallback: direct database read
     let repo = SupervisorRepo::new(db.pool.clone());
 
     match repo.get_active_instance_for_dir(state_directory_id).await {
@@ -115,10 +152,11 @@ pub async fn cmd_supervisor_status(
                     "protocol_version": instance.protocol_version,
                     "binary_version": instance.binary_version,
                     "lease_active": lease.map(|l| l.is_active == 1).unwrap_or(false),
+                    "source": "database (offline)",
                 });
                 println!("{}", serde_json::to_string_pretty(&status)?);
             } else {
-                println!("Supervisor Status:");
+                println!("Supervisor Status (via database — offline):");
                 println!("  Instance ID:       {}", instance.instance_id);
                 println!("  State:             {}", instance.state);
                 println!("  PID:               {}", instance.pid);
@@ -140,8 +178,6 @@ pub async fn cmd_supervisor_status(
                     "  Lease Active:      {}",
                     lease.map(|l| l.is_active == 1).unwrap_or(false)
                 );
-                println!("  Protocol Version:  {}", instance.protocol_version);
-                println!("  Binary Version:    {}", instance.binary_version);
             }
             Ok(())
         }
@@ -157,12 +193,55 @@ pub async fn cmd_supervisor_status(
     }
 }
 
+/// Try to get supervisor status via IPC.
+async fn try_ipc_status(
+    _state_directory_id: &str,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    // Attempt IPC connection to the supervisor
+    match crate::ipc_client::SupervisorClient::new(crate::ipc_client::DEFAULT_ENDPOINT)
+        .send_request("supervisor.status", serde_json::json!({}))
+        .await
+    {
+        Ok(resp) => {
+            if let Some(payload) = resp.payload {
+                Ok(Some(payload))
+            } else {
+                Ok(None)
+            }
+        }
+        Err(_) => Ok(None), // Supervisor not reachable
+    }
+}
+
 /// Request the supervisor to stop gracefully.
-/// In I6.1, this updates the lease to expire immediately.
+/// Tries IPC first, falls back to direct lease deactivation.
 pub async fn cmd_supervisor_stop(
     db: &Database,
     state_directory_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Try IPC first
+    match crate::ipc_client::SupervisorClient::new(crate::ipc_client::DEFAULT_ENDPOINT)
+        .send_request("supervisor.stop", serde_json::json!({}))
+        .await
+    {
+        Ok(resp) => {
+            if let Some(payload) = resp.payload {
+                if payload
+                    .get("acknowledged")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    println!("Stop request acknowledged by supervisor.");
+                    return Ok(());
+                }
+            }
+        }
+        Err(_) => {
+            // IPC not available — fall back to direct DB
+        }
+    }
+
+    // Fallback: direct database
     let repo = SupervisorRepo::new(db.pool.clone());
 
     match repo.get_active_instance_for_dir(state_directory_id).await {
@@ -175,7 +254,6 @@ pub async fn cmd_supervisor_stop(
                 return Ok(());
             }
 
-            // Deactivate the lease to trigger graceful stop on next heartbeat
             repo.force_deactivate_lease(state_directory_id).await?;
             println!(
                 "Stop request sent to supervisor {} (PID: {}).",

@@ -1,5 +1,5 @@
 //! Thin CLI IPC client — discovers and communicates with the Supervisor.
-#![allow(dead_code)] // IPC client wiring in progress — will be activated in I6.5+
+#![allow(dead_code)] // CliMode and ping are wired in status/stop commands; full activation in I6.5+
 //!
 //! Default production mode: all CLI commands route through IPC to the
 //! running Supervisor. If no Supervisor is available, the CLI reports

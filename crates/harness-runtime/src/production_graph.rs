@@ -1,5 +1,6 @@
 //! Production service graph — wires the full I4 runtime (Scheduler →
-//! Worktree → Lease → Claims → Verification → Finalization) into a single
+//! Worktree → Lease → Claims → Verification → Finalization) and I5/I6
+//! services (Review, Commit, Integration, Supervisor) into a single
 //! ready-to-use bundle for the CLI, runtime, and tests.
 //!
 //! This is the ONLY production composition root.  CLI commands, the
@@ -16,7 +17,12 @@
 //! - All services use production constructors (never `*_for_tests`).
 //! - `LivenessOrchestrator` is MANDATORY in production; only tests may
 //!   construct a graph without it.
+//! - I5 services (ControlledCommitService, ReviewOrchestrationService,
+//!   IntegrationQueueService, IntegrationExecutor, IntegrationRecoveryService)
+//!   are constructed here and shared — never constructed ad-hoc by CLI commands.
+//! - SupervisorServices bundles all I6 runtime services for the Supervisor daemon.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,13 +30,20 @@ use harness_core::contracts::scheduler::ConcurrencyConfig;
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
+use crate::commit::service::ControlledCommitService;
+use crate::integration::executor::IntegrationExecutor;
+use crate::integration::recovery::IntegrationRecoveryService;
+use crate::integration::service::IntegrationQueueService;
 use crate::lease::clock::SystemClock;
 use crate::lease::types::LeaseConfig;
 use crate::liveness::{LivenessOrchestrator, RunContext};
 use crate::resource_claim::lease_adapter::LeaseServiceAdapter;
 use crate::resource_claim::ResourceClaimRepo;
 use crate::resource_claim::ResourceClaimService;
+use crate::review::service::ReviewOrchestrationService;
 use crate::scheduler::composition::SchedulerServices;
+use crate::supervisor::repo::SupervisorRepo;
+use crate::supervisor::SupervisorServices;
 use crate::task_loop::gateway::RealI4OrchestrationGateway;
 use crate::task_loop::service::TaskEngineeringLoopService;
 use crate::worktree::git::GitRunner;
@@ -46,8 +59,8 @@ use crate::worktree::manager::WorktreeManager;
 /// dispatches Agents through the certified pipeline.
 pub struct ProductionGraph {
     pub pool: SqlitePool,
-    pub scheduler_services: SchedulerServices,
-    pub task_loop_service: TaskEngineeringLoopService,
+    pub scheduler_services: Arc<SchedulerServices>,
+    pub task_loop_service: Arc<TaskEngineeringLoopService>,
     pub i4_gateway: Arc<RealI4OrchestrationGateway>,
     pub worktree_mgr: Arc<WorktreeManager>,
     pub lease_service: Arc<crate::lease::service::WorkspaceLeaseService>,
@@ -58,6 +71,30 @@ pub struct ProductionGraph {
     pub liveness_orchestrator: Arc<LivenessOrchestrator>,
     /// The run context for this graph instance (managed temp/evidence).
     pub run_context: Arc<RunContext>,
+
+    // ── I5 production services (shared, not ad-hoc) ──────────────
+    /// Controlled commit service — admission + commit creation.
+    pub commit_service: Arc<ControlledCommitService>,
+    /// Review orchestration service — full I4.6 review lifecycle.
+    pub review_service: Arc<ReviewOrchestrationService>,
+    /// Integration queue service — enqueue, dequeue, publish.
+    pub integration_queue: Arc<IntegrationQueueService>,
+    /// Integration executor — sandboxed integration execution.
+    pub integration_executor: Arc<IntegrationExecutor>,
+    /// Integration recovery service — reconciliation of stuck states.
+    pub integration_recovery: Arc<IntegrationRecoveryService>,
+
+    // ── I6 supervisor services ───────────────────────────────────
+    /// Supervisor repository for instance/lease/event persistence.
+    pub supervisor_repo: SupervisorRepo,
+    /// Bundled supervisor services for the daemon (IPC, control loop, recovery).
+    pub supervisor_services: SupervisorServices,
+
+    // ── Paths ────────────────────────────────────────────────────
+    /// Repository root path.
+    pub repo_root: PathBuf,
+    /// Integration root path.
+    pub integration_root: PathBuf,
 }
 
 impl ProductionGraph {
@@ -74,8 +111,8 @@ impl ProductionGraph {
     /// location (repo root, user profile, etc.) — this fails closed.
     pub fn build(
         pool: SqlitePool,
-        worktree_root: &std::path::Path,
-        repo_root: &std::path::Path,
+        worktree_root: &Path,
+        repo_root: &Path,
         run_context: Arc<RunContext>,
     ) -> Result<Self, String> {
         // ── Clock (production: wall-clock) ──────────────────────────
@@ -127,13 +164,13 @@ impl ProductionGraph {
         ));
 
         // ── Scheduler services ─────────────────────────────────────
-        let scheduler_services = SchedulerServices::build(
+        let scheduler_services = Arc::new(SchedulerServices::build(
             pool.clone(),
             worktree_mgr.clone(),
             lease_service.clone(),
             claim_service.clone(),
             ConcurrencyConfig::default(),
-        );
+        ));
 
         // ── Extract heartbeat registry before moving scheduler_services ──
         let heartbeat_registry = scheduler_services.heartbeat_registry.clone();
@@ -145,15 +182,59 @@ impl ProductionGraph {
         ));
 
         // ── Task loop service wired with real I4 gateway ───────────
-        let task_loop_service =
-            TaskEngineeringLoopService::new(pool.clone()).with_i4_gateway(i4_gateway.clone());
+        let task_loop_service = Arc::new(
+            TaskEngineeringLoopService::new(pool.clone()).with_i4_gateway(i4_gateway.clone()),
+        );
 
         // ── Liveness orchestrator (MANDATORY for production) ───────
         let liveness_config = run_context.config().clone();
-        let liveness_orchestrator = LivenessOrchestrator::new(liveness_config, pool.clone())
-            .map_err(|e| format!("liveness orchestrator: {e}"))?;
+        let liveness_orchestrator = Arc::new(
+            LivenessOrchestrator::new(liveness_config, pool.clone())
+                .map_err(|e| format!("liveness orchestrator: {e}"))?,
+        );
 
         tracing::info!("liveness orchestrator initialized in production graph");
+
+        // ── I5: ControlledCommitService ────────────────────────────
+        let commit_service = Arc::new(ControlledCommitService::new(pool.clone()));
+
+        // ── I5: ReviewOrchestrationService ─────────────────────────
+        let review_service = Arc::new(ReviewOrchestrationService::new(pool.clone()));
+
+        // ── I5: Integration services ───────────────────────────────
+        let integration_root = repo_root.join("target").join("harness-integration");
+        let integration_queue = Arc::new(IntegrationQueueService::new(pool.clone()));
+        let integration_executor =
+            Arc::new(IntegrationExecutor::new(pool.clone(), &integration_root));
+        let integration_recovery = Arc::new(IntegrationRecoveryService::new(pool.clone()));
+
+        // ── I6: Supervisor repository ──────────────────────────────
+        let supervisor_repo = SupervisorRepo::new(pool.clone());
+
+        // ── I6: Supervisor services bundle ─────────────────────────
+        let repo_root_buf = repo_root.to_path_buf();
+        let integration_root_buf = repo_root.join("target").join("harness-integration");
+        let supervisor_services = SupervisorServices {
+            pool: pool.clone(),
+            supervisor_repo: supervisor_repo.clone(),
+            task_loop_service: task_loop_service.clone(),
+            i4_gateway: i4_gateway.clone(),
+            worktree_mgr: worktree_mgr.clone(),
+            lease_service: lease_service.clone(),
+            claim_service: claim_service.clone(),
+            commit_service: commit_service.clone(),
+            review_service: review_service.clone(),
+            integration_queue: integration_queue.clone(),
+            integration_executor: integration_executor.clone(),
+            integration_recovery: integration_recovery.clone(),
+            liveness_orchestrator: liveness_orchestrator.clone(),
+            run_context: run_context.clone(),
+            scheduler_services: scheduler_services.clone(),
+            repo_root: repo_root_buf,
+            integration_root: integration_root_buf,
+        };
+
+        tracing::info!("I5/I6 production services initialized");
 
         Ok(Self {
             pool,
@@ -164,8 +245,17 @@ impl ProductionGraph {
             lease_service,
             claim_service,
             heartbeat_registry,
-            liveness_orchestrator: Arc::new(liveness_orchestrator),
+            liveness_orchestrator: liveness_orchestrator.clone(),
             run_context,
+            commit_service,
+            review_service,
+            integration_queue,
+            integration_executor,
+            integration_recovery,
+            supervisor_repo,
+            supervisor_services,
+            repo_root: repo_root.to_path_buf(),
+            integration_root,
         })
     }
 
@@ -196,7 +286,7 @@ impl ProductionGraph {
 
     /// Build a production graph for tests (no managed temp env redirect).
     /// Liveness is still mandatory but uses a test config.
-    pub fn build_for_tests(pool: SqlitePool, repo_root: &std::path::Path) -> Result<Self, String> {
+    pub fn build_for_tests(pool: SqlitePool, repo_root: &Path) -> Result<Self, String> {
         let run_context = Arc::new(
             RunContext::create(repo_root, "test-head", false)
                 .map_err(|e| format!("run context: {e}"))?,
