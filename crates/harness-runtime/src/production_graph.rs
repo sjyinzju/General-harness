@@ -30,6 +30,9 @@ use harness_core::contracts::scheduler::ConcurrencyConfig;
 use sqlx::SqlitePool;
 use tokio_util::sync::CancellationToken;
 
+use harness_core::contracts::agent_adapter::AgentAdapter;
+use harness_core::contracts::runtime_profile::RuntimeProfile;
+
 use crate::commit::service::ControlledCommitService;
 use crate::goal::evaluator::ProductionGoalEvaluator;
 use crate::goal::planner::ProductionGoalPlanner;
@@ -97,6 +100,12 @@ pub struct ProductionGraph {
     // ── I7 goal services ─────────────────────────────────────────
     /// Prompt registry for versioned goal prompts.
     pub prompt_registry: Arc<PromptRegistry>,
+    /// Goal loop service — orchestrates Plan → Task → Review → Commit → Integration.
+    pub goal_loop_service: Arc<GoalLoopService>,
+    /// Goal Planner (production — calls real LLM via AgentAdapter).
+    pub goal_planner: Option<Arc<ProductionGoalPlanner>>,
+    /// Goal Evaluator (production — calls real LLM via AgentAdapter).
+    pub goal_evaluator: Option<Arc<ProductionGoalEvaluator>>,
 
     // ── Paths ────────────────────────────────────────────────────
     /// Repository root path.
@@ -122,6 +131,21 @@ impl ProductionGraph {
         worktree_root: &Path,
         repo_root: &Path,
         run_context: Arc<RunContext>,
+    ) -> Result<Self, String> {
+        Self::build_with_adapter(pool, worktree_root, repo_root, run_context, None, None)
+    }
+
+    /// Build the full production service graph with optional AgentAdapter
+    /// for Planner/Evaluator construction. When `adapter` and `profile` are
+    /// provided, ProductionGoalPlanner and ProductionGoalEvaluator are
+    /// constructed and wired into the GoalLoopService.
+    pub fn build_with_adapter(
+        pool: SqlitePool,
+        worktree_root: &Path,
+        repo_root: &Path,
+        run_context: Arc<RunContext>,
+        adapter: Option<Arc<dyn AgentAdapter>>,
+        profile: Option<RuntimeProfile>,
     ) -> Result<Self, String> {
         // ── Clock (production: wall-clock) ──────────────────────────
         let clock: Arc<dyn crate::lease::clock::Clock + Send + Sync> = Arc::new(SystemClock);
@@ -216,13 +240,72 @@ impl ProductionGraph {
             Arc::new(IntegrationExecutor::new(pool.clone(), &integration_root));
         let integration_recovery = Arc::new(IntegrationRecoveryService::new(pool.clone()));
 
-        // ── I7: GoalLoopService ────────────────────────────────────
+        // ── I7: Prompt registry ────────────────────────────────────
         let prompt_registry = Arc::new(PromptRegistry::new());
-        let goal_loop_service = Arc::new(GoalLoopService::new(pool.clone()));
 
         // ── I7: Goal planner/evaluator (wired when adapters/profiles available) ─
-        let goal_planner: Option<Arc<ProductionGoalPlanner>> = None;
-        let goal_evaluator: Option<Arc<ProductionGoalEvaluator>> = None;
+        let profile_for_svc = profile.clone();
+        let (goal_planner, goal_evaluator): (
+            Option<Arc<ProductionGoalPlanner>>,
+            Option<Arc<ProductionGoalEvaluator>>,
+        ) = match (adapter, profile) {
+            (Some(adapter), Some(profile)) => {
+                let planner = Arc::new(ProductionGoalPlanner::new(
+                    Arc::clone(&adapter),
+                    profile.clone(),
+                    prompt_registry.clone(),
+                ));
+                let evaluator = Arc::new(ProductionGoalEvaluator::new(
+                    Arc::clone(&adapter),
+                    profile.clone(),
+                    prompt_registry.clone(),
+                ));
+                tracing::info!(
+                    profile_id = %profile.id,
+                    "goal planner/evaluator constructed with production adapter"
+                );
+                (Some(planner), Some(evaluator))
+            }
+            _ => {
+                tracing::info!(
+                    "goal planner/evaluator not constructed (no adapter/profile provided)"
+                );
+                (None, None)
+            }
+        };
+
+        // ── I7: GoalLoopService (wired with all production services) ──
+        let mut goal_loop_svc = GoalLoopService::new(pool.clone());
+
+        // Wire profiles first (consumes self, must handle Err)
+        if let Some(ref profile) = profile_for_svc {
+            goal_loop_svc = match goal_loop_svc.with_goal_profiles(profile.clone(), profile.clone())
+            {
+                Ok(svc) => svc,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "failed to configure goal profiles; continuing without profile isolation"
+                    );
+                    GoalLoopService::new(pool.clone())
+                }
+            };
+        }
+
+        // Wire planner/evaluator (non-consuming builder)
+        if let (Some(ref planner), Some(ref evaluator)) = (&goal_planner, &goal_evaluator) {
+            goal_loop_svc =
+                goal_loop_svc.with_planner_evaluator(Arc::clone(planner), Arc::clone(evaluator));
+        }
+
+        // Wire production services (non-consuming builder)
+        goal_loop_svc = goal_loop_svc.with_production_services(
+            task_loop_service.clone(),
+            review_service.clone(),
+            commit_service.clone(),
+            integration_queue.clone(),
+        );
+        let goal_loop_service = Arc::new(goal_loop_svc);
 
         // ── I6: Supervisor repository ──────────────────────────────
         let supervisor_repo = SupervisorRepo::new(pool.clone());
@@ -275,6 +358,9 @@ impl ProductionGraph {
             supervisor_repo,
             supervisor_services,
             prompt_registry,
+            goal_loop_service,
+            goal_planner,
+            goal_evaluator,
             repo_root: repo_root.to_path_buf(),
             integration_root,
         })

@@ -227,6 +227,8 @@ pub struct PlannedTask {
 
     /// When this task was materialized into a real Task (None if not yet).
     pub materialized_task_id: Option<String>,
+    /// The I4.5 loop_id when materialized (None if not yet).
+    pub materialized_loop_id: Option<String>,
 }
 
 /// Risk level for approval gating.

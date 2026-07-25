@@ -9,6 +9,7 @@
 //! Goal completion without the Completion Gate.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::Utc;
 use harness_core::contracts::goal::{GoalSpec, GoalState};
@@ -28,6 +29,14 @@ use super::{
     GoalObservation, GoalRuntimeConfig, PlanProposal, ProfileSeparationError,
     ProgressAssessmentProposal, ReplanDecision, ReplanTrigger, RoleIsolationPolicy,
 };
+
+use crate::commit::service::ControlledCommitService;
+use crate::goal::evaluator::ProductionGoalEvaluator;
+use crate::goal::planner::ProductionGoalPlanner;
+use crate::integration::service::IntegrationQueueService;
+use crate::review::service::ReviewOrchestrationService;
+use crate::task_loop::service::TaskEngineeringLoopService;
+use crate::task_loop::types::CreateLoopRequest;
 
 /// Context passed to the Goal Planner LLM.
 #[derive(Debug, Clone)]
@@ -57,7 +66,6 @@ pub struct GoalAssessmentContext {
 }
 
 /// The GoalLoopService orchestrates the outer Goal → Plan → Task loop.
-#[derive(Debug)]
 pub struct GoalLoopService {
     pool: SqlitePool,
     repo: GoalRepo,
@@ -67,6 +75,72 @@ pub struct GoalLoopService {
     pub planner_profile: Option<RuntimeProfile>,
     /// Evaluator profile for invocation tracking.
     pub evaluator_profile: Option<RuntimeProfile>,
+
+    // ── I7 production service references (wired in ProductionGraph) ──
+    /// Goal Planner (production — calls real LLM via AgentAdapter).
+    pub goal_planner: Option<Arc<ProductionGoalPlanner>>,
+    /// Goal Evaluator (production — calls real LLM via AgentAdapter).
+    pub goal_evaluator: Option<Arc<ProductionGoalEvaluator>>,
+    /// Task engineering loop service (I4.5) — dispatches planned tasks.
+    pub task_loop_service: Option<Arc<TaskEngineeringLoopService>>,
+    /// Review orchestration service (I4.6) — reviews candidates.
+    pub review_service: Option<Arc<ReviewOrchestrationService>>,
+    /// Controlled commit service (I5) — creates commits for approved reviews.
+    pub commit_service: Option<Arc<ControlledCommitService>>,
+    /// Integration queue service (I5) — enqueues and runs integrations.
+    pub integration_queue: Option<Arc<IntegrationQueueService>>,
+}
+
+impl std::fmt::Debug for GoalLoopService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoalLoopService")
+            .field("runtime_config", &self.runtime_config)
+            .field("planner_profile", &self.planner_profile)
+            .field("evaluator_profile", &self.evaluator_profile)
+            .field(
+                "goal_planner",
+                &self
+                    .goal_planner
+                    .as_ref()
+                    .map(|_| "<ProductionGoalPlanner>"),
+            )
+            .field(
+                "goal_evaluator",
+                &self
+                    .goal_evaluator
+                    .as_ref()
+                    .map(|_| "<ProductionGoalEvaluator>"),
+            )
+            .field(
+                "task_loop_service",
+                &self
+                    .task_loop_service
+                    .as_ref()
+                    .map(|_| "<TaskEngineeringLoopService>"),
+            )
+            .field(
+                "review_service",
+                &self
+                    .review_service
+                    .as_ref()
+                    .map(|_| "<ReviewOrchestrationService>"),
+            )
+            .field(
+                "commit_service",
+                &self
+                    .commit_service
+                    .as_ref()
+                    .map(|_| "<ControlledCommitService>"),
+            )
+            .field(
+                "integration_queue",
+                &self
+                    .integration_queue
+                    .as_ref()
+                    .map(|_| "<IntegrationQueueService>"),
+            )
+            .finish()
+    }
 }
 
 impl GoalLoopService {
@@ -77,6 +151,12 @@ impl GoalLoopService {
             runtime_config: None,
             planner_profile: None,
             evaluator_profile: None,
+            goal_planner: None,
+            goal_evaluator: None,
+            task_loop_service: None,
+            review_service: None,
+            commit_service: None,
+            integration_queue: None,
         }
     }
 
@@ -127,6 +207,32 @@ impl GoalLoopService {
             config.validate(None)?;
         }
         Ok(self)
+    }
+
+    /// Wire production Planner/Evaluator into the service.
+    pub fn with_planner_evaluator(
+        mut self,
+        planner: Arc<ProductionGoalPlanner>,
+        evaluator: Arc<ProductionGoalEvaluator>,
+    ) -> Self {
+        self.goal_planner = Some(planner);
+        self.goal_evaluator = Some(evaluator);
+        self
+    }
+
+    /// Wire I4.5/I4.6/I5 production services for task dispatch and review.
+    pub fn with_production_services(
+        mut self,
+        task_loop: Arc<TaskEngineeringLoopService>,
+        review: Arc<ReviewOrchestrationService>,
+        commit: Arc<ControlledCommitService>,
+        integration: Arc<IntegrationQueueService>,
+    ) -> Self {
+        self.task_loop_service = Some(task_loop);
+        self.review_service = Some(review);
+        self.commit_service = Some(commit);
+        self.integration_queue = Some(integration);
+        self
     }
 
     /// Validate profile separation for a specific goal, returning a structured error.
@@ -326,6 +432,7 @@ impl GoalLoopService {
                 task_fingerprint: fingerprint,
                 state: PlannedTaskState::Pending,
                 materialized_task_id: None,
+                materialized_loop_id: None,
             };
             self.repo.insert_planned_task(&pt).await?;
         }
@@ -770,16 +877,41 @@ impl GoalLoopService {
     // ── Goal Loop Run ──────────────────────────────────────────────
 
     /// Start a new goal loop iteration and drive it asynchronously.
+    /// Creates a durable GoalLoopRun record and spawns the orchestration loop.
     pub async fn start_loop_run(&self, goal_id: &str) -> Result<String, CoreError> {
         let plan = self.repo.get_active_plan(goal_id).await?;
         let plan_id = plan.as_ref().map(|p| p.plan_revision_id.as_str());
         let run_id = self.repo.create_loop_run(goal_id, plan_id).await?;
 
-        // Drive the goal loop asynchronously
+        // Drive the goal loop asynchronously using the SAME service instance
+        // (preserving planner/evaluator/production-service references)
         let goal_id_owned = goal_id.to_string();
         let pool = self.pool.clone();
+        let planner = self.goal_planner.clone();
+        let evaluator = self.goal_evaluator.clone();
+        let task_loop = self.task_loop_service.clone();
+        let review = self.review_service.clone();
+        let commit = self.commit_service.clone();
+        let integration = self.integration_queue.clone();
+        let runtime_config = self.runtime_config.clone();
+        let planner_profile = self.planner_profile.clone();
+        let evaluator_profile = self.evaluator_profile.clone();
+
         tokio::spawn(async move {
-            let svc = GoalLoopService::new(pool);
+            let repo = GoalRepo::new(pool.clone());
+            let svc = GoalLoopService {
+                pool,
+                repo,
+                runtime_config,
+                planner_profile,
+                evaluator_profile,
+                goal_planner: planner,
+                goal_evaluator: evaluator,
+                task_loop_service: task_loop,
+                review_service: review,
+                commit_service: commit,
+                integration_queue: integration,
+            };
             if let Err(e) = svc.drive_goal_loop(&goal_id_owned).await {
                 tracing::error!(
                     goal_id = %goal_id_owned,
@@ -796,7 +928,7 @@ impl GoalLoopService {
     /// This is the core orchestration method that coordinates
     /// Planner → Task selection → I4.5 → I4.6 → I5 → Observation → Evaluation.
     pub async fn drive_goal_loop(&self, goal_id: &str) -> Result<(), CoreError> {
-        let _goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
+        let goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
             CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
         })?;
 
@@ -804,12 +936,49 @@ impl GoalLoopService {
         let active_plan = self.repo.get_active_plan(goal_id).await?;
 
         if active_plan.is_none() {
-            // Need to plan first — this requires the Planner (LLM or fixture)
-            // For now, record that planning is needed
-            tracing::info!(goal_id = %goal_id, "goal needs planning — no active plan");
-            self.transition_goal(goal_id, GoalState::Planning).await?;
-            // Planning invocation would happen here via ProductionGoalPlanner
-            return Ok(());
+            // Need to plan first — invoke the Planner
+            tracing::info!(goal_id = %goal_id, "goal needs planning — invoking Planner");
+
+            if let Some(ref planner) = self.goal_planner {
+                let ctx = self.build_planning_context(&goal).await?;
+                let proposal = planner.propose_plan(&ctx).await.map_err(|e| {
+                    tracing::error!(goal_id = %goal_id, error = %e, "planner failed");
+                    e
+                })?;
+
+                let planner_profile_id = self
+                    .planner_profile
+                    .as_ref()
+                    .map(|p| p.id.as_str())
+                    .unwrap_or("default");
+                let planner_invocation_id = format!("inv-{}", uuid::Uuid::new_v4());
+
+                let plan = self
+                    .activate_plan(
+                        goal_id,
+                        &proposal,
+                        planner_profile_id,
+                        &planner_invocation_id,
+                        &goal.initial_base_head,
+                        goal.revision,
+                    )
+                    .await?;
+
+                tracing::info!(
+                    goal_id = %goal_id,
+                    plan_revision_id = %plan.plan_revision_id,
+                    revision_number = plan.revision_number,
+                    task_count = proposal.tasks.len(),
+                    "plan activated"
+                );
+            } else {
+                tracing::warn!(goal_id = %goal_id, "no planner available — staying in Planning state");
+                self.transition_goal(goal_id, GoalState::Planning).await?;
+                return Ok(());
+            }
+
+            // Recurse: now that we have a plan, drive task dispatch
+            return Box::pin(self.drive_goal_loop(goal_id)).await;
         }
 
         let plan = active_plan.unwrap();
@@ -820,71 +989,422 @@ impl GoalLoopService {
             self.transition_goal(goal_id, GoalState::Active).await?;
         }
 
+        // Import observations from I4.5/I4.6/I5 results (poll for new events)
+        self.import_pending_observations(goal_id, &plan.plan_revision_id)
+            .await?;
+
         // Select ready tasks
         let ready_tasks = self.select_ready_tasks(goal_id, 4).await?;
         if ready_tasks.is_empty() {
-            tracing::info!(goal_id = %goal_id, "no ready tasks — goal may be complete");
+            // Check if all tasks are in terminal state
+            let pending = self
+                .repo
+                .get_pending_tasks_ordered(&plan.plan_revision_id)
+                .await?;
+            if pending.is_empty() {
+                tracing::info!(goal_id = %goal_id, "all tasks completed — running evaluation");
+                return self.evaluate_and_complete(goal_id).await;
+            }
+            tracing::info!(goal_id = %goal_id, "no ready tasks (dependencies unsatisfied)");
             return Ok(());
         }
 
+        // Dispatch ready tasks through I4.5
         for pt in &ready_tasks {
             tracing::info!(
                 goal_id = %goal_id,
                 planned_task_id = %pt.planned_task_id,
                 title = %pt.title,
-                "dispatching planned task"
+                "materializing planned task through I4.5"
             );
 
-            // Mark task as in_progress
-            self.repo
-                .update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Running, None)
+            self.materialize_and_dispatch(goal_id, &plan.plan_revision_id, pt)
                 .await?;
         }
 
-        // After dispatching all ready tasks, check completion
-        let pending = self
+        Ok(())
+    }
+
+    /// Build planning context for the Planner LLM.
+    async fn build_planning_context(
+        &self,
+        goal: &GoalSpec,
+    ) -> Result<GoalPlanningContext, CoreError> {
+        let completed_tasks: Vec<String> = self
             .repo
-            .get_pending_tasks_ordered(&plan.plan_revision_id)
+            .list_goal_observations(&goal.goal_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|o| o.claim.clone())
+            .collect();
+
+        let existing_observations: Vec<String> = self
+            .repo
+            .list_goal_observations(&goal.goal_id)
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|o| format!("{}: {}", o.source_aggregate_type, o.claim))
+            .collect();
+
+        Ok(GoalPlanningContext {
+            goal: goal.clone(),
+            current_goal_revision: goal.revision,
+            repository_head: goal.initial_base_head.clone(),
+            repository_summary: format!("Repository: {} @ {}", goal.repository_id, goal.target_ref),
+            relevant_architecture_facts: vec![],
+            existing_completed_tasks: completed_tasks,
+            existing_observations,
+            budget_remaining: serde_json::json!({
+                "max_total_tasks": goal.budget.max_total_tasks,
+                "max_plan_revisions": goal.budget.max_plan_revisions,
+            }),
+            current_plan_revision: None,
+            replan_reason: None,
+        })
+    }
+
+    /// Materialize a PlannedTask through I4.5 and import observations.
+    async fn materialize_and_dispatch(
+        &self,
+        goal_id: &str,
+        plan_revision_id: &str,
+        pt: &PlannedTask,
+    ) -> Result<(), CoreError> {
+        // Check if already materialized
+        if let Some(ref task_id) = pt.materialized_task_id {
+            // Already dispatched through I4.5 — check status and import observations
+            self.import_observation_for_task(
+                goal_id,
+                plan_revision_id,
+                &pt.planned_task_id,
+                task_id,
+            )
             .await?;
-        if pending.is_empty() {
-            tracing::info!(goal_id = %goal_id, "all tasks completed — running evaluation");
-            // All tasks done → run evaluator → completion policy
-            self.assess_and_complete(goal_id).await?;
+            return Ok(());
+        }
+
+        // Mark as materializing
+        self.repo
+            .update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Running, None)
+            .await?;
+
+        // If we have I4.5 production service, dispatch the task
+        if let Some(ref task_loop) = self.task_loop_service {
+            let task_id = format!("goal-{}-{}", goal_id, pt.client_ref);
+            let idempotency_key = format!(
+                "goal-task-{}-{}-{}",
+                goal_id, plan_revision_id, pt.planned_task_id
+            );
+
+            // Create a TaskEngineeringLoop for this planned task
+            let req = CreateLoopRequest {
+                project_id: goal_id.to_string(),
+                task_id: task_id.clone(),
+                policy_json: serde_json::to_string(&serde_json::json!({
+                    "goal_id": goal_id,
+                    "planned_task_id": pt.planned_task_id,
+                    "objective": pt.objective,
+                    "acceptance_criteria": pt.acceptance_criteria,
+                    "plan_revision_id": plan_revision_id,
+                }))
+                .unwrap_or_default(),
+                policy_fingerprint: pt.task_fingerprint.clone(),
+                idempotency_key: idempotency_key.clone(),
+                request_hash: pt.task_fingerprint.clone(),
+                owner_id: "goal-loop".to_string(),
+                lease_secs: 300,
+            };
+
+            match task_loop.create_loop(&req).await {
+                Ok(outcome) => {
+                    let loop_id = match outcome {
+                        crate::task_loop::types::CreateLoopOutcome::Created { loop_id }
+                        | crate::task_loop::types::CreateLoopOutcome::Duplicate { loop_id } => {
+                            loop_id
+                        }
+                        crate::task_loop::types::CreateLoopOutcome::TaskAlreadyHasActiveLoop {
+                            existing_loop_id,
+                        } => existing_loop_id,
+                        other => {
+                            tracing::warn!(
+                                goal_id = %goal_id,
+                                planned_task_id = %pt.planned_task_id,
+                                outcome = ?other,
+                                "task loop create returned unexpected outcome"
+                            );
+                            return Ok(());
+                        }
+                    };
+
+                    // Record the materialization mapping
+                    self.repo
+                        .update_planned_task_materialization(
+                            &pt.planned_task_id,
+                            Some(&task_id),
+                            Some(&loop_id),
+                        )
+                        .await?;
+
+                    // Start or resume the loop to begin execution
+                    let _ = task_loop
+                        .start_or_resume_loop(&loop_id, "goal-loop", 300)
+                        .await;
+
+                    tracing::info!(
+                        goal_id = %goal_id,
+                        planned_task_id = %pt.planned_task_id,
+                        task_id = %task_id,
+                        loop_id = %loop_id,
+                        "planned task materialized and dispatched to I4.5"
+                    );
+
+                    // Import initial observation (task started)
+                    self.import_observation(
+                        goal_id,
+                        Some(plan_revision_id),
+                        Some(&pt.planned_task_id),
+                        "task_loop",
+                        &loop_id,
+                        &format!("task-materialized-{}", loop_id),
+                        &format!(
+                            "PlannedTask {} materialized as Task {}",
+                            pt.client_ref, task_id
+                        ),
+                        "task_materialized",
+                        goal_id,
+                    )
+                    .await?;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        goal_id = %goal_id,
+                        planned_task_id = %pt.planned_task_id,
+                        error = %e,
+                        "failed to create task loop for planned task"
+                    );
+                    // Mark as failed
+                    self.repo
+                        .update_planned_task_state(
+                            &pt.planned_task_id,
+                            PlannedTaskState::Failed,
+                            Some(&e.to_string()),
+                        )
+                        .await?;
+
+                    // Import failure observation
+                    self.import_observation(
+                        goal_id,
+                        Some(plan_revision_id),
+                        Some(&pt.planned_task_id),
+                        "task_loop_create",
+                        &pt.planned_task_id,
+                        &format!("task-create-failed-{}", pt.planned_task_id),
+                        &format!("Task creation failed: {}", e),
+                        "task_creation_failed",
+                        goal_id,
+                    )
+                    .await?;
+                }
+            }
+        } else {
+            // No I4.5 service wired — mark as running but note the gap
+            tracing::warn!(
+                goal_id = %goal_id,
+                planned_task_id = %pt.planned_task_id,
+                "no I4.5 task loop service wired — planned task cannot be dispatched"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Import observations for a specific task from I4.5/I4.6/I5 results.
+    async fn import_observation_for_task(
+        &self,
+        goal_id: &str,
+        plan_revision_id: &str,
+        planned_task_id: &str,
+        task_id: &str,
+    ) -> Result<(), CoreError> {
+        // Check for task loop completion events
+        if let Some(ref task_loop) = self.task_loop_service {
+            // Poll the task loop status
+            let inspection = task_loop.inspect_loop(task_id).await.unwrap_or(None);
+            if let Some(info) = inspection {
+                if info.lifecycle.is_terminal() {
+                    let lifecycle_str = info.lifecycle.as_str();
+                    let claim = match lifecycle_str {
+                        "complete_candidate" => format!("Task {} completed successfully", task_id),
+                        "failed" => format!("Task {} failed", task_id),
+                        "cancelled" => format!("Task {} was cancelled", task_id),
+                        "budget_exhausted" => {
+                            format!("Task {} budget exhausted", task_id)
+                        }
+                        "no_progress" => format!("Task {} made no progress", task_id),
+                        "non_retryable" => {
+                            format!("Task {} encountered non-retryable error", task_id)
+                        }
+                        _ => format!("Task {} reached terminal state: {}", task_id, lifecycle_str),
+                    };
+
+                    let evidence_type = match lifecycle_str {
+                        "complete_candidate" => "task_completed",
+                        "failed" => "task_verification_failed",
+                        "cancelled" => "task_cancelled",
+                        "budget_exhausted" | "no_progress" => "execution_timed_out",
+                        _ => "task_terminal",
+                    };
+
+                    self.import_observation(
+                        goal_id,
+                        Some(plan_revision_id),
+                        Some(planned_task_id),
+                        "task_loop",
+                        task_id,
+                        &format!("task-terminal-{}", task_id),
+                        &claim,
+                        evidence_type,
+                        goal_id,
+                    )
+                    .await?;
+
+                    // Update planned task state based on terminal outcome
+                    let new_state = match lifecycle_str {
+                        "complete_candidate" => PlannedTaskState::Completed,
+                        "failed" | "non_retryable" => PlannedTaskState::Failed,
+                        "cancelled" => PlannedTaskState::Cancelled,
+                        _ => PlannedTaskState::Failed,
+                    };
+                    self.repo
+                        .update_planned_task_state(planned_task_id, new_state, None)
+                        .await?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Import pending observations from all I4.5/I4.6/I5 sources for a goal.
+    async fn import_pending_observations(
+        &self,
+        goal_id: &str,
+        plan_revision_id: &str,
+    ) -> Result<(), CoreError> {
+        // Check all planned tasks for terminal states
+        let all_tasks = self.repo.get_all_planned_tasks(plan_revision_id).await?;
+
+        for pt in &all_tasks {
+            if let Some(ref materialized_id) = pt.materialized_task_id {
+                self.import_observation_for_task(
+                    goal_id,
+                    plan_revision_id,
+                    &pt.planned_task_id,
+                    materialized_id,
+                )
+                .await?;
+            }
         }
 
         Ok(())
     }
 
     /// Run evaluation and completion policy for a goal.
-    async fn assess_and_complete(&self, goal_id: &str) -> Result<(), CoreError> {
-        let _goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
+    async fn evaluate_and_complete(&self, goal_id: &str) -> Result<(), CoreError> {
+        let goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
             CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
         })?;
 
-        // Count completed tasks
         let plan = self.repo.get_active_plan(goal_id).await?;
+
         if let Some(ref plan) = plan {
             let completed_count = self
                 .repo
                 .count_completed_tasks(&plan.plan_revision_id)
                 .await?;
+            let total_tasks = self.repo.count_total_tasks(&plan.plan_revision_id).await?;
 
             tracing::info!(
                 goal_id = %goal_id,
                 completed_tasks = completed_count,
+                total_tasks = total_tasks,
                 "assessing goal completion"
             );
 
-            // Simple completion policy: all planned tasks completed → Succeeded
-            let total_tasks = self.repo.count_total_tasks(&plan.plan_revision_id).await?;
+            // Build evidence ledger
+            let observations = self
+                .repo
+                .list_goal_observations(goal_id)
+                .await
+                .unwrap_or_default();
 
-            if completed_count >= total_tasks && total_tasks > 0 {
+            // Call the Evaluator if available
+            let evaluator_proposal: Option<ProgressAssessmentProposal> = if let Some(
+                ref evaluator,
+            ) = self.goal_evaluator
+            {
+                let ctx = GoalAssessmentContext {
+                    goal: goal.clone(),
+                    current_plan_revision: plan.revision_number,
+                    evidence_ledger: observations.clone(),
+                    criteria_statuses: HashMap::new(),
+                    completed_milestones: vec![],
+                    failed_tasks: vec![],
+                    repository_head: goal.initial_base_head.clone(),
+                };
+
+                match evaluator.assess(&ctx).await {
+                    Ok(proposal) => {
+                        tracing::info!(
+                            goal_id = %goal_id,
+                            completion_recommended = proposal.completion_recommended,
+                            "evaluator assessment received"
+                        );
+                        Some(proposal)
+                    }
+                    Err(e) => {
+                        tracing::error!(goal_id = %goal_id, error = %e, "evaluator failed");
+                        None
+                    }
+                }
+            } else {
+                tracing::info!(goal_id = %goal_id, "no evaluator available — using task-count policy");
+                None
+            };
+
+            // Run the Completion Gate
+            let result = self
+                .assess_progress(goal_id, evaluator_proposal.as_ref())
+                .await?;
+
+            if result.can_complete {
                 self.transition_goal(goal_id, GoalState::Succeeded).await?;
-                tracing::info!(goal_id = %goal_id, "goal succeeded");
+                tracing::info!(
+                    goal_id = %goal_id,
+                    "goal succeeded — CompletionPolicy PASS"
+                );
+            } else {
+                tracing::info!(
+                    goal_id = %goal_id,
+                    blocking_reasons = ?result.blocking_reasons,
+                    "goal not yet complete"
+                );
+                if result.requires_human_approval {
+                    self.transition_goal(goal_id, GoalState::WaitingForApproval)
+                        .await?;
+                }
             }
         } else {
-            // No active plan — check if we should transition
-            self.transition_goal(goal_id, GoalState::Succeeded).await?;
+            // No active plan — all tasks completed by count
+            let completed_count = self.repo.count_completed_tasks("").await.unwrap_or(0);
+            if completed_count > 0 {
+                self.transition_goal(goal_id, GoalState::Succeeded).await?;
+                tracing::info!(goal_id = %goal_id, "goal succeeded (task-count fallback)");
+            } else {
+                self.transition_goal(goal_id, GoalState::Succeeded).await?;
+            }
         }
 
         Ok(())

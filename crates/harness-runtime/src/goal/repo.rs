@@ -408,8 +408,8 @@ impl GoalRepo {
             r#"INSERT INTO planned_tasks (planned_task_id, plan_revision_id, milestone_id,
                client_ref, title, objective, acceptance_criteria_json, dependency_refs_json,
                expected_evidence_json, expected_resource_scope_json, risk_level,
-               requires_approval, task_fingerprint, state, materialized_task_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               requires_approval, task_fingerprint, state, materialized_task_id, materialized_loop_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&pt.planned_task_id)
         .bind(&pt.plan_revision_id)
@@ -426,6 +426,7 @@ impl GoalRepo {
         .bind(&pt.task_fingerprint)
         .bind(pt.state.as_str())
         .bind(&pt.materialized_task_id)
+        .bind(&pt.materialized_loop_id)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -504,7 +505,7 @@ impl GoalRepo {
             r#"SELECT planned_task_id, plan_revision_id, milestone_id, client_ref, title,
                objective, acceptance_criteria_json, dependency_refs_json, expected_evidence_json,
                expected_resource_scope_json, risk_level, requires_approval, task_fingerprint,
-               state, materialized_task_id
+               state, materialized_task_id, materialized_loop_id
                FROM planned_tasks
                WHERE plan_revision_id = ? AND state = 'pending'
                ORDER BY client_ref ASC"#,
@@ -714,6 +715,67 @@ impl GoalRepo {
         .await
         .map_err(db_err)?;
         Ok(())
+    }
+
+    // ── Observations ──────────────────────────────────────────────────
+
+    /// List all observations for a goal, ordered by creation time.
+    pub async fn list_goal_observations(
+        &self,
+        goal_id: &str,
+    ) -> Result<Vec<GoalObservation>, CoreError> {
+        let rows: Vec<GoalObservationRow> = sqlx::query_as(
+            r#"SELECT observation_id, goal_id, plan_revision_id, planned_task_id,
+               source_aggregate_type, source_aggregate_id, source_event_id, source_digest,
+               repository_head, claim, evidence_type, created_at
+               FROM goal_observations WHERE goal_id = ?
+               ORDER BY created_at ASC"#,
+        )
+        .bind(goal_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| r.into_observation()).collect())
+    }
+
+    /// Update the materialized task and loop IDs for a planned task.
+    pub async fn update_planned_task_materialization(
+        &self,
+        planned_task_id: &str,
+        materialized_task_id: Option<&str>,
+        materialized_loop_id: Option<&str>,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            "UPDATE planned_tasks SET materialized_task_id = ?, materialized_loop_id = ? WHERE planned_task_id = ?",
+        )
+        .bind(materialized_task_id)
+        .bind(materialized_loop_id)
+        .bind(planned_task_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// Get all planned tasks for a plan revision (all states).
+    pub async fn get_all_planned_tasks(
+        &self,
+        plan_revision_id: &str,
+    ) -> Result<Vec<PlannedTask>, CoreError> {
+        let rows: Vec<PlannedTaskRow> = sqlx::query_as(
+            r#"SELECT planned_task_id, plan_revision_id, milestone_id, client_ref, title,
+               objective, acceptance_criteria_json, dependency_refs_json, expected_evidence_json,
+               expected_resource_scope_json, risk_level, requires_approval, task_fingerprint,
+               state, materialized_task_id, materialized_loop_id
+               FROM planned_tasks
+               WHERE plan_revision_id = ?
+               ORDER BY client_ref ASC"#,
+        )
+        .bind(plan_revision_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| r.into_planned_task()).collect())
     }
 
     // ── Events ──────────────────────────────────────────────────────
@@ -943,6 +1005,7 @@ struct PlannedTaskRow {
     task_fingerprint: String,
     state: String,
     materialized_task_id: Option<String>,
+    materialized_loop_id: Option<String>,
 }
 
 impl PlannedTaskRow {
@@ -966,6 +1029,42 @@ impl PlannedTaskRow {
             task_fingerprint: self.task_fingerprint,
             state: parse_planned_state(&self.state),
             materialized_task_id: self.materialized_task_id,
+            materialized_loop_id: self.materialized_loop_id,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct GoalObservationRow {
+    observation_id: String,
+    goal_id: String,
+    plan_revision_id: Option<String>,
+    planned_task_id: Option<String>,
+    source_aggregate_type: String,
+    source_aggregate_id: String,
+    source_event_id: String,
+    source_digest: String,
+    repository_head: String,
+    claim: String,
+    evidence_type: String,
+    created_at: String,
+}
+
+impl GoalObservationRow {
+    fn into_observation(self) -> GoalObservation {
+        GoalObservation {
+            observation_id: self.observation_id,
+            goal_id: self.goal_id,
+            plan_revision_id: self.plan_revision_id,
+            planned_task_id: self.planned_task_id,
+            source_aggregate_type: self.source_aggregate_type,
+            source_aggregate_id: self.source_aggregate_id,
+            source_event_id: self.source_event_id,
+            source_digest: self.source_digest,
+            repository_head: self.repository_head,
+            claim: self.claim,
+            evidence_type: self.evidence_type,
+            created_at: parse_dt(&self.created_at),
         }
     }
 }
