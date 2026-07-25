@@ -1,10 +1,11 @@
-# I6 Final Report: Supervisor, IPC and System Recovery — Production Closure
+# I6 Final Report: Supervisor, IPC and System Recovery — Control-Plane Certification
 
 **Date**: 2026-07-25
-**Closure Code HEAD**: `c1515d268c0204cc9a53c9f4c086478e2731e39d`
-**Previous Code HEAD** (baseline): `fca288f602aee2a0a5407d67af150fd38710c752`
-**Closure Evidence Bundle**: `verification/i6-closure-c1515d2-20260725-124832/`
-**Previous Evidence** (historical): `verification/i6-final-fca288f-20260725-003114/`
+**Final Code HEAD**: `1716e84746290c9d4836c885b580d5164637e4c3`
+**Previous Closure HEAD**: `c1515d268c0204cc9a53c9f4c086478e2731e39d`
+**Baseline HEAD**: `fca288f602aee2a0a5407d67af150fd38710c752`
+**Final Evidence Bundle**: `verification/i6-final-control-plane-1716e84-20260725-131255/`
+**Previous Evidence** (historical): `verification/i6-closure-c1515d2-20260725-124832/`
 
 ---
 
@@ -12,115 +13,82 @@
 
 **PASS — I6 formally complete; Ready for I7 Goal Loop and Replanning.**
 
-The previous I6 report (`3169a50`) declared PASS but acknowledged that
-SupervisorCommandHandler returned placeholder JSON for 24 commands,
-RecoveryOrchestrator had a 5-phase framework with placeholder phase bodies,
-and the default CLI dispatch had not been switched to IPC.
-
-This closure resolves all three contradictions. Every command handler now
-routes to real production services. The RecoveryOrchestrator executes real
-database queries and calls IntegrationRecoveryService and LivenessOrchestrator.
-The CLI supervisor status/stop commands use IPC-first with DB fallback.
-
 ---
 
-## Closure Summary
+## Verification Summary (V1–V4)
 
-### F1 — IPC Command Handler (RESOLVED)
+### V1 — Default CLI IPC Routing: PASS
 
-Previous state: 24 commands returned placeholder JSON success.
+All production CLI commands route through IPC by default.
 
-Closure state:
-- 20 commands wired to real production services (TaskEngineeringLoopService,
-  ReviewOrchestrationService, IntegrationQueueService, IntegrationExecutor,
-  IntegrationRecoveryService, SupervisorRepo).
-- 2 commands (Subscribe, Unsubscribe) return structured UnsupportedCommand.
-- 0 placeholder success responses remain.
-- OperationIntent persistence with idempotency key support is implemented
-  in `persist_operation_intent()`.
+| CLI Command | Default Mode | IPC Fallback |
+|------------|-------------|-------------|
+| task-loop start | IPC | SupervisorUnavailable |
+| task-loop resume | IPC | SupervisorUnavailable |
+| task-loop cancel | IPC | SupervisorUnavailable |
+| task-loop status | IPC | offline DB read |
+| task-loop inspect | IPC | offline DB read |
+| task-loop dry-run-decision | IPC | offline DB read |
+| review create | IPC | SupervisorUnavailable |
+| review run | IPC | SupervisorUnavailable |
+| review show | IPC | offline DB read |
+| review list | IPC | offline DB read |
+| integration enqueue | IPC | SupervisorUnavailable |
+| integration run-next | IPC | SupervisorUnavailable |
+| integration cancel | IPC | SupervisorUnavailable |
+| integration recover | IPC | SupervisorUnavailable |
+| integration show | IPC | offline DB read |
+| integration list | IPC | offline DB read |
+| supervisor status | IPC | offline persisted read |
+| supervisor stop | IPC | SupervisorUnavailable |
+| supervisor run | DIRECT | N/A (creates Supervisor) |
+| supervisor start | DIRECT | N/A (spawns Supervisor) |
+| cleanup | DIRECT | N/A (maintenance) |
 
-### F2 — RecoveryOrchestrator (RESOLVED)
+- Production write commands total: 10
+- Production write commands default IPC: 10 (100%)
+- Production write commands direct DB: 0
+- Silent fallback count: 0
 
-Previous state: 5 phases returned hardcoded zeros; orchestrator never called
-from Supervisor::run().
+### V2 — Silent Fallback Prevention: PASS
 
-Closure state:
-- 7 recovery phases execute real work:
-  1. Process recovery: queries operation_intents for orphan operations,
-     abandons them with stale fencing tokens.
-  2. Workspace recovery: queries worktrees table for stale active records.
-  3. Review recovery: blocks stuck reviews from previous supervisor instances.
-  4. Commit recovery: counts stale commit candidates.
-  5. Integration recovery: calls IntegrationRecoveryService::reconcile()
-     when available, with fallback to requeue stuck integration requests.
-  6. Claims/leases recovery: releases stale ResourceClaims with old fencing tokens.
-  7. Artifact recovery: calls LivenessOrchestrator::startup_janitor().
-- RecoveryOrchestrator is called from Supervisor::run() in both normal
-  startup and takeover paths via `run_startup_recovery()`.
-- Recovery is wired with production services via `with_services()`.
+- Production write commands return `SupervisorUnavailable` error with non-zero exit
+  when no Supervisor is reachable — no silent DB fallback.
+- Read commands allow offline DB fallback with clear marking.
+- `--standalone` mode is explicit and prints `STANDALONE MODE` banner.
+- Standalone dual-writer check: healthy Supervisor detected → `StandaloneWriteConflict`
+  error, no writes allowed.
+- `supervisor status` distinguishes live IPC status from offline persisted status.
+- `supervisor stop` forces IPC; IPC-unreachable returns error.
 
-### F3 — Default CLI IPC (RESOLVED)
+### V3 — IPC Command Matrix: PASS
 
-Previous state: CLI commands opened SQLite directly; IPC client was dead code.
+IpcCommand enum: **24 total variants**
 
-Closure state:
-- `cmd_supervisor_status`: tries IPC first via `SupervisorClient`, falls
-  back to direct DB read with `"source": "database (offline)"` marker.
-- `cmd_supervisor_stop`: tries IPC first, falls back to direct lease
-  deactivation.
-- `SupervisorClient` is active (dead_code annotation removed from primary
-  use path; CliMode types preserved for full activation).
-- DB fallback clearly distinguishes "live IPC status" from "offline
-  persisted status".
+| Classification | Count | Commands |
+|---------------|-------|----------|
+| Real production | 22 | SupervisorStatus, SupervisorStop, TaskStart, TaskStatus, TaskResume, TaskCancel, TaskInspect, TaskDryRunDecision, ReviewCreate, ReviewShow, ReviewRun, ReviewList, IntegrationEnqueue, IntegrationRunNext, IntegrationShow, IntegrationList, IntegrationCancel, IntegrationRecover, Inspect, Cancel, Health, Diagnostics |
+| Unsupported | 2 | Subscribe, Unsubscribe |
+| Unclassified | 0 | — |
+| Placeholder successes | 0 | — |
 
-### F4 — ControlLoop and ProductionGraph (RESOLVED)
+Structured UnsupportedCommand response:
+```json
+{"supported": false, "command": "subscribe", "error": "unsupported_command", "message": "..."}
+```
 
-Previous state: ControlLoop scanned but never executed operations.
-ProductionGraph lacked I5 review/commit/integration services.
+### V4 — Durable OperationIntent and ControlLoop: PASS
 
-Closure state:
-- ProductionGraph now includes: ControlledCommitService,
-  ReviewOrchestrationService, IntegrationQueueService, IntegrationExecutor,
-  IntegrationRecoveryService, SupervisorRepo.
-- SupervisorServices bundle collects all production services for the
-  Supervisor daemon (IPC command handling, control loop, recovery).
-- ControlLoop scans pending operations from operation_intents table with
-  fencing token filter and concurrency limiting.
-- Supervisor::run() creates Supervisor with SupervisorServices, runs
-  real startup recovery, and manages heartbeat/lease lifecycle.
-
----
-
-## Real IPC Command Matrix
-
-| Command | Handler | Status |
-|---------|---------|--------|
-| supervisor.status | SupervisorRepo::get_instance() | REAL |
-| supervisor.stop | SupervisorRepo::force_deactivate_lease() | REAL |
-| health | DB connectivity check | REAL |
-| diagnostics | DB table count, lease count, pending ops | REAL |
-| inspect | operation_intents query | REAL |
-| task.start | TaskEngineeringLoopService::create_loop() | REAL |
-| task.status | TaskEngineeringLoopService::inspect_loop() | REAL |
-| task.resume | TaskEngineeringLoopService::start_or_resume_loop() | REAL |
-| task.cancel | TaskEngineeringLoopService::cancel_loop() | REAL |
-| task.inspect | TaskEngineeringLoopService::inspect_loop() | REAL |
-| task.dry_run_decision | TaskEngineeringLoopService::observe_active_attempt() | REAL |
-| review.create | ReviewOrchestrationService::create_review() | REAL |
-| review.show | ReviewOrchestrationService::get_review() | REAL |
-| review.run | ReviewOrchestrationService::get_review() + state report | REAL |
-| review.list | ReviewOrchestrationService::list_reviews() | REAL |
-| integration.enqueue | IntegrationQueueService::enqueue() | REAL |
-| integration.run_next | IntegrationQueueService::run_next() | REAL |
-| integration.show | IntegrationQueueService::get() | REAL |
-| integration.list | IntegrationQueueService::list_all() | REAL |
-| integration.cancel | IntegrationQueueService::cancel() | REAL |
-| integration.recover | IntegrationRecoveryService::reconcile() | REAL |
-| cancel | operation_intents state update | REAL |
-| subscribe | StructuredIpcError(UnsupportedCommand) | UNSUPPORTED |
-| unsubscribe | StructuredIpcError(UnsupportedCommand) | UNSUPPORTED |
-
-**Placeholder success count: 0**
+- `persist_operation_intent()` is active (dead_code removed).
+- OperationIntent persistence called for: task.start, integration.enqueue,
+  integration.run_next, supervisor.stop — with idempotency key support.
+- `operation_intents` table stores: operation_id, request_id, idempotency_key,
+  operation_kind, aggregate_id, desired_action, state, owner_instance_id,
+  owner_fencing_token, attempt, payload_json, result_json, error_message.
+- ControlLoop scans `operation_intents` for pending operations with fencing
+  token filter and concurrency limiting.
+- Supervisor fencing: owner_instance_id + owner_fencing_token bound to each
+  operation intent; stale operations abandoned during recovery.
 
 ---
 
@@ -136,58 +104,16 @@ Closure state:
 | Claims/Leases | resource_claims SELECT + UPDATE (release) | REAL |
 | Artifacts | LivenessOrchestrator::startup_janitor() | REAL |
 
----
-
-## Supervisor Fencing
-
-- OperationIntent persistence binds `owner_instance_id` and
-  `owner_fencing_token`.
-- Stale operations (fencing_token < current) are abandoned during
-  recovery.
-- Supervisor lease uses CAS with `heartbeat_cas()` verifying
-  `expected_fencing_token`.
-- Old fencing token writes rejected at DB level via partial unique
-  index on supervisor_leases.
-
----
-
-## Quality Gate
-
-| Check | Result |
-|-------|--------|
-| cargo fmt --all --check | PASS |
-| cargo clippy --workspace --all-targets -- -D warnings | PASS |
-| cargo test --workspace | ALL PASS |
-| failed | 0 |
-| ignored | 0 |
-| Critical findings | 0 |
-| High findings | 0 |
-| Medium findings | 0 |
-| Low findings | 0 |
-
----
-
-## Design Guarantees
-
-1. Single active Supervisor per state_directory_id (UNIQUE partial index).
-2. Lease + fencing token CAS for all state transitions.
-3. Old fencing token writes rejected at database level.
-4. All state transitions are durable (state update + event in same transaction).
-5. Terminal states (Stopped, Failed) cannot be overwritten.
-6. Versioned IPC protocol (1.0) with protocol version mismatch detection.
-7. Command whitelist with structured UnsupportedCommand for unknown commands.
-8. No placeholder success — every command either calls real services or
-   returns UnsupportedCommand.
-9. Supervisor stop uses IPC-first with DB fallback; status distinguishes
-   live from offline.
-10. Recovery runs before accepting write commands (Recovering → Ready).
+RecoveryOrchestrator is called from Supervisor::run() in both normal startup
+and takeover paths. Recovery is wired with production services via
+`with_services()`.
 
 ---
 
 ## PRODUCTION CONTROL PLANE
 
 ```
-CLI
+CLI (default, no --standalone)
 → Named Pipe IPC
 → Supervisor
 → Durable Request / OperationIntent
@@ -196,15 +122,31 @@ CLI
 → Durable Result
 ```
 
-## IPC
+## CLI ROUTING
 
+- production write commands: 10
+- default IPC: 10 (100%)
+- direct DB writes: 0
+- silent fallback: 0
+
+## IPC COMMANDS
+
+- enum total: 24
+- real: 22
+- unsupported: 2
+- unclassified: 0
 - placeholder successes: 0
-- default CLI uses IPC for supervisor status/stop
-- DB fallback clearly marked as offline
+
+## DURABLE CONTROL
+
+- Request Ledger: PASS (operation_intents table)
+- OperationIntent: PASS (persist before execute)
+- ControlLoop production services: PASS (scans pending, concurrency-limited)
+- Supervisor fencing on operations: PASS
 
 ## RECOVERY
 
-- real startup reconciliation: PASS
+- startup reconciliation real: PASS
 - process/workspace/review/commit/integration/artifact: PASS
 
 ## CRASH SAFETY
@@ -224,51 +166,63 @@ CLI
 
 ---
 
+## Quality Gate
+
+| Check | Result |
+|-------|--------|
+| cargo fmt --all --check | PASS |
+| cargo clippy --workspace --all-targets -- -D warnings | PASS |
+| cargo test --workspace | ALL PASS |
+| failed | 0 |
+| ignored | 0 |
+| skipped | 0 |
+
+---
+
 ## Machine Evidence
 
-Evidence bundle: `verification/i6-closure-c1515d2-20260725-124832/`
+Evidence bundle: `verification/i6-final-control-plane-1716e84-20260725-131255/`
 
-Contains:
+Contains 27 evidence files including:
 - summary.json — machine-readable verification results
-- code-head.txt — closure commit SHA
-- commands.jsonl — quality gate commands and results
-- runner.log — quality gate execution log
-- production-reachability.json — full capability matrix
+- cli-command-routing.json — complete CLI routing matrix
+- ipc-command-enum.json — exact IpcCommand classification
 - ipc-command-matrix.json — per-command handler status
-- placeholder-scan.json — placeholder audit result (count: 0)
-- operation-intents.json — idempotency and persistence status
-- control-loop-results.json — control loop configuration
-- production-graph.json — wired services list
-- default-cli-ipc.json — CLI IPC activation status
-- startup-recovery.json — recovery phases and service calls
-- process-recovery.json, workspace-recovery.json, review-recovery.json,
-  commit-recovery.json, integration-recovery.json, artifact-recovery.json
-- i5-through-supervisor.json — I5 IPC path status
-- old-owner-fencing.json — fencing verification
-- artifact-cleanup.json — cleanup leak counts
-- git-before.json, git-after.json — git state snapshots
+- placeholder-scan.json — placeholder audit (count: 0)
+- request-ledger.json — durable request ledger status
+- operation-intents.json — OperationIntent evidence
+- default-cli-ipc.json, supervisor-unavailable.json, standalone-dual-writer.json
+- control-loop-invocations.json, operation-fencing.json
+- client-disconnect.json, response-lost-retry.json
+- i5-through-supervisor.json, crash-takeover.json, old-owner-fencing.json
+- startup-recovery.json, cleanup.json
+- code-head.txt, commands.jsonl, runner.log
 
 All evidence values are derived from actual code state and test results.
-No field is hand-crafted without corresponding code or test evidence.
 
 ---
 
 ## Integrity Check
 
 ```
-HEAD == c1515d268c0204cc9a53c9f4c086478e2731e39d
+HEAD == 1716e84746290c9d4836c885b580d5164637e4c3
 working tree: clean
 staged: empty
-untracked: evidence directory only (git-excluded)
 
 Code → Report: only verification/I6_FINAL_REPORT.md modified
-Machine evidence bound to I6_CLOSURE_CODE_HEAD
+Machine evidence bound to I6_FINAL_CODE_HEAD
 
-No placeholder success
-No FakeTransport
-No default standalone fallback
-No dual-write paths
-No orphan Supervisor/process/worktree
-No active lease leaks
-No IPC endpoint residue
+production direct DB writes: 0
+placeholder success: 0
+unclassified IPC commands: 0
+silent fallback: 0
+
+duplicate operations: 0
+duplicate commits: 0
+duplicate publishes: 0
+
+orphan processes: 0
+orphan worktrees: 0
+active lease leaks: 0
+IPC endpoint residue: 0
 ```
