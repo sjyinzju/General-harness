@@ -278,6 +278,9 @@ pub struct SupervisorConfig {
     pub max_diagnostic_bytes: usize,
     /// State directory ID for this supervisor instance.
     pub state_directory_id: String,
+    /// IPC endpoint name (e.g., "harness-supervisor").
+    /// The actual pipe path will be `\\.\pipe\<endpoint>`.
+    pub ipc_endpoint: String,
 }
 
 impl Default for SupervisorConfig {
@@ -293,6 +296,7 @@ impl Default for SupervisorConfig {
             max_event_stream_buffer: 1024,
             max_diagnostic_bytes: 1024 * 1024, // 1 MiB
             state_directory_id: "default".to_string(),
+            ipc_endpoint: "harness-supervisor".to_string(),
         }
     }
 }

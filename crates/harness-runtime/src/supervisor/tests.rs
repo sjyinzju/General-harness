@@ -549,4 +549,76 @@ mod supervisor_tests {
             "heartbeat should be less than lease_duration/3 for safety margin"
         );
     }
+
+    // ── IPC lifecycle tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_supervisor_config_includes_ipc_endpoint() {
+        let config = SupervisorConfig::default();
+        assert_eq!(config.ipc_endpoint, "harness-supervisor");
+        assert!(!config.ipc_endpoint.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_ipc_server_construction() {
+        use crate::ipc::IpcServer;
+        use harness_core::contracts::ipc::IpcConfig;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let config = IpcConfig::default();
+
+        // Use a minimal mock handler
+        struct MockHandler;
+        #[async_trait::async_trait]
+        impl crate::ipc::IpcCommandHandler for MockHandler {
+            async fn handle_command(
+                &self,
+                _command: &harness_core::contracts::ipc::IpcCommand,
+                _payload: &serde_json::Value,
+            ) -> Result<serde_json::Value, harness_core::CoreError> {
+                Ok(serde_json::json!({"mock": true}))
+            }
+        }
+
+        let handler = std::sync::Arc::new(MockHandler);
+        let server = IpcServer::new(config, handler, db.pool.clone());
+        assert_eq!(server.active_connections().await, 0);
+
+        // Shutdown should be idempotent
+        server.shutdown().await;
+        server.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_ipc_server_shutdown_prevents_hang() {
+        use crate::ipc::IpcServer;
+        use harness_core::contracts::ipc::IpcConfig;
+
+        let db = Database::open_in_memory().await.unwrap();
+        let config = IpcConfig {
+            accept_timeout_secs: 1,
+            ..Default::default()
+        };
+
+        struct MockHandler;
+        #[async_trait::async_trait]
+        impl crate::ipc::IpcCommandHandler for MockHandler {
+            async fn handle_command(
+                &self,
+                _command: &harness_core::contracts::ipc::IpcCommand,
+                _payload: &serde_json::Value,
+            ) -> Result<serde_json::Value, harness_core::CoreError> {
+                Ok(serde_json::json!({"mock": true}))
+            }
+        }
+
+        let handler = std::sync::Arc::new(MockHandler);
+        let server = IpcServer::new(config, handler, db.pool.clone());
+
+        // Signal shutdown before serving — serve should exit cleanly
+        server.shutdown().await;
+
+        // Must not hang; either Ok (clean exit after shutdown) or Err is acceptable
+        let _ = server.serve("harness-test-ipc-shutdown").await;
+    }
 }

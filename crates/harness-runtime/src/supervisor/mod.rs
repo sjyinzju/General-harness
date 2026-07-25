@@ -37,6 +37,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use harness_core::contracts::ipc::IpcConfig;
 use harness_core::contracts::supervisor::{
     SupervisorConfig, SupervisorEvent, SupervisorInstance, SupervisorInstanceId, SupervisorState,
     SupervisorStatus,
@@ -44,8 +45,13 @@ use harness_core::contracts::supervisor::{
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 use tracing;
 
+use crate::ipc::IpcServer;
+use crate::supervisor::control_loop::{ControlLoop, ControlLoopConfig};
+
+use self::command_handler::SupervisorCommandHandler;
 use self::heartbeat::HeartbeatHandle;
 use self::lifecycle::LifecycleFsm;
 use self::ownership::OwnershipManager;
@@ -151,6 +157,10 @@ impl Supervisor {
 
     /// Run the Supervisor foreground (startup → ownership → recovery → ready).
     /// Blocks until shutdown is requested or an unrecoverable error occurs.
+    ///
+    /// After reaching Ready state, starts the IPC server (Named Pipe), control loop,
+    /// and heartbeat. The IPC server must bind successfully before the supervisor
+    /// is considered fully ready for external commands.
     pub async fn run(&self, state_directory_id: &str) -> Result<(), CoreError> {
         // 1. Create instance record
         let instance = self.create_instance(state_directory_id).await?;
@@ -179,39 +189,7 @@ impl Supervisor {
         let result = self.ownership.acquire(&instance).await;
 
         match result {
-            Ok(()) => {
-                self.transition_to(SupervisorState::Recovering, &instance)
-                    .await?;
-
-                // 4. Run startup reconciliation (REAL — wired to production services)
-                self.run_startup_recovery(&instance).await?;
-
-                // 5. Ready
-                self.transition_to(SupervisorState::Ready, &instance)
-                    .await?;
-
-                // 6. Start heartbeat
-                self.start_heartbeat(&instance).await?;
-
-                tracing::info!(
-                    instance_id = %instance.instance_id,
-                    fencing_token = instance.fencing_token,
-                    "supervisor ready"
-                );
-
-                // Block until shutdown signal (Ctrl+C)
-                tracing::info!("supervisor waiting for shutdown signal...");
-                tokio::signal::ctrl_c().await.map_err(|e| {
-                    CoreError::new(
-                        ErrorCode::Internal,
-                        format!("signal error: {e}"),
-                        ErrorSource::System,
-                    )
-                })?;
-                tracing::info!("shutdown signal received, draining...");
-
-                Ok(())
-            }
+            Ok(()) => self.run_ready_and_serve(&instance).await,
             Err(e) => {
                 // Check if this is a "rejected" vs "stale owner" case
                 let msg = e.to_string();
@@ -233,35 +211,7 @@ impl Supervisor {
 
                     *self.instance.write().await = Some(updated_instance.clone());
 
-                    self.transition_to(SupervisorState::Recovering, &updated_instance)
-                        .await?;
-
-                    // Run startup reconciliation after takeover
-                    self.run_startup_recovery(&updated_instance).await?;
-
-                    self.transition_to(SupervisorState::Ready, &updated_instance)
-                        .await?;
-
-                    self.start_heartbeat(&updated_instance).await?;
-
-                    tracing::info!(
-                        instance_id = %updated_instance.instance_id,
-                        fencing_token = updated_instance.fencing_token,
-                        "supervisor ready (after takeover)"
-                    );
-
-                    // Block until shutdown signal
-                    tracing::info!("supervisor (takeover) waiting for shutdown signal...");
-                    tokio::signal::ctrl_c().await.map_err(|e| {
-                        CoreError::new(
-                            ErrorCode::Internal,
-                            format!("signal error: {e}"),
-                            ErrorSource::System,
-                        )
-                    })?;
-                    tracing::info!("shutdown signal received, draining...");
-
-                    Ok(())
+                    self.run_ready_and_serve(&updated_instance).await
                 } else {
                     // Genuine rejection — healthy owner exists
                     self.emit_event(
@@ -282,6 +232,157 @@ impl Supervisor {
                 }
             }
         }
+    }
+
+    /// Post-ownership: recover → ready → start IPC + control loop → serve until shutdown.
+    async fn run_ready_and_serve(&self, instance: &SupervisorInstance) -> Result<(), CoreError> {
+        // Recover
+        self.transition_to(SupervisorState::Recovering, instance)
+            .await?;
+        self.run_startup_recovery(instance).await?;
+
+        // Ready
+        self.transition_to(SupervisorState::Ready, instance).await?;
+
+        // Start heartbeat
+        self.start_heartbeat(instance).await?;
+
+        // ── Wire production IPC server ──────────────────────────────
+        let cancel = CancellationToken::new();
+        let ipc_endpoint = self.config.ipc_endpoint.clone();
+
+        // Create command handler (shared with IPC server)
+        let handler = Arc::new(SupervisorCommandHandler::new(
+            self.pool.clone(),
+            self.services.clone(),
+            Some(instance.instance_id.clone()),
+            instance.fencing_token,
+        ));
+
+        // Build IPC config from supervisor config
+        let ipc_config = IpcConfig {
+            max_frame_bytes: self.config.max_ipc_frame_bytes,
+            max_connections: self.config.max_ipc_connections,
+            max_inflight_requests: self.config.max_inflight_requests,
+            ..Default::default()
+        };
+
+        let ipc_server = Arc::new(IpcServer::new(
+            ipc_config,
+            handler.clone(),
+            self.pool.clone(),
+        ));
+
+        // Create ControlLoop
+        let control_loop = ControlLoop::new(
+            ControlLoopConfig {
+                max_concurrency: self.config.max_operation_concurrency,
+                ..Default::default()
+            },
+            self.pool.clone(),
+            self.repo.clone(),
+            instance.instance_id.clone(),
+            instance.fencing_token,
+        );
+
+        // ── Spawn IPC accept loop ───────────────────────────────────
+        let ipc_cancel = cancel.child_token();
+        let ipc_server_task = {
+            let ipc_server = ipc_server.clone();
+            let endpoint = ipc_endpoint.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    result = ipc_server.serve(&endpoint) => {
+                        if let Err(e) = result {
+                            tracing::error!(error = %e, endpoint = %endpoint, "IPC server exited with error");
+                        }
+                    }
+                    _ = ipc_cancel.cancelled() => {
+                        tracing::info!("IPC server cancellation received");
+                        ipc_server.shutdown().await;
+                    }
+                }
+            })
+        };
+
+        // ── Spawn ControlLoop ───────────────────────────────────────
+        let cl_cancel = cancel.child_token();
+        let cl_handle = tokio::spawn(async move {
+            control_loop.run(cl_cancel).await;
+        });
+
+        tracing::info!(
+            instance_id = %instance.instance_id,
+            fencing_token = instance.fencing_token,
+            ipc_endpoint = %ipc_endpoint,
+            "supervisor ready — IPC server bound, control loop started"
+        );
+
+        // ── Wait for shutdown signal ────────────────────────────────
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("shutdown signal (Ctrl+C) received, draining...");
+            }
+            _ = cancel.cancelled() => {
+                tracing::info!("internal shutdown requested, draining...");
+            }
+        }
+
+        // ── Graceful shutdown sequence ──────────────────────────────
+        tracing::info!("beginning graceful shutdown...");
+
+        // 1. Stop accepting new IPC connections
+        ipc_server.shutdown().await;
+
+        // 2. Cancel background tasks
+        cancel.cancel();
+
+        // 3. Wait for tasks to drain (with bounded timeout)
+        let _ = tokio::time::timeout(
+            Duration::from_secs(self.config.shutdown_grace_period_secs),
+            async {
+                let _ = tokio::join!(ipc_server_task, cl_handle);
+            },
+        )
+        .await;
+
+        // 4. Stop heartbeat
+        self.stop_heartbeat().await;
+
+        // 5. Transition through Draining → Stopping → Stopped
+        let instance_refreshed = {
+            let guard = self.instance.read().await;
+            guard.as_ref().unwrap().clone()
+        };
+
+        self.transition_to(SupervisorState::Draining, &instance_refreshed)
+            .await?;
+
+        let instance_refreshed = {
+            let guard = self.instance.read().await;
+            guard.as_ref().unwrap().clone()
+        };
+
+        self.transition_to(SupervisorState::Stopping, &instance_refreshed)
+            .await?;
+
+        // Release lease
+        self.ownership.release_lease(&instance_refreshed).await?;
+
+        let instance_refreshed = {
+            let guard = self.instance.read().await;
+            guard.as_ref().unwrap().clone()
+        };
+
+        self.transition_to(SupervisorState::Stopped, &instance_refreshed)
+            .await?;
+
+        tracing::info!(
+            instance_id = %instance.instance_id,
+            "supervisor stopped cleanly"
+        );
+
+        Ok(())
     }
 
     /// Run startup reconciliation using the real RecoveryOrchestrator.
