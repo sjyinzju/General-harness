@@ -54,17 +54,15 @@ impl SupervisorCommandHandler {
     }
 
     /// Persist an OperationIntent for a mutating command and return the operation_id.
-    #[allow(dead_code)]
-    async fn persist_operation_intent(
+    pub(crate) async fn persist_operation_intent(
         &self,
         request_id: &str,
         idempotency_key: &str,
-        command: &IpcCommand,
+        command_name: &str,
         aggregate_id: &str,
         payload: &serde_json::Value,
     ) -> Result<String, CoreError> {
         let operation_id = uuid::Uuid::new_v4().to_string();
-        let kind = command.as_str().to_string();
         let payload_json = serde_json::to_string(payload).unwrap_or_default();
         let owner_id = self
             .instance_id
@@ -134,9 +132,9 @@ impl SupervisorCommandHandler {
         .bind(&operation_id)
         .bind(request_id)
         .bind(idempotency_key)
-        .bind(&kind)
+        .bind(command_name)
         .bind(aggregate_id)
-        .bind(&kind)
+        .bind(command_name)
         .bind(&owner_id)
         .bind(self.fencing_token)
         .bind(&payload_json)
@@ -255,8 +253,20 @@ impl SupervisorCommandHandler {
 
     async fn cmd_supervisor_stop(
         &self,
-        _payload: &serde_json::Value,
+        payload: &serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
+        // Persist durable OperationIntent
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let _op_id = self
+            .persist_operation_intent(
+                &request_id,
+                &format!("supervisor-stop-{}", request_id),
+                "supervisor.stop",
+                "supervisor",
+                payload,
+            )
+            .await?;
+
         if let Some(ref id) = self.instance_id {
             self.services
                 .supervisor_repo
@@ -402,6 +412,19 @@ impl SupervisorCommandHandler {
                 harness_core::ErrorSource::Harness,
             ));
         }
+
+        // Persist durable OperationIntent before executing
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let aggregate_id = format!("task-{}-{}", project, task);
+        let _op_id = self
+            .persist_operation_intent(
+                &request_id,
+                &format!("task-start-{}-{}", project, task),
+                "task.start",
+                &aggregate_id,
+                payload,
+            )
+            .await?;
 
         let req = CreateLoopRequest {
             project_id: project.to_string(),
@@ -870,6 +893,18 @@ impl SupervisorCommandHandler {
             ));
         }
 
+        // Persist durable OperationIntent
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let _op_id = self
+            .persist_operation_intent(
+                &request_id,
+                &format!("integration-enqueue-{}", candidate_id),
+                "integration.enqueue",
+                candidate_id,
+                payload,
+            )
+            .await?;
+
         let commit_request_id = uuid::Uuid::new_v4().to_string();
         let integration_id: harness_core::contracts::integration::IntegrationId =
             uuid::Uuid::new_v4().to_string();
@@ -917,6 +952,18 @@ impl SupervisorCommandHandler {
             .get("target_ref")
             .and_then(|v| v.as_str())
             .unwrap_or("refs/heads/main");
+
+        // Persist durable OperationIntent
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let _op_id = self
+            .persist_operation_intent(
+                &request_id,
+                &format!("integration-run-next-{}-{}", repo_id, target_ref),
+                "integration.run_next",
+                &format!("{}/{}", repo_id, target_ref),
+                payload,
+            )
+            .await?;
 
         let policy = harness_core::contracts::integration::IntegrationVerificationPolicy::default();
 

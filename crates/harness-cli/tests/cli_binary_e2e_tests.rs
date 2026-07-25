@@ -25,6 +25,8 @@ fn binary() -> String {
 
 fn run(args: &[&str], db: &str) -> std::process::Output {
     let mut c = Command::new(binary());
+    // Use --standalone since these tests run without a Supervisor daemon
+    c.arg("--standalone");
     c.args(args).env("HARNESS_DB", db).env("NO_COLOR", "1");
     let td = tempfile::tempdir().unwrap();
     c.env("HOME", td.path()).env("USERPROFILE", td.path());

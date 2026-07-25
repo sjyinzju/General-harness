@@ -1,18 +1,30 @@
 //! harness-cli: CLI entry point with automatic managed-temp lifecycle.
 //!
-//! Every command automatically:
-//! 1. Creates a `RunContext` with managed temp directories.
-//! 2. Redirects `TEMP`/`TMP` to the managed temp (inherited by all children).
-//! 3. Builds a `ProductionGraph` with mandatory `LivenessOrchestrator`.
-//! 4. Starts a periodic janitor for background cleanup.
-//! 5. Runs the startup janitor before accepting work.
-//! 6. Calls explicit shutdown on all exit paths (including Ctrl+C).
+//! # Production IPC routing (default)
+//!
+//! All production commands route through the running Supervisor via
+//! Windows Named Pipe IPC. The CLI never opens the database directly
+//! for write operations in production mode.
+//!
+//! | Command | Default Mode | Fallback |
+//! |---------|-------------|----------|
+//! | task-loop * | IPC | SupervisorUnavailable |
+//! | review * | IPC | SupervisorUnavailable |
+//! | integration * | IPC | SupervisorUnavailable |
+//! | supervisor status | IPC | offline persisted read |
+//! | supervisor stop | IPC | lease deactivation |
+//! | supervisor run | DIRECT | N/A (creates Supervisor) |
+//! | supervisor start | DIRECT | N/A (spawns Supervisor) |
+//! | cleanup | DIRECT | N/A (maintenance) |
+//!
+//! Explicit `--standalone` enables direct DB mode. Write operations
+//! in standalone mode are rejected when a healthy Supervisor exists.
 //!
 //! # invariants
 //! - `RunContext::shutdown()` is ALWAYS called (success, failure, cancel, Ctrl+C).
 //! - `std::process::exit()` is NEVER called after `RunContext` creation.
-//! - The periodic janitor is started exactly once and cancelled before shutdown.
-//! - No detached background tasks remain after shutdown.
+//! - No silent standalone/DB fallback for production write commands.
+//! - Default CLI never opens the database for writes in IPC mode.
 
 mod commands;
 mod ipc_client;
@@ -24,20 +36,29 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ipc_client::{ClientError, SupervisorClient, DEFAULT_ENDPOINT};
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
+    let raw_args: Vec<String> = std::env::args().collect();
+    if raw_args.len() < 2 {
         print_usage();
         return Ok(());
     }
+
+    let standalone = raw_args.contains(&"--standalone".to_string());
+
+    // Filter out --standalone flag to not interfere with position-based dispatch
+    let args: Vec<String> = raw_args
+        .into_iter()
+        .filter(|a| a != "--standalone")
+        .collect();
 
     // ── Resolve repo root ──────────────────────────────────────
     let repo_root = parse_flag(&args, "--repo")
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let code_head = parse_flag(&args, "--code-head").unwrap_or("unknown");
-    // Default DB goes into target/data/ so it never lands in repo root.
     let default_db = repo_root
         .join("target")
         .join("data")
@@ -46,12 +67,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .to_string();
     let db_path = std::env::var("HARNESS_DB").unwrap_or(default_db);
 
-    // ── "cleanup" and "review" are special cases — no ProductionGraph needed ──
+    // ── Commands that don't need ProductionGraph ─────────────────
+    // cleanup and supervisor start don't require the graph
     if args.len() >= 2 && args[1] == "cleanup" {
         return cmd_cleanup(&args, &repo_root, &db_path).await;
     }
-    if args.len() >= 2 && args[1] == "review" {
-        return cmd_review_standalone(&args, &db_path).await;
+
+    // supervisor start spawns a child process — no graph needed
+    if args.len() >= 3 && args[1] == "supervisor" && args[2] == "start" {
+        let state_dir = parse_flag(&args, "--state-dir").unwrap_or("default");
+        match commands::supervisor::cmd_supervisor_start(&db_path, state_dir).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                return Err("supervisor start failed".into());
+            }
+        }
+    }
+
+    // ── Try IPC first for all production commands ──────────────
+    // supervisor run is always direct (it IS the supervisor)
+    let is_supervisor_run = args.len() >= 3 && args[1] == "supervisor" && args[2] == "run";
+
+    if !standalone && !is_supervisor_run {
+        match try_ipc_dispatch(&args).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => return Err("command failed".into()),
+            Err(IpcDispatchResult::SupervisorUnavailable) => {
+                // For write commands: hard error, no fallback
+                if is_production_write(&args) {
+                    eprintln!(
+                        "error: Supervisor unavailable — cannot execute write command '{}'",
+                        args[1]
+                    );
+                    eprintln!("Start the supervisor with: harness supervisor start");
+                    eprintln!("Or use --standalone for direct database mode.");
+                    return Err("SupervisorUnavailable".into());
+                }
+                // For read commands: fall through to ProductionGraph
+                eprintln!("warning: Supervisor unavailable, using offline database (read-only)");
+            }
+            Err(IpcDispatchResult::CommandFailed(msg)) => {
+                eprintln!("error: {msg}");
+                return Err(msg.into());
+            }
+        }
+    }
+
+    if standalone {
+        eprintln!("╔══════════════════════════════════════════════╗");
+        eprintln!("║           STANDALONE MODE                    ║");
+        eprintln!("║  Direct database access — no Supervisor IPC ║");
+        eprintln!("╚══════════════════════════════════════════════╝");
     }
 
     // ── Create RunContext (managed temp + env redirect) ─────────
@@ -77,11 +144,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(g) => g,
         Err(e) => {
             eprintln!("fatal: {e}");
-            // Shutdown run context before exit — env restore + marker finalize.
             let _ = run_context.shutdown(false).await;
             std::process::exit(1);
         }
     };
+
+    // ── Standalone dual-writer check ───────────────────────────
+    if standalone {
+        let client = SupervisorClient::new(DEFAULT_ENDPOINT);
+        if let Ok(true) = client.ping().await {
+            eprintln!("error: StandaloneWriteConflict — a healthy Supervisor is running.");
+            eprintln!("Write operations in standalone mode would conflict with the Supervisor.");
+            eprintln!("Use default IPC mode (remove --standalone) for production.");
+            let _ = run_context.shutdown(false).await;
+            std::process::exit(1);
+        }
+    }
 
     // ── Run startup janitor ─────────────────────────────────────
     let _startup_result = graph.startup().await;
@@ -89,13 +167,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Start periodic janitor ──────────────────────────────────
     let janitor_cancel = graph.start_periodic_janitor(Duration::from_secs(300));
 
-    // ── Install Ctrl+C handler ──────────────────────────────────
-    let _ctrlc_cancel = janitor_cancel.clone();
-    let _ctrlc_run_context = run_context.clone();
-
     // ── Dispatch with Ctrl+C awareness ──────────────────────────
     let run_succeeded = tokio::select! {
-        result = dispatch_command(&args, &db, &graph, &repo_root, &db_path) => {
+        result = dispatch_direct(&args, &db, &graph, &repo_root, &db_path) => {
             result
         }
         _ = tokio::signal::ctrl_c() => {
@@ -105,37 +179,292 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // ── Cancel periodic janitor (bounded wait) ──────────────────
+    // ── Cancel periodic janitor ──────────────────────────────────
     janitor_cancel.cancel();
-    // Give the periodic janitor up to 2 seconds to finish its current tick.
     tokio::time::timeout(Duration::from_secs(2), async {
-        // The janitor will observe cancellation and exit its loop.
         tokio::time::sleep(Duration::from_millis(100)).await;
     })
     .await
     .ok();
 
     // ── Explicit shutdown ───────────────────────────────────────
-    // The Ctrl+C handler uses its own cleanup path; for the main path,
-    // we call shutdown explicitly.  The Drop impl on RunContext is the
-    // last-resort safety net.
     let _shutdown_result = graph.shutdown(run_succeeded).await;
-
-    // Also ensure the Ctrl+C path's clone is shut down if it was
-    // the one that activated.  Since Ctrl+C selects the signal future,
-    // the main run_context.shutdown is still called above.
 
     tracing::info!(run_succeeded = run_succeeded, "harness exiting");
 
     if run_succeeded {
         Ok(())
     } else {
-        // Return error via main return, NOT process::exit().
         Err("command failed".into())
     }
 }
 
-async fn dispatch_command(
+// ── IPC dispatch ──────────────────────────────────────────────────
+
+enum IpcDispatchResult {
+    /// Supervisor not reachable via IPC.
+    SupervisorUnavailable,
+    /// Command failed with a message.
+    CommandFailed(String),
+}
+
+impl From<ClientError> for IpcDispatchResult {
+    fn from(e: ClientError) -> Self {
+        match &e {
+            ClientError::Connection(_) => IpcDispatchResult::SupervisorUnavailable,
+            ClientError::Serialization(_) => IpcDispatchResult::CommandFailed(e.to_string()),
+            ClientError::SupervisorError { code, message } => {
+                IpcDispatchResult::CommandFailed(format!("[{code}] {message}"))
+            }
+        }
+    }
+}
+
+/// Try to dispatch a CLI command through IPC to the running Supervisor.
+async fn try_ipc_dispatch(args: &[String]) -> Result<bool, IpcDispatchResult> {
+    let client = SupervisorClient::new(DEFAULT_ENDPOINT);
+
+    // Quick ping to confirm supervisor is reachable
+    if !client.ping().await.unwrap_or(false) {
+        return Err(IpcDispatchResult::SupervisorUnavailable);
+    }
+
+    match args[1].as_str() {
+        "task-loop" => try_ipc_task_loop(&client, args).await,
+        "review" => try_ipc_review(&client, args).await,
+        "integration" => try_ipc_integration(&client, args).await,
+        "supervisor" => try_ipc_supervisor(&client, args).await,
+        _ => Err(IpcDispatchResult::SupervisorUnavailable),
+    }
+}
+
+async fn try_ipc_task_loop(
+    client: &SupervisorClient,
+    args: &[String],
+) -> Result<bool, IpcDispatchResult> {
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "start" => {
+            let project = parse_flag(args, "--project").unwrap_or("default");
+            let task = parse_flag(args, "--task").unwrap_or("");
+            let owner = parse_flag(args, "--owner").unwrap_or("cli");
+            let policy = parse_flag(args, "--policy").unwrap_or("{}");
+            send_ipc(
+                client,
+                "task.start",
+                serde_json::json!({"project": project, "task": task, "owner": owner, "policy": policy}),
+            )
+            .await
+        }
+        "status" => {
+            let loop_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "task.status",
+                serde_json::json!({"loop_id": loop_id}),
+            )
+            .await
+        }
+        "resume" => {
+            let loop_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let owner = parse_flag(args, "--owner").unwrap_or("cli");
+            send_ipc(
+                client,
+                "task.resume",
+                serde_json::json!({"loop_id": loop_id, "owner": owner}),
+            )
+            .await
+        }
+        "cancel" => {
+            let loop_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let owner = parse_flag(args, "--owner").unwrap_or("cli");
+            send_ipc(
+                client,
+                "task.cancel",
+                serde_json::json!({"loop_id": loop_id, "owner": owner}),
+            )
+            .await
+        }
+        "inspect" | "dry-run-decision" => {
+            let loop_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let cmd = if sub == "inspect" {
+                "task.inspect"
+            } else {
+                "task.dry_run_decision"
+            };
+            send_ipc(client, cmd, serde_json::json!({"loop_id": loop_id})).await
+        }
+        _ => Err(IpcDispatchResult::CommandFailed(format!(
+            "unknown subcommand: {sub}"
+        ))),
+    }
+}
+
+async fn try_ipc_review(
+    client: &SupervisorClient,
+    args: &[String],
+) -> Result<bool, IpcDispatchResult> {
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "create" => {
+            let candidate_id = parse_flag(args, "--candidate")
+                .or_else(|| args.get(3).map(|s| s.as_str()))
+                .unwrap_or("");
+            let reviewer = parse_flag(args, "--reviewer").unwrap_or("default-reviewer");
+            send_ipc(
+                client,
+                "review.create",
+                serde_json::json!({"candidate_id": candidate_id, "reviewer": reviewer}),
+            )
+            .await
+        }
+        "show" => {
+            let review_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "review.show",
+                serde_json::json!({"review_id": review_id}),
+            )
+            .await
+        }
+        "run" => {
+            let review_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "review.run",
+                serde_json::json!({"review_id": review_id}),
+            )
+            .await
+        }
+        "list" => {
+            let state = parse_flag(args, "--state");
+            send_ipc(client, "review.list", serde_json::json!({"state": state})).await
+        }
+        _ => Err(IpcDispatchResult::CommandFailed(format!(
+            "unknown subcommand: {sub}"
+        ))),
+    }
+}
+
+async fn try_ipc_integration(
+    client: &SupervisorClient,
+    args: &[String],
+) -> Result<bool, IpcDispatchResult> {
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "enqueue" => {
+            let candidate_id = parse_flag(args, "--candidate").unwrap_or("");
+            let repo_id = parse_flag(args, "--repo-id").unwrap_or("default");
+            let target_ref = parse_flag(args, "--target-ref").unwrap_or("refs/heads/main");
+            let priority = parse_flag(args, "--priority")
+                .unwrap_or("0")
+                .parse::<i64>()
+                .unwrap_or(0);
+            send_ipc(
+                client,
+                "integration.enqueue",
+                serde_json::json!({
+                    "candidate_id": candidate_id,
+                    "repo_id": repo_id,
+                    "target_ref": target_ref,
+                    "priority": priority,
+                }),
+            )
+            .await
+        }
+        "run-next" => {
+            let repo_id = parse_flag(args, "--repo-id").unwrap_or("default");
+            let target_ref = parse_flag(args, "--target-ref").unwrap_or("refs/heads/main");
+            send_ipc(
+                client,
+                "integration.run_next",
+                serde_json::json!({"repo_id": repo_id, "target_ref": target_ref}),
+            )
+            .await
+        }
+        "show" => {
+            let id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "integration.show",
+                serde_json::json!({"integration_id": id}),
+            )
+            .await
+        }
+        "list" => send_ipc(client, "integration.list", serde_json::json!({})).await,
+        "cancel" => {
+            let id = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            send_ipc(
+                client,
+                "integration.cancel",
+                serde_json::json!({"integration_id": id}),
+            )
+            .await
+        }
+        "recover" => send_ipc(client, "integration.recover", serde_json::json!({})).await,
+        _ => Err(IpcDispatchResult::CommandFailed(format!(
+            "unknown subcommand: {sub}"
+        ))),
+    }
+}
+
+async fn try_ipc_supervisor(
+    client: &SupervisorClient,
+    args: &[String],
+) -> Result<bool, IpcDispatchResult> {
+    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "status" => send_ipc(client, "supervisor.status", serde_json::json!({})).await,
+        "stop" => send_ipc(client, "supervisor.stop", serde_json::json!({})).await,
+        "diagnostics" => send_ipc(client, "diagnostics", serde_json::json!({})).await,
+        // "run" and "start" are never dispatched through IPC
+        _ => Err(IpcDispatchResult::CommandFailed(format!(
+            "unknown subcommand: {sub}"
+        ))),
+    }
+}
+
+/// Send an IPC request and render the response.
+async fn send_ipc(
+    client: &SupervisorClient,
+    command: &str,
+    payload: serde_json::Value,
+) -> Result<bool, IpcDispatchResult> {
+    let response = client.send_request(command, payload).await?;
+
+    if let Some(ref error) = response.error {
+        eprintln!("error: [{}] {}", error.code, error.message);
+        return Ok(false);
+    }
+
+    if let Some(ref p) = response.payload {
+        // Pretty-print if --json flag is not set
+        println!("{}", serde_json::to_string_pretty(p).unwrap_or_default());
+    }
+
+    Ok(true)
+}
+
+/// Determine if a CLI command is a production write (side-effect) command.
+fn is_production_write(args: &[String]) -> bool {
+    if args.len() < 3 {
+        return false;
+    }
+    match args[1].as_str() {
+        "task-loop" => matches!(args[2].as_str(), "start" | "resume" | "cancel"),
+        "review" => matches!(args[2].as_str(), "create" | "run"),
+        "integration" => matches!(
+            args[2].as_str(),
+            "enqueue" | "run-next" | "cancel" | "recover"
+        ),
+        "supervisor" => matches!(args[2].as_str(), "stop"),
+        _ => false,
+    }
+}
+
+// ── Direct dispatch (standalone / supervisor run / fallback) ──────
+
+async fn dispatch_direct(
     args: &[String],
     db: &Database,
     graph: &ProductionGraph,
@@ -464,29 +793,31 @@ async fn dispatch_integration(args: &[String], db: &Database, repo_path: &Path) 
 fn print_usage() {
     println!("harness v0.1.0 — task engineering harness");
     println!("Usage:");
-    println!("  harness task-loop start --project <id> --task <id> [--owner <id>] [--policy <json>] [--repo <path>] [--worktree-root <path>] [--code-head <sha>]");
-    println!("  harness task-loop status <loop-id> [--repo <path>]");
-    println!("  harness task-loop resume <loop-id> [--owner <id>] [--repo <path>] [--worktree-root <path>]");
-    println!("  harness task-loop cancel <loop-id> [--owner <id>] [--repo <path>]");
-    println!("  harness task-loop inspect <loop-id> [--json] [--repo <path>]");
-    println!("  harness task-loop dry-run-decision <loop-id> [--repo <path>]");
-    println!("  harness review create <candidate-id> [--reviewer <profile-id>] [--repo <path>]");
-    println!("  harness review run <review-id> [--repo <path>]");
-    println!("  harness review show <review-id> [--json] [--repo <path>]");
-    println!("  harness review list [--state <state>] [--json] [--repo <path>]");
-    println!("  harness integration enqueue --candidate <id> [--repo-id <id>] [--target-ref <ref>] [--priority <n>] [--repo <path>]");
-    println!(
-        "  harness integration run-next [--repo-id <id>] [--target-ref <ref>] [--repo <path>]"
-    );
-    println!("  harness integration show <id> [--json] [--repo <path>]");
-    println!("  harness integration list [--json] [--repo <path>]");
-    println!("  harness integration cancel <id> [--repo <path>]");
-    println!("  harness integration recover [--repo <path>]");
+    println!("  harness task-loop start --project <id> --task <id> [--owner <id>] [--policy <json>] [--repo <path>] [--worktree-root <path>] [--code-head <sha>] [--standalone]");
+    println!("  harness task-loop status <loop-id> [--repo <path>] [--standalone]");
+    println!("  harness task-loop resume <loop-id> [--owner <id>] [--repo <path>] [--worktree-root <path>] [--standalone]");
+    println!("  harness task-loop cancel <loop-id> [--owner <id>] [--repo <path>] [--standalone]");
+    println!("  harness task-loop inspect <loop-id> [--json] [--repo <path>] [--standalone]");
+    println!("  harness task-loop dry-run-decision <loop-id> [--repo <path>] [--standalone]");
+    println!("  harness review create <candidate-id> [--reviewer <profile-id>] [--repo <path>] [--standalone]");
+    println!("  harness review run <review-id> [--repo <path>] [--standalone]");
+    println!("  harness review show <review-id> [--json] [--repo <path>] [--standalone]");
+    println!("  harness review list [--state <state>] [--json] [--repo <path>] [--standalone]");
+    println!("  harness integration enqueue --candidate <id> [--repo-id <id>] [--target-ref <ref>] [--priority <n>] [--repo <path>] [--standalone]");
+    println!("  harness integration run-next [--repo-id <id>] [--target-ref <ref>] [--repo <path>] [--standalone]");
+    println!("  harness integration show <id> [--json] [--repo <path>] [--standalone]");
+    println!("  harness integration list [--json] [--repo <path>] [--standalone]");
+    println!("  harness integration cancel <id> [--repo <path>] [--standalone]");
+    println!("  harness integration recover [--repo <path>] [--standalone]");
     println!("  harness supervisor run [--state-dir <id>] [--repo <path>]");
     println!("  harness supervisor start [--state-dir <id>] [--repo <path>]");
     println!("  harness supervisor status [--state-dir <id>] [--json] [--repo <path>]");
     println!("  harness supervisor stop [--state-dir <id>] [--repo <path>]");
     println!("  harness cleanup [--dry-run|--apply] [--repo <path>]");
+    println!();
+    println!("Modes:");
+    println!("  Default:  IPC via running Supervisor (production)");
+    println!("  --standalone: Direct database access (development/maintenance)");
     println!();
     println!("Environment:");
     println!("  HARNESS_DB     path to SQLite database (default: target/data/harness.db)");
@@ -498,16 +829,13 @@ async fn dispatch_review(args: &[String], db: &Database) -> bool {
         "create" => {
             let candidate_id = match parse_flag(args, "--candidate") {
                 Some(c) => c,
-                None => {
-                    // Also accept positional candidate ID
-                    match args.get(3) {
-                        Some(c) if !c.starts_with("--") => c.as_str(),
-                        _ => {
-                            eprintln!("error: --candidate <id> required (or use positional)");
-                            return false;
-                        }
+                None => match args.get(3) {
+                    Some(c) if !c.starts_with("--") => c.as_str(),
+                    _ => {
+                        eprintln!("error: --candidate <id> required (or use positional)");
+                        return false;
                     }
-                }
+                },
             };
             let reviewer = parse_flag(args, "--reviewer").unwrap_or("default-reviewer");
             match commands::review::cmd_review_create(db, candidate_id, reviewer).await {
@@ -567,19 +895,6 @@ async fn dispatch_review(args: &[String], db: &Database) -> bool {
             eprintln!("Usage: harness review <create|show|run|list> [args]");
             false
         }
-    }
-}
-
-async fn cmd_review_standalone(
-    args: &[String],
-    db_path: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let db = Database::open(&PathBuf::from(db_path)).await?;
-    let ok = dispatch_review(args, &db).await;
-    if ok {
-        Ok(())
-    } else {
-        Err("review command failed".into())
     }
 }
 
