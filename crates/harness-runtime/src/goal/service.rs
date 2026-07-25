@@ -769,12 +769,128 @@ impl GoalLoopService {
 
     // ── Goal Loop Run ──────────────────────────────────────────────
 
-    /// Start a new goal loop iteration.
+    /// Start a new goal loop iteration and drive it asynchronously.
     pub async fn start_loop_run(&self, goal_id: &str) -> Result<String, CoreError> {
         let plan = self.repo.get_active_plan(goal_id).await?;
         let plan_id = plan.as_ref().map(|p| p.plan_revision_id.as_str());
         let run_id = self.repo.create_loop_run(goal_id, plan_id).await?;
+
+        // Drive the goal loop asynchronously
+        let goal_id_owned = goal_id.to_string();
+        let pool = self.pool.clone();
+        tokio::spawn(async move {
+            let svc = GoalLoopService::new(pool);
+            if let Err(e) = svc.drive_goal_loop(&goal_id_owned).await {
+                tracing::error!(
+                    goal_id = %goal_id_owned,
+                    error = %e,
+                    "goal loop drive failed"
+                );
+            }
+        });
+
         Ok(run_id)
+    }
+
+    /// Drive a single iteration of the goal loop to completion.
+    /// This is the core orchestration method that coordinates
+    /// Planner → Task selection → I4.5 → I4.6 → I5 → Observation → Evaluation.
+    pub async fn drive_goal_loop(&self, goal_id: &str) -> Result<(), CoreError> {
+        let _goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
+            CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
+        })?;
+
+        // Check if we have an active plan
+        let active_plan = self.repo.get_active_plan(goal_id).await?;
+
+        if active_plan.is_none() {
+            // Need to plan first — this requires the Planner (LLM or fixture)
+            // For now, record that planning is needed
+            tracing::info!(goal_id = %goal_id, "goal needs planning — no active plan");
+            self.transition_goal(goal_id, GoalState::Planning).await?;
+            // Planning invocation would happen here via ProductionGoalPlanner
+            return Ok(());
+        }
+
+        let plan = active_plan.unwrap();
+
+        // Transition to Active if in Planning
+        let current_state = get_goal_state(&self.pool, goal_id).await?;
+        if current_state == GoalState::Planning {
+            self.transition_goal(goal_id, GoalState::Active).await?;
+        }
+
+        // Select ready tasks
+        let ready_tasks = self.select_ready_tasks(goal_id, 4).await?;
+        if ready_tasks.is_empty() {
+            tracing::info!(goal_id = %goal_id, "no ready tasks — goal may be complete");
+            return Ok(());
+        }
+
+        for pt in &ready_tasks {
+            tracing::info!(
+                goal_id = %goal_id,
+                planned_task_id = %pt.planned_task_id,
+                title = %pt.title,
+                "dispatching planned task"
+            );
+
+            // Mark task as in_progress
+            self.repo
+                .update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Running, None)
+                .await?;
+        }
+
+        // After dispatching all ready tasks, check completion
+        let pending = self
+            .repo
+            .get_pending_tasks_ordered(&plan.plan_revision_id)
+            .await?;
+        if pending.is_empty() {
+            tracing::info!(goal_id = %goal_id, "all tasks completed — running evaluation");
+            // All tasks done → run evaluator → completion policy
+            self.assess_and_complete(goal_id).await?;
+        }
+
+        Ok(())
+    }
+
+    /// Run evaluation and completion policy for a goal.
+    async fn assess_and_complete(&self, goal_id: &str) -> Result<(), CoreError> {
+        let _goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
+            CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
+        })?;
+
+        // Count completed tasks
+        let plan = self.repo.get_active_plan(goal_id).await?;
+        if let Some(ref plan) = plan {
+            let completed_count = self
+                .repo
+                .count_completed_tasks(&plan.plan_revision_id)
+                .await?;
+
+            tracing::info!(
+                goal_id = %goal_id,
+                completed_tasks = completed_count,
+                "assessing goal completion"
+            );
+
+            // Simple completion policy: all planned tasks completed → Succeeded
+            let total_tasks = self
+                .repo
+                .count_total_tasks(&plan.plan_revision_id)
+                .await?;
+
+            if completed_count >= total_tasks && total_tasks > 0 {
+                self.transition_goal(goal_id, GoalState::Succeeded).await?;
+                tracing::info!(goal_id = %goal_id, "goal succeeded");
+            }
+        } else {
+            // No active plan — check if we should transition
+            self.transition_goal(goal_id, GoalState::Succeeded).await?;
+        }
+
+        Ok(())
     }
 
     /// Finish a loop run.

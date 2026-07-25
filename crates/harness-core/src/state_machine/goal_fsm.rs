@@ -30,6 +30,7 @@ impl GoalFsm {
             (from, to),
             // Draft progression
             (Draft, Validated)
+                | (Draft, Planning)  // direct start: goal spec already validated at create
                 | (Draft, Cancelled)
                 // Validated progression
                 | (Validated, Planning)

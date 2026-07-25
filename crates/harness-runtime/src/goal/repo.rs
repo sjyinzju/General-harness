@@ -474,6 +474,34 @@ impl GoalRepo {
         Ok(row.map(|r| r.0))
     }
 
+    pub async fn count_completed_tasks(
+        &self,
+        plan_revision_id: &str,
+    ) -> Result<i64, CoreError> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT COUNT(*) FROM planned_tasks WHERE plan_revision_id = ? AND state = 'completed'",
+        )
+        .bind(plan_revision_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| r.0).unwrap_or(0))
+    }
+
+    pub async fn count_total_tasks(
+        &self,
+        plan_revision_id: &str,
+    ) -> Result<i64, CoreError> {
+        let row: Option<(i64,)> = sqlx::query_as(
+            "SELECT COUNT(*) FROM planned_tasks WHERE plan_revision_id = ? AND state != 'superseded'",
+        )
+        .bind(plan_revision_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| r.0).unwrap_or(0))
+    }
+
     pub async fn get_pending_tasks_ordered(
         &self,
         plan_revision_id: &str,
