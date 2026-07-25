@@ -1226,7 +1226,16 @@ impl SupervisorCommandHandler {
         &self,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
-        let goal: harness_core::contracts::goal::GoalSpec = serde_json::from_value(payload.clone())
+        // CLI sends {"goal_spec": "<json>"}. Extract or use directly.
+        let goal_value = match payload.get("goal_spec") {
+            Some(sv) if sv.is_string() => {
+                serde_json::from_str::<serde_json::Value>(sv.as_str().unwrap())
+                    .unwrap_or_else(|_| sv.clone())
+            }
+            Some(sv) => sv.clone(),
+            None => payload.clone(),
+        };
+        let goal: harness_core::contracts::goal::GoalSpec = serde_json::from_value(goal_value)
             .map_err(|e| {
                 CoreError::new(
                     harness_core::ErrorCode::SerializationError,

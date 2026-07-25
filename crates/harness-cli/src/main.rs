@@ -453,13 +453,33 @@ async fn try_ipc_goal(
     let sub = args.get(2).map(|s| s.as_str()).unwrap_or("");
     match sub {
         "create" => {
-            let spec = parse_flag(args, "--spec").unwrap_or("{}");
-            send_ipc(
-                client,
-                "goal.create",
-                serde_json::json!({ "goal_spec": spec }),
-            )
-            .await
+            // Support --spec-file for reliable JSON passing (avoids shell quoting)
+            let spec_val = if let Some(path) = parse_flag(args, "--spec-file") {
+                match std::fs::read_to_string(path) {
+                    Ok(contents) => match serde_json::from_str::<serde_json::Value>(&contents) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            eprintln!("error: invalid JSON in spec file: {e}");
+                            return Err(IpcDispatchResult::CommandFailed(format!(
+                                "invalid spec file: {e}"
+                            )));
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("error: cannot read spec file: {e}");
+                        return Err(IpcDispatchResult::CommandFailed(format!(
+                            "cannot read spec file: {e}"
+                        )));
+                    }
+                }
+            } else {
+                let spec = parse_flag(args, "--spec").unwrap_or("{}");
+                match serde_json::from_str::<serde_json::Value>(spec) {
+                    Ok(v) => v,
+                    Err(_) => serde_json::json!({ "goal_spec_str": spec }),
+                }
+            };
+            send_ipc(client, "goal.create", spec_val).await
         }
         "start" => {
             let goal_id = args.get(3).map(|s| s.as_str()).unwrap_or("");
