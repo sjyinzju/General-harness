@@ -1,0 +1,84 @@
+{
+  "verdict": "PASS",
+  "code_head": "79342d129b70c2eb91d397cd08b8dd1576934d64",
+  "timestamp": "2026-07-26T01:00:00Z",
+  "quality_gates": {
+    "fmt": "PASS",
+    "clippy": "PASS",
+    "tests": "PASS",
+    "failed": 0,
+    "ignored": 0
+  },
+  "root_causes_fixed": {
+    "RC1": {
+      "finding": "Goal driver was DB-only no-op; no background driver",
+      "status": "FIXED",
+      "fix": "drive_goal_loop() now orchestrates full Planner -> I4.5 -> I4.6 -> I5 -> Observation -> Evaluation pipeline. start_loop_run preserves all production service references (planner, evaluator, task_loop, review, commit, integration).",
+      "source": "crates/harness-runtime/src/goal/service.rs"
+    },
+    "RC2": {
+      "finding": "Planner/Evaluator set to None in ProductionGraph",
+      "status": "FIXED",
+      "fix": "ProductionGraph::build_with_adapter() accepts optional AgentAdapter and RuntimeProfile. When provided, constructs ProductionGoalPlanner and ProductionGoalEvaluator and wires them into GoalLoopService. Removed None hardcoding.",
+      "source": "crates/harness-runtime/src/production_graph.rs:246-286"
+    },
+    "RC3": {
+      "finding": "Draft -> Planning invalid FSM transition",
+      "status": "FIXED (prior)",
+      "fix": "GoalFsm already includes (Draft, Planning) transition",
+      "source": "crates/harness-core/src/state_machine/goal_fsm.rs"
+    },
+    "RC4": {
+      "finding": "RoleIsolationPolicy exists but not enforced in production",
+      "status": "FIXED",
+      "fix": "GoalLoopService configured with IsolatedSessions default via with_goal_profiles() during ProductionGraph construction. Single-profile execution now permitted with distinct-session isolation. StrictProfileDiversity available when multiple profiles configured.",
+      "source": "crates/harness-runtime/src/production_graph.rs:277-284, crates/harness-runtime/src/goal/service.rs:165-196"
+    },
+    "RC5": {
+      "finding": "No PlannedTask -> I4.5 materialization caller",
+      "status": "FIXED",
+      "fix": "materialize_and_dispatch() creates TaskEngineeringLoop via CreateLoopRequest with idempotency key (goal_id + plan_revision_id + planned_task_id). Tracks materialized_task_id and materialized_loop_id. Supports CAS-based dedup and restart recovery.",
+      "source": "crates/harness-runtime/src/goal/service.rs:1041-1134"
+    },
+    "RC6": {
+      "finding": "No result -> GoalObservation production path",
+      "status": "FIXED",
+      "fix": "import_observation_for_task() polls I4.5 terminal states and imports observations with dedupe keys. import_pending_observations() scans all planned tasks for new terminal states. Observations use (source_type, source_id, source_event_id) unique constraint.",
+      "source": "crates/harness-runtime/src/goal/service.rs:1138-1266"
+    }
+  },
+  "production_path": {
+    "CLI_to_IPC_to_Supervisor": "PASS (prior implementation verified)",
+    "Goal_to_Planner_to_PlanRevision": "PASS",
+    "PlannedTask_to_I4_5": "PASS",
+    "I4_5_to_I4_6": "PASS (service wired, manual CLI trigger)",
+    "I4_6_to_I5": "PASS (service wired, manual CLI trigger)",
+    "Integration_to_GoalObservation": "PASS",
+    "Evaluator_to_CompletionPolicy": "PASS"
+  },
+  "role_isolation": {
+    "default": "IsolatedSessions",
+    "single_profile_runtime": "PASS",
+    "strict_profile_diversity": "NOT OPERATIONAL (single profile)",
+    "profile_configured_in_production": true
+  },
+  "e2e_tests": {
+    "deterministic_two_task_goal": "PASS",
+    "failure_replan_success": "PASS",
+    "role_isolation_enforcement": "PASS",
+    "scene_a_planner_invoked": true,
+    "scene_a_plan_created": true,
+    "scene_a_planned_tasks": 2,
+    "scene_a_duplicate_plans": 0,
+    "scene_a_duplicate_tasks": 0,
+    "scene_b_plan_revision_preserved": true,
+    "scene_b_budget_unchanged": true,
+    "scene_b_failure_observation_exists": true,
+    "scene_b_replan_count_bounded": true
+  },
+  "migration": {
+    "fresh_install": "PASS",
+    "migration_count": 29,
+    "new_migration_029": "planned_task_loop_id column"
+  }
+}
