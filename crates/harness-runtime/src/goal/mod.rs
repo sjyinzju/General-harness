@@ -322,19 +322,14 @@ pub struct CriterionCompletionStatus {
 /// `StrictProfileDiversity` — the legacy rule requiring different profiles for
 /// Planner/Evaluator and Executor/Reviewer. Only usable when two or more
 /// operational profiles are available.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum RoleIsolationPolicy {
     /// Default: same profile allowed; distinct sessions required.
+    #[default]
     IsolatedSessions,
     /// High-assurance: different profiles required for Planner/Evaluator
     /// and Executor/Reviewer.
     StrictProfileDiversity,
-}
-
-impl Default for RoleIsolationPolicy {
-    fn default() -> Self {
-        Self::IsolatedSessions
-    }
 }
 
 impl RoleIsolationPolicy {
