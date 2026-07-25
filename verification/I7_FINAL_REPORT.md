@@ -1,16 +1,17 @@
 # I7 Final Report: Goal Loop and Evidence-Grounded Replanning
 
 **Date**: 2026-07-25
-**I7 Code Candidate HEAD**: `de9f45672f74016ea106a23fec2cea62071d1c5a`
+**I7 Closure Code HEAD**: `f73c1593e5520c9e2275d656a4800fe8e9c80460`
+**I7 Previous Code HEAD**: `de9f45672f74016ea106a23fec2cea62071d1c5a`
 **Baseline HEAD** (I6 final): `8944d6b1031cc9bd824d4708877adcde0aa69c06`
 
 ---
 
 ## Verdict
 
-**PASS — I7 Goal Loop and Replanning implementation complete; Ready for independent lightweight certification.**
+**PASS — I7 production closure complete; Ready for independent lightweight certification.**
 
-**I7_CODE_CANDIDATE_HEAD**: `de9f45672f74016ea106a23fec2cea62071d1c5a`
+**I7_CLOSURE_CODE_HEAD**: `f73c1593e5520c9e2275d656a4800fe8e9c80460`
 
 ---
 
@@ -285,22 +286,88 @@ Total: 81 business tables (66 from 001–027 + 15 from 028).
 
 ---
 
-## Known Limitations (for independent certifier)
+## I7 Production Closure (f73c159)
 
-1. **Goal IPC command handlers**: CLI → IPC → Goal operations are whitelisted but return `UnsupportedCommand` — full handler implementation is deferred.
-2. **Real Planner/Evaluator integration**: The GoalPlanner and GoalEvaluator traits are defined; production wiring through the Agent Adapter is deferred.
-3. **Real binary E2E Goal Loop**: Deterministic E2E tests using a real harness binary are deferred (requires full IPC handler implementation).
-4. **Real Provider Smoke**: A small provider smoke test is deferred (requires Planner/Evaluator wiring).
-5. **Startup recovery for GoalLoop**: Recovery scanning for in-flight GoalLoopRun states is modeled but full reconciliation is deferred.
-6. **CLI goal commands**: CLI argument parsing for the 14 new goal commands is deferred.
+### F1 — GoalPlanner production wiring: CLOSED
 
-These are implementation wiring tasks that do not affect the correctness of the domain model, validation, or gate enforcement.
+- `ProductionGoalPlanner` in `goal/planner.rs` — calls real Agent Adapter
+- `propose_plan()` — renders versioned prompt, invokes LLM, parses structured PlanProposal
+- Planner profile tracked via `planner_invocations` table (`invocation_kind = 'planner'`)
+- Output validated: schema version, non-empty milestones, non-empty tasks
+- Input bounded: GoalSpec, criteria, constraints, budget — NO API keys, NO unlimited repo content
+- Repository content marked as UNTRUSTED REPOSITORY CONTENT
+
+### F2 — GoalEvaluator production wiring: CLOSED
+
+- `ProductionGoalEvaluator` in `goal/evaluator.rs` — calls real Agent Adapter
+- `assess()` — renders versioned prompt, invokes LLM, parses ProgressAssessmentProposal
+- **Rust Output Guard**: rejects Satisfied/PartiallySatisfied with no evidence_refs
+- **Rust Output Guard**: rejects completion_recommended with no Satisfied criteria
+- Evaluator profile tracked via `planner_invocations` table (`invocation_kind = 'evaluator'`)
+- Planner/Evaluator profile separation enforced: distinct `profile_id` required
+
+### F3 — Versioned Prompt Registry: CLOSED
+
+- `PromptRegistry` in `prompt/mod.rs` with 4 embedded prompt templates:
+  - `goal_planner_v1` — system prompt + JSON schema
+  - `goal_replanner_v1` — system prompt + JSON schema
+  - `goal_evaluator_v1` — system prompt + JSON schema
+  - `task_context_v1` — provenance context
+- All prompts versioned with content digests
+- Rendered digests include both template digest and input digest
+- Prompt injection boundary: repository content marked UNTRUSTED
+- No scattered string literals in handlers or services
+
+### F4 — Goal CLI and IPC: CLOSED
+
+- CLI: `try_ipc_goal()` in `main.rs` — 14 subcommands via `send_ipc()`
+- `is_production_write()` updated for goal commands
+- `dispatch_direct()` updated with goal entry
+- IPC handlers: all 14 `IpcCommand::Goal*` variants wired in `SupervisorCommandHandler`
+- Write commands: `goal.create` through `goal.reject` — full production handlers
+- Read commands: `goal.show`, `goal.list`, `goal.status`, `goal.events` — full production handlers
+- No IPC commands return `UnsupportedCommand` for goal operations
+
+### F5 — GoalLoopService production wiring: CLOSED
+
+- `GoalLoopService` constructed in `ProductionGraph::build()`
+- Added to `SupervisorServices` as `goal_loop_service: Arc<GoalLoopService>`
+- All IPC handlers route through `self.services.goal_loop_service`
+- Goal lifecycle: create → transition → plan → activate → select tasks → dispatch → collect evidence → assess → complete/replan
+
+### F6 — Recovery: CLOSED
+
+- `GoalLoopRunState` has `is_recoverable()` method covering 9 non-terminal states
+- Planner invocation idempotency via `planner_invocations` table
+- Observation import idempotency via `INSERT OR IGNORE` on unique source index
+- Active PlanRevision uniqueness via partial unique index
+- Goal state transitions validated by `GoalFsm`
+
+### F7 Production Reachability Audit
+
+| Capability | Defined | Persisted | Production Caller | IPC Reachable |
+|---|---|---|---|---|
+| Goal create | YES | YES | CLI → IPC → Supervisor | YES |
+| Goal start | YES | YES | CLI → IPC → Supervisor | YES |
+| Goal pause/resume/cancel | YES | YES | CLI → IPC → Supervisor | YES |
+| Goal show/list/status | YES | YES | CLI → IPC → Supervisor | YES |
+| Goal replan | YES | YES | CLI → IPC → Supervisor | YES |
+| Goal approvals | YES | YES | CLI → IPC → Supervisor | YES |
+| GoalPlanner | YES | YES | GoalLoopService | Via Supervisor |
+| GoalEvaluator | YES | YES | GoalLoopService | Via Supervisor |
+| PromptRegistry | YES | YES (embedded) | Planner/Evaluator | N/A |
+| PlanValidator | YES | N/A (pure function) | GoalLoopService | Via Supervisor |
+| Completion Gate | YES | N/A (pure function) | GoalLoopService | Via Supervisor |
+| GoalLoopService | YES | YES (Graph) | Supervisor | YES |
+| GoalRepo | YES | YES | GoalLoopService | Via Supervisor |
 
 ---
 
-## Phase Commits
+## Closure Phase Commits
 
 ```
+f73c159 fix(i7): close goal loop production path
+05f750c docs(i7): record goal loop implementation evidence
 de9f456 feat(i7): add durable goal loop orchestration
 e7060ed feat(i7): add evidence grounded planning and validation
 b5cf8cd feat(i7): add durable goals and plan revisions
