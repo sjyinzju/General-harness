@@ -447,7 +447,10 @@ async fn run_real_provider_smoke_approved(
 
     let db_path = smoke_dir.join("harness.db");
     let test_repo = smoke_dir.join("test-repo");
-    let worktree_root = smoke_dir.join("worktrees");
+    // Worktree root MUST be outside the harness git worktree
+    let worktree_root = std::env::temp_dir()
+        .join("harness-i7-wt")
+        .join(code_head);
 
     // Create isolated git repo
     std::fs::create_dir_all(&test_repo)?;
@@ -863,7 +866,10 @@ async fn _run_real_provider_smoke_removed(
 
     let db_path = smoke_dir.join("harness.db");
     let test_repo = smoke_dir.join("test-repo");
-    let worktree_root = smoke_dir.join("worktrees");
+    // Worktree root MUST be outside the harness git worktree
+    let worktree_root = std::env::temp_dir()
+        .join("harness-i7-wt")
+        .join(code_head);
 
     // Create isolated git repo
     std::fs::create_dir_all(&test_repo)?;
