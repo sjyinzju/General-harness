@@ -3,6 +3,14 @@ name = "harness-cli"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "harness"
+path = "src/main.rs"
+
+[[bin]]
+name = "i7-acceptance"
+path = "src/bin/i7_acceptance.rs"
+
 [lints]
 workspace = true
 

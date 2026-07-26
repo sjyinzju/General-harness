@@ -469,18 +469,50 @@ impl GoalRuntimeConfig {
 // ── Invocation Record ───────────────────────────────────────────────────
 
 /// Durable record of a real Agent invocation for a goal role.
+///
+/// Records session provenance: each invocation gets a unique
+/// `harness_session_id` and `invocation_id`, with `session_mode = fresh`
+/// and `resume_requested = false` — proving session independence.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoleInvocation {
+    /// Unique invocation identifier (one per role call).
     pub invocation_id: String,
+    /// Role: GoalPlanner, GoalEvaluator, TaskExecutor, TaskReviewer, Certification.
     pub role: String,
+    /// RuntimeProfile ID used for this invocation.
     pub profile_id: String,
+    /// Adapter kind (claude-cli, codex-cli, etc.).
     pub adapter_kind: String,
+    /// Path to the agent binary.
     pub binary_path: String,
+    /// Agent version string.
     pub binary_version: String,
+    /// SHA-256 of the input context.
     pub input_digest: String,
+    /// SHA-256 of the rendered prompt.
     pub prompt_digest: String,
+    /// SHA-256 of the output (None if failed).
     pub output_digest: Option<String>,
+
+    // ── Session provenance (RC-C) ──────────────────────────
+    /// Harness-assigned session ID (distinct from vendor session_id).
+    /// Always unique per invocation; never resumed.
+    pub harness_session_id: String,
+    /// Vendor/provider session ID (e.g., Claude's session_id).
+    /// May be None if the provider doesn't expose it.
+    pub vendor_session_id: Option<String>,
+    /// Session mode: "fresh" or "resume".
+    /// Must be "fresh" for all acceptance invocations.
+    pub session_mode: String,
+    /// Whether resume was requested (must be false for acceptance).
+    pub resume_requested: bool,
+    /// OS process identity (pid + start time fingerprint).
+    pub process_identity: String,
+
+    /// When the invocation started.
     pub started_at: chrono::DateTime<chrono::Utc>,
+    /// When the invocation completed (None if still running/crashed).
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Terminal state: "completed", "failed", "timeout", "cancelled".
     pub terminal_state: Option<String>,
 }

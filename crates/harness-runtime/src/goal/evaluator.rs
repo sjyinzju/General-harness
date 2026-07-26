@@ -25,6 +25,8 @@ pub struct ProductionGoalEvaluator {
     adapter: Arc<dyn AgentAdapter>,
     profile: RuntimeProfile,
     prompt_registry: Arc<PromptRegistry>,
+    /// Invocation records for session provenance tracking.
+    invocations: Arc<std::sync::Mutex<Vec<super::RoleInvocation>>>,
 }
 
 impl ProductionGoalEvaluator {
@@ -37,7 +39,13 @@ impl ProductionGoalEvaluator {
             adapter,
             profile,
             prompt_registry,
+            invocations: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
+    }
+
+    /// Return recorded invocations (for acceptance/session provenance tracking).
+    pub fn get_invocations(&self) -> Vec<super::RoleInvocation> {
+        self.invocations.lock().unwrap().clone()
     }
 
     /// Assess goal progress by invoking the LLM.
@@ -109,6 +117,10 @@ impl ProductionGoalEvaluator {
     }
 
     async fn call_adapter(&self, envelope: &TaskEnvelope) -> Result<serde_json::Value, CoreError> {
+        let invocation_id = format!("inv-evaluator-{}", uuid::Uuid::new_v4());
+        let harness_session_id = format!("hs-evaluator-{}", uuid::Uuid::new_v4());
+        let started_at = chrono::Utc::now();
+
         let opts = SessionOptions {
             working_directory: std::env::temp_dir(),
             env: HashMap::new(),
@@ -127,20 +139,68 @@ impl ProductionGoalEvaluator {
         session.receive_events(&mut collector).await?;
         session.dispose().await?;
 
-        let inner = collector.final_result.ok_or_else(|| {
+        let result = collector.final_result.ok_or_else(|| {
             CoreError::new(
                 ErrorCode::Internal,
                 "Evaluator produced no final result",
                 ErrorSource::Harness,
             )
         })?;
-        inner.map_err(|msg| {
+
+        let output = result.map_err(|msg| {
             CoreError::new(
                 ErrorCode::Internal,
                 format!("Evaluator result was an error: {msg}"),
                 ErrorSource::Harness,
             )
-        })
+        })?;
+
+        // ── Record invocation provenance ──────────────────────────
+        let completed_at = chrono::Utc::now();
+        let output_digest = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(
+                serde_json::to_string(&output)
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+            Some(format!("{:x}", h.finalize()))
+        };
+
+        let record = super::RoleInvocation {
+            invocation_id: invocation_id.clone(),
+            role: "GoalEvaluator".to_string(),
+            profile_id: self.profile.id.clone(),
+            adapter_kind: self.adapter.kind().to_string(),
+            binary_path: self.profile.executable_path.clone(),
+            binary_version: self.profile.agent_version.clone(),
+            input_digest: String::new(), // evaluator input not tracked separately
+            prompt_digest: String::new(),
+            output_digest,
+            harness_session_id: harness_session_id.clone(),
+            vendor_session_id: Some(session.session_id().to_string()),
+            session_mode: "fresh".to_string(),
+            resume_requested: false,
+            process_identity: format!("pid-{}", std::process::id()),
+            started_at,
+            completed_at: Some(completed_at),
+            terminal_state: Some("completed".to_string()),
+        };
+
+        if let Ok(mut invocations) = self.invocations.lock() {
+            invocations.push(record);
+        }
+
+        tracing::info!(
+            invocation_id = %invocation_id,
+            harness_session_id = %harness_session_id,
+            role = "GoalEvaluator",
+            session_mode = "fresh",
+            "Evaluator invocation recorded (RC-C: session provenance)"
+        );
+
+        Ok(output)
     }
 }
 

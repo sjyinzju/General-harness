@@ -48,25 +48,41 @@ impl Failpoint {
         Self { name, description }
     }
 
-    /// Hit this failpoint. If failpoints are enabled, this will block
-    /// until the failpoint is released by the test harness. Otherwise,
-    /// it's a no-op.
+    /// Hit this failpoint. If failpoints are enabled, this will:
+    /// 1. Write a `.hit` marker file (deterministic signal for the test harness)
+    /// 2. Block until the failpoint is released by the test harness
     ///
-    /// The test harness sets a file-based signal (e.g., a marker file)
-    /// that this function checks before proceeding.
+    /// The hit marker is written BEFORE blocking, so the runner can observe
+    /// the failpoint was reached without log scanning or sleep-based heuristics.
+    ///
+    /// When failpoints are disabled (production), this is a no-op.
     pub async fn hit(&self) {
         if !failpoints_enabled() {
             return;
         }
 
+        // Ensure failpoint directory exists
+        let fp_dir = std::path::Path::new("target/harness-failpoints");
+        let _ = std::fs::create_dir_all(fp_dir);
+
+        // 1. Write hit marker BEFORE blocking (deterministic signal for runner)
+        let hit_file = fp_dir.join(format!("{}.hit", self.name));
+        if let Err(e) = std::fs::write(&hit_file, chrono::Utc::now().to_rfc3339()) {
+            tracing::warn!(
+                failpoint = self.name,
+                error = %e,
+                "failed to write failpoint hit marker"
+            );
+        }
+
         tracing::info!(
             failpoint = self.name,
             description = self.description,
-            "failpoint hit — waiting for release signal"
+            hit_file = %hit_file.display(),
+            "failpoint hit — hit marker written, waiting for release signal"
         );
 
-        // Poll for release signal file. The test harness creates a file
-        // named `<failpoint_name>.release` in the failpoint directory.
+        // 2. Poll for release signal file
         let release_file = format!("target/harness-failpoints/{}.release", self.name);
 
         loop {
@@ -106,3 +122,30 @@ pub const AFTER_EVALUATOR_INVOCATION: Failpoint = Failpoint::new(
     "after_evaluator_invocation",
     "Evaluator returned, before assessment persisted",
 );
+
+/// Check if a specific failpoint was hit (reads the .hit marker file).
+/// Returns Some(timestamp) if the failpoint was hit, None otherwise.
+/// Used by test harnesses for deterministic observation without log scanning.
+pub fn check_failpoint_hit(name: &str) -> Option<String> {
+    let hit_file = format!("target/harness-failpoints/{}.hit", name);
+    std::fs::read_to_string(&hit_file)
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Clean up failpoint markers for a specific failpoint.
+pub fn cleanup_failpoint(name: &str) {
+    let fp_dir = std::path::Path::new("target/harness-failpoints");
+    let hit_file = fp_dir.join(format!("{}.hit", name));
+    let release_file = fp_dir.join(format!("{}.release", name));
+    let _ = std::fs::remove_file(&hit_file);
+    let _ = std::fs::remove_file(&release_file);
+}
+
+/// Clean up all failpoint markers.
+pub fn cleanup_all_failpoints() {
+    let fp_dir = std::path::Path::new("target/harness-failpoints");
+    if fp_dir.exists() {
+        let _ = std::fs::remove_dir_all(fp_dir);
+    }
+}

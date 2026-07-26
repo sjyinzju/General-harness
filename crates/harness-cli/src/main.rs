@@ -26,6 +26,7 @@
 //! - No silent standalone/DB fallback for production write commands.
 //! - Default CLI never opens the database for writes in IPC mode.
 
+mod bootstrap;
 mod commands;
 mod ipc_client;
 
@@ -79,7 +80,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // supervisor start spawns a child process — no graph needed
     if args.len() >= 3 && args[1] == "supervisor" && args[2] == "start" {
         let state_dir = parse_flag(&args, "--state-dir").unwrap_or("default");
-        match commands::supervisor::cmd_supervisor_start(&db_path, state_dir).await {
+        let start_repo = parse_flag(&args, "--repo");
+        let start_wt = parse_flag(&args, "--worktree-root");
+        let start_ch = parse_flag(&args, "--code-head");
+        let failpoint_enable = std::env::var("HARNESS_FAILPOINT_ENABLE").is_ok();
+        match commands::supervisor::cmd_supervisor_start(
+            &db_path,
+            state_dir,
+            start_repo,
+            start_wt,
+            start_ch,
+            failpoint_enable,
+        )
+        .await
+        {
             Ok(()) => return Ok(()),
             Err(e) => {
                 eprintln!("error: {e}");
@@ -133,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    // ── Build ProductionGraph ───────────────────────────────────
+    // ── Build ProductionGraph with real adapter bootstrap ──────────
     let db = Database::open(&PathBuf::from(&db_path)).await?;
     let worktree_root = parse_flag(&args, "--worktree-root")
         .map(PathBuf::from)
@@ -144,19 +158,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(PathBuf::from)
         })
         .unwrap_or_else(|| repo_root.join("target/tmp"));
-    let graph = match ProductionGraph::build(
+    // Bootstrap with real adapter discovery (RC-A fix)
+    let bootstrapped = match bootstrap::bootstrap_production_graph(
         db.pool.clone(),
         &worktree_root,
         &repo_root,
         run_context.clone(),
-    ) {
-        Ok(g) => g,
+    )
+    .await
+    {
+        Ok(b) => b,
         Err(e) => {
-            eprintln!("fatal: {e}");
+            eprintln!("fatal: bootstrap failed: {e}");
             let _ = run_context.shutdown(false).await;
             std::process::exit(1);
         }
     };
+    let graph = bootstrapped.graph;
+    if bootstrapped.operational_profile.is_some() {
+        eprintln!(
+            "info: bootstrap: {} profiles discovered, Planner/Evaluator LIVE",
+            bootstrapped.profiles_discovered
+        );
+    } else {
+        eprintln!("warning: bootstrap: no operational profiles — Planner/Evaluator unavailable");
+    }
 
     // ── Standalone dual-writer check ───────────────────────────
     if standalone {
@@ -1107,7 +1133,11 @@ async fn dispatch_supervisor(
                 false
             }
         },
-        "start" => match commands::supervisor::cmd_supervisor_start(db_path, state_dir).await {
+        "start" => match commands::supervisor::cmd_supervisor_start(
+            db_path, state_dir, None, None, None, false,
+        )
+        .await
+        {
             Ok(()) => true,
             Err(e) => {
                 eprintln!("error: {e}");
