@@ -1095,7 +1095,7 @@ async fn run_crash_takeover(
 
     let db_path = ct_dir.join("harness.db");
     let test_repo = ct_dir.join("test-repo");
-    let worktree_root = ct_dir.join("worktrees");
+    let worktree_root = std::env::temp_dir().join("harness-i7-wt-ct").join(code_head);
 
     // Setup isolated test repo
     std::fs::create_dir_all(&test_repo)?;
@@ -1599,7 +1599,7 @@ fn make_operational_profile(profile_id: &str) -> RuntimeProfile {
         agent_kind: "claude-code".to_string(),
         adapter_kind: "claude-cli".to_string(),
         agent_version: "unknown".to_string(),
-        executable_path: "claude".to_string(),
+        executable_path: r"C:\Users\shiju\AppData\Roaming\npm\claude.cmd".to_string(),
         provider: "custom-anthropic-compatible".to_string(),
         provider_source: ProviderSource::CustomAnthropicCompatible,
         model: None,
