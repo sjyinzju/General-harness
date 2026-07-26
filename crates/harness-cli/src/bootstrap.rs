@@ -500,9 +500,7 @@ pub async fn run_independent_certification(
                         } => {
                             self.content = content.clone();
                         }
-                        AgentEvent::Message { content, .. }
-                            if self.content.is_empty() =>
-                        {
+                        AgentEvent::Message { content, .. } if self.content.is_empty() => {
                             self.content = content.clone();
                         }
                         _ => {}
