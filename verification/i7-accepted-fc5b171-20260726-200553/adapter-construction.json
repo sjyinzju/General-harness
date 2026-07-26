@@ -1,0 +1,16 @@
+{
+  "adapter_type": "ClaudeCliAdapter",
+  "construction_path": "bootstrap.rs → ClaudeCliAdapter::new(ProcessManager) → Arc<dyn AgentAdapter>",
+  "profile_source": "RuntimeProfile built from DiscoveredAgent (passive PATH scan)",
+  "profile_fields": {
+    "agent_kind": "claude-code",
+    "adapter_kind": "claude-cli",
+    "executable": "PATH-discovered (claude)",
+    "model": "not hardcoded (None — uses RuntimeProfile/SessionOptions override)",
+    "base_url": "not hardcoded (None)",
+    "provider": "custom-anthropic-compatible (from env hint detection)"
+  },
+  "session_creation": "Each Planner/Evaluator invocation creates fresh AgentSession via adapter.start_session()",
+  "resume": "resume_session_id always None — fresh sessions only",
+  "process_manager": "Arc<ProcessManager> with ProcessRegistry — proper lifecycle management"
+}

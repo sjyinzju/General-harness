@@ -1,0 +1,16 @@
+{
+  "mechanism": "File-based hit marker + release signal",
+  "hit_signal": "target/harness-failpoints/{failpoint_name}.hit — written atomically before blocking",
+  "release_signal": "target/harness-failpoints/{failpoint_name}.release — created by test harness",
+  "observation_api": "check_failpoint_hit(name) → Option<timestamp>",
+  "cleanup_api": "cleanup_failpoint(name) | cleanup_all_failpoints()",
+  "well_known_failpoints": [
+    "after_task_integrated",
+    "before_goal_observation_persisted",
+    "after_planner_invocation",
+    "after_evaluator_invocation"
+  ],
+  "production_safety": "All failpoints disabled by default. Only active when HARNESS_FAILPOINT_ENABLE=1 or debug_assertions + enable_failpoints() called.",
+  "polling_interval": "100ms (bounded, no unbounded sleep)",
+  "no_log_scanning_needed": true
+}

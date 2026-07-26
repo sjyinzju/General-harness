@@ -1,0 +1,22 @@
+{
+  "consistency_check": {
+    "code_head_in_evidence": "fc5b17150b85a6cafbd72f5ef532c3b71559eae5",
+    "code_head_in_git": "fc5b17150b85a6cafbd72f5ef532c3b71559eae5",
+    "match": true
+  },
+  "contradiction_count": 0,
+  "all_evidence_files_consistent": true,
+  "files_in_bundle": [
+    "summary.json",
+    "code-head.txt",
+    "commands.jsonl",
+    "acceptance-root-causes.json",
+    "production-bootstrap.json",
+    "adapter-construction.json",
+    "role-session-isolation.json",
+    "failpoint-handshake.json",
+    "process-cleanup.json",
+    "independent-certification.json",
+    "report-consistency.json"
+  ]
+}

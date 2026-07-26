@@ -1,0 +1,23 @@
+{
+  "role_isolation_policy": "IsolatedSessions",
+  "provenance_tracking": {
+    "struct": "RoleInvocation (extended)",
+    "fields": {
+      "invocation_id": "inv-{role}-{uuid} — unique per invocation",
+      "harness_session_id": "hs-{role}-{uuid} — unique per session, never resumed",
+      "vendor_session_id": "Claude CLI session_id or None",
+      "session_mode": "fresh (always — resume_requested=false)",
+      "process_identity": "pid-{OS_PID}",
+      "role": "GoalPlanner | GoalEvaluator | TaskExecutor | TaskReviewer | Certification"
+    }
+  },
+  "planner_invocations": "Recorded by ProductionGoalPlanner::call_adapter()",
+  "evaluator_invocations": "Recorded by ProductionGoalEvaluator::call_adapter()",
+  "independence_proof": {
+    "distinct_invocation_ids": "Each role call gets unique invocation_id",
+    "distinct_harness_session_ids": "Each role call gets unique harness_session_id",
+    "session_mode_all_fresh": "All session_mode == 'fresh'",
+    "resume_requested_all_false": "All resume_requested == false",
+    "cross_role_parent_session_ids": "None — no parent-child session relationships"
+  }
+}
