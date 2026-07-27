@@ -123,7 +123,20 @@ impl ProductionGoalEvaluator {
 
         let opts = SessionOptions {
             working_directory: std::env::temp_dir(),
-            env: HashMap::new(),
+            env: {
+                let mut m = HashMap::new();
+                for key in &[
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_BASE_URL",
+                    "ANTHROPIC_MODEL",
+                    "NO_PROXY",
+                ] {
+                    if let Ok(val) = std::env::var(key) {
+                        m.insert(key.to_string(), val);
+                    }
+                }
+                m
+            },
             timeout: Duration::from_secs(120),
             max_turns: Some(1),
             resume_session_id: None,

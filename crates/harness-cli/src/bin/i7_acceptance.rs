@@ -42,7 +42,7 @@ enum AcceptanceExecutionMode {
     /// Phases 1-3 only. Real Agent phases require approval.
     SafeOnly,
     /// All phases. Explicit human approval has been granted.
-    ApprovedRealRuntime(RealRuntimeApproval),
+    ApprovedRealRuntime(Box<RealRuntimeApproval>),
 }
 
 /// Structured approval grant for real runtime execution.
@@ -117,7 +117,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mode = if requested_real {
         match request_interactive_approval(&repo_root, &code_head, &run_id) {
-            Ok(approval) => AcceptanceExecutionMode::ApprovedRealRuntime(approval),
+            Ok(approval) => AcceptanceExecutionMode::ApprovedRealRuntime(Box::new(approval)),
             Err(e) => {
                 eprintln!("\nApproval denied: {e}");
                 eprintln!("Re-run without --execute-real-runtime for SafeOnly mode.");
@@ -166,12 +166,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Phase 2: Migration Tests ─────────────────────────────────
     println!("\n═══ Phase 2: Migration Tests ═══");
     run_migration_tests(&repo_root, results);
-    println!("Phase 2: COMPLETE (fresh={}, v23={})", results.migration_fresh_passed, results.migration_v23_passed);
+    println!(
+        "Phase 2: COMPLETE (fresh={}, v23={})",
+        results.migration_fresh_passed, results.migration_v23_passed
+    );
 
     // ── Phase 3: Deterministic Binary E2E ────────────────────────
     println!("\n═══ Phase 3: Deterministic E2E Tests ═══");
     run_deterministic_e2e(&repo_root, results);
-    println!("Phase 3: COMPLETE (det_e2e={}, replan={})", results.det_e2e_passed, results.replan_e2e_passed);
+    println!(
+        "Phase 3: COMPLETE (det_e2e={}, replan={})",
+        results.det_e2e_passed, results.replan_e2e_passed
+    );
 
     // ── Phase 4: Real Provider Smoke ─────────────────────────────
     match &mode {
@@ -218,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             return Ok(());
         }
-        AcceptanceExecutionMode::ApprovedRealRuntime(approval) => {
+        AcceptanceExecutionMode::ApprovedRealRuntime(ref approval) => {
             println!("\n═══ Phase 4: Real Provider Smoke ═══");
             println!(
                 "Approval: {} (by human at {})",
@@ -448,9 +454,7 @@ async fn run_real_provider_smoke_approved(
     let db_path = smoke_dir.join("harness.db");
     let test_repo = smoke_dir.join("test-repo");
     // Worktree root MUST be outside the harness git worktree
-    let worktree_root = std::env::temp_dir()
-        .join("harness-i7-wt")
-        .join(code_head);
+    let worktree_root = std::env::temp_dir().join("harness-i7-wt").join(code_head);
 
     // Create isolated git repo
     std::fs::create_dir_all(&test_repo)?;
@@ -685,10 +689,7 @@ fn run_quality_gates(repo_root: &Path, results: &mut AcceptanceResults) {
     results.log(&format!("cargo fmt: {}", if ok { "PASS" } else { "FAIL" }));
 
     // cargo clippy (without -D warnings, so warnings don't break the gate)
-    let (_ok, out) = run_cargo_cmd(
-        repo_root,
-        &["clippy", "--workspace", "--all-targets"],
-    );
+    let (_ok, out) = run_cargo_cmd(repo_root, &["clippy", "--workspace", "--all-targets"]);
     let clippy_ok = !out.contains("error:") && !out.contains("error[");
     results.clippy_passed = clippy_ok;
     results.clippy_failed = !clippy_ok;
@@ -730,7 +731,11 @@ fn run_quality_gates(repo_root: &Path, results: &mut AcceptanceResults) {
         }
     }
     // If parsing found nothing but exit code is OK, trust exit code
-    let tests_ok = if total_passed == 0 && total_failed == 0 { ok } else { ok && total_failed == 0 };
+    let tests_ok = if total_passed == 0 && total_failed == 0 {
+        ok
+    } else {
+        ok && total_failed == 0
+    };
     results.tests_passed = tests_ok;
     results.tests_failed = total_failed;
     results.tests_output = Some(out);
@@ -867,9 +872,7 @@ async fn _run_real_provider_smoke_removed(
     let db_path = smoke_dir.join("harness.db");
     let test_repo = smoke_dir.join("test-repo");
     // Worktree root MUST be outside the harness git worktree
-    let worktree_root = std::env::temp_dir()
-        .join("harness-i7-wt")
-        .join(code_head);
+    let worktree_root = std::env::temp_dir().join("harness-i7-wt").join(code_head);
 
     // Create isolated git repo
     std::fs::create_dir_all(&test_repo)?;
@@ -1095,7 +1098,9 @@ async fn run_crash_takeover(
 
     let db_path = ct_dir.join("harness.db");
     let test_repo = ct_dir.join("test-repo");
-    let worktree_root = std::env::temp_dir().join("harness-i7-wt-ct").join(code_head);
+    let worktree_root = std::env::temp_dir()
+        .join("harness-i7-wt-ct")
+        .join(code_head);
 
     // Setup isolated test repo
     std::fs::create_dir_all(&test_repo)?;
@@ -1129,17 +1134,17 @@ async fn run_crash_takeover(
     results.log(&format!("DB initialized: {}", db_path.display()));
 
     // ── Start Supervisor A ───────────────────────────────────────
-    let state_dir_a = "i7-accept-a";
-    results.log(&format!(
-        "Starting Supervisor A (state_dir={state_dir_a})..."
-    ));
+    // CRITICAL: A and B must use the SAME state directory to share
+    // the ownership lease domain. Otherwise there is no real takeover.
+    let state_dir = "i7-accept-shared";
+    results.log(&format!("Starting Supervisor A (state_dir={state_dir})..."));
 
     let mut child_a = Command::new(&harness_bin)
         .args([
             "supervisor",
             "run",
             "--state-dir",
-            state_dir_a,
+            state_dir,
             "--db",
             &db_path.to_string_lossy(),
             "--repo",
@@ -1164,17 +1169,15 @@ async fn run_crash_takeover(
     let start = Instant::now();
     let mut a_ready = false;
     while start.elapsed() < SUPERVISOR_START_TIMEOUT {
-        // Check if process is alive
         match child_a.try_wait() {
             Ok(Some(status)) => {
                 return Err(format!("Supervisor A exited early with status: {status:?}").into());
             }
-            Ok(None) => {} // still running
+            Ok(None) => {}
             Err(e) => return Err(format!("wait error: {e}").into()),
         }
 
-        // Try IPC ping
-        if let Ok(Some(inst)) = check_ipc_ready(&db_path, state_dir_a).await {
+        if let Ok(Some(inst)) = check_ipc_ready(&db_path, state_dir).await {
             results.log(&format!(
                 "Supervisor A ready: instance={}, state={:?}, token={}",
                 inst.instance_id, inst.state, inst.fencing_token
@@ -1224,17 +1227,15 @@ async fn run_crash_takeover(
     tokio::time::sleep(Duration::from_secs(LEASE_DURATION_SECS + 5)).await;
 
     // ── Start Supervisor B ───────────────────────────────────────
-    let state_dir_b = "i7-accept-b";
-    results.log(&format!(
-        "Starting Supervisor B (state_dir={state_dir_b})..."
-    ));
+    // B uses the SAME state_dir as A to compete for the shared lease.
+    results.log(&format!("Starting Supervisor B (state_dir={state_dir})..."));
 
     let mut child_b = Command::new(&harness_bin)
         .args([
             "supervisor",
             "run",
             "--state-dir",
-            state_dir_b,
+            state_dir,
             "--db",
             &db_path.to_string_lossy(),
             "--repo",
@@ -1266,7 +1267,7 @@ async fn run_crash_takeover(
             Err(e) => return Err(format!("wait error: {e}").into()),
         }
 
-        if let Ok(Some(inst)) = check_ipc_ready(&db_path, state_dir_b).await {
+        if let Ok(Some(inst)) = check_ipc_ready(&db_path, state_dir).await {
             results.log(&format!(
                 "Supervisor B ready: instance={}, state={:?}, token={}",
                 inst.instance_id, inst.state, inst.fencing_token
@@ -1308,19 +1309,51 @@ async fn run_crash_takeover(
     let instance_ok = results.supervisor_a_instance_id != results.supervisor_b_instance_id;
     results.log(&format!("Instance check: different={instance_ok}"));
 
+    // ── Verify takeover (MANDATORY) ──────────────────────────────
+    if !takeover_ok {
+        return Err(format!(
+            "Takeover FAILED: B fencing token ({token_b}) NOT > A fencing token ({token_a}) — shared ownership domain not established"
+        ).into());
+    }
+
     // ── Verify recovery ──────────────────────────────────────────
-    // Check that SupervisorRepo shows the takeover
+    // Check shared lease after takeover — only B should be active
     let svc_repo = harness_runtime::supervisor::repo::SupervisorRepo::new(db.pool.clone());
-    let lease_a = svc_repo.get_active_lease(state_dir_a).await.ok().flatten();
-    let lease_b = svc_repo.get_active_lease(state_dir_b).await.ok().flatten();
+    let lease = svc_repo.get_active_lease(state_dir).await.ok().flatten();
 
     results.log(&format!(
-        "Lease A active: {}",
-        lease_a.map(|l| l.is_active == 1).unwrap_or(false)
+        "Active lease after takeover: instance={}, token={}",
+        lease
+            .as_ref()
+            .map(|l| l.instance_id.to_string())
+            .unwrap_or_else(|| "none".to_string()),
+        lease.as_ref().map(|l| l.fencing_token).unwrap_or(-1)
     ));
+
+    // Verify old owner fencing: old instance_id should NOT be the active owner.
+    let active_instance = svc_repo
+        .get_active_instance_for_dir(state_dir)
+        .await
+        .ok()
+        .flatten();
+    let old_owner_fenced = active_instance
+        .as_ref()
+        .map(|inst| {
+            inst.instance_id.to_string()
+                != results.supervisor_a_instance_id.clone().unwrap_or_default()
+        })
+        .unwrap_or(true);
     results.log(&format!(
-        "Lease B active: {}",
-        lease_b.map(|l| l.is_active == 1).unwrap_or(false)
+        "Old owner fencing: {} (A instance={}, active instance={})",
+        if old_owner_fenced {
+            "REJECTED (PASS)"
+        } else {
+            "ACCEPTED (FAIL)"
+        },
+        results.supervisor_a_instance_id.clone().unwrap_or_default(),
+        active_instance
+            .map(|i| i.instance_id.to_string())
+            .unwrap_or_else(|| "none".to_string())
     ));
 
     // ── Cleanup supervisors ──────────────────────────────────────
@@ -1341,6 +1374,9 @@ async fn run_crash_takeover(
         "b_fencing_higher": token_b > token_a,
         "pids_different": pid_ok,
         "instances_different": instance_ok,
+        "old_owner_fenced": old_owner_fenced,
+        "shared_state_dir": state_dir,
+        "shared_database": db_path.to_string_lossy(),
         "lease_duration_secs": LEASE_DURATION_SECS,
         "timestamp": Utc::now().to_rfc3339(),
     });
@@ -1419,15 +1455,141 @@ async fn run_certification(
         }
     }
 
-    // ── Build certification result ───────────────────────────────
-    let blocking_findings: Vec<String> = Vec::new();
+    // ── Build certification result (MANDATORY criteria enforcement) ──
+    let mut blocking_findings: Vec<String> = Vec::new();
+    let mut criteria: Vec<Value> = Vec::new();
 
-    if !results.fmt_passed {
-        // Collect findings but don't block (fmt is cosmetic for evidence)
+    // Helper to record a criterion verdict
+    let mut check = |name: &str, required: bool, passed: bool, detail: &str| {
+        let verdict = if passed { "PASS" } else { "FAIL" };
+        criteria.push(json!({
+            "criterion": name,
+            "required": required,
+            "passed": passed,
+            "verdict": verdict,
+            "detail": detail
+        }));
+        if required && !passed {
+            blocking_findings.push(format!("{name}: {detail}"));
+        }
+    };
+
+    // Phase 1: Quality gates
+    check("fmt", false, results.fmt_passed, "cargo fmt check");
+    check("clippy", false, results.clippy_passed, "cargo clippy");
+    check(
+        "workspace_tests",
+        true,
+        results.tests_failed == 0 && results.tests_passed,
+        &format!("{} tests failed", results.tests_failed),
+    );
+
+    // Phase 2: Migration
+    check(
+        "migration_fresh",
+        true,
+        results.migration_fresh_passed,
+        "fresh install 0→latest",
+    );
+    check(
+        "migration_v23_upgrade",
+        true,
+        results.migration_v23_passed,
+        "canonical v23 upgrade",
+    );
+
+    // Phase 3: Deterministic E2E
+    check(
+        "deterministic_goal_e2e",
+        true,
+        results.det_e2e_passed,
+        "two-task deterministic Goal",
+    );
+    check(
+        "failure_replan_e2e",
+        true,
+        results.replan_e2e_passed,
+        "failure → replan → success",
+    );
+
+    // Phase 4: Real Provider Smoke
+    check(
+        "real_provider_smoke_executed",
+        true,
+        results.real_provider_smoke_executed,
+        "real provider smoke was executed",
+    );
+    check(
+        "planner_invocations",
+        true,
+        results.real_planner_invocations >= 1,
+        &format!("planner invoked {} times", results.real_planner_invocations),
+    );
+    check(
+        "executor_invocations",
+        true,
+        results.real_executor_invocations >= 1,
+        &format!(
+            "executor invoked {} times",
+            results.real_executor_invocations
+        ),
+    );
+    check(
+        "reviewer_invocations",
+        true,
+        results.real_reviewer_invocations >= 1,
+        &format!(
+            "reviewer invoked {} times",
+            results.real_reviewer_invocations
+        ),
+    );
+    check(
+        "evaluator_invocations",
+        true,
+        results.real_evaluator_invocations >= 1,
+        &format!(
+            "evaluator invoked {} times",
+            results.real_evaluator_invocations
+        ),
+    );
+
+    // Phase 5: Crash/Takeover
+    check(
+        "supervisor_a_terminated",
+        true,
+        results.supervisor_a_terminated,
+        "A was killed by OS",
+    );
+    check(
+        "supervisor_takeover",
+        true,
+        results.supervisor_takeover_passed,
+        &format!(
+            "B token ({}) > A token ({})",
+            results.supervisor_b_fencing_token.unwrap_or(0),
+            results.supervisor_a_fencing_token.unwrap_or(0)
+        ),
+    );
+    check(
+        "shared_ownership_domain",
+        true,
+        results.supervisor_takeover_passed,
+        "A and B share same state directory domain",
+    );
+
+    // Phase runtime errors
+    if let Some(ref e) = results.provider_smoke_error {
+        check("provider_smoke_error_free", true, false, e);
     }
-    if results.tests_failed > 0 {
-        // This is a real blocking finding
+    if let Some(ref e) = results.crash_takeover_error {
+        check("crash_takeover_error_free", true, false, e);
     }
+
+    let verdict = if blocking_findings.is_empty() {
+        "PASS"
+    } else {
+        "FAIL"
+    };
 
     let cert = json!({
         "certification_id": format!("cert-{}", uuid::Uuid::new_v4()),
@@ -1436,13 +1598,18 @@ async fn run_certification(
         "code_head_verified": results.cert_code_head_verified,
         "evidence_files_count": files.len(),
         "evidence_files": files,
+        "mandatory_criteria": criteria.iter().filter(|c| c["required"].as_bool().unwrap_or(false)).count(),
+        "passed_criteria": criteria.iter().filter(|c| c["passed"].as_bool().unwrap_or(false) && c["required"].as_bool().unwrap_or(false)).count(),
+        "criteria": criteria,
         "blocking_findings": blocking_findings,
-        "verdict": if blocking_findings.is_empty() { "PASS" } else { "FAIL" },
+        "blocking_count": blocking_findings.len(),
+        "verdict": verdict,
         "summary": format!(
-            "Evidence bundle contains {} files. Code head verification: {}. Summary valid: {}.",
+            "{} evidence files. {} of {} mandatory criteria passed. {} blocking findings.",
             files.len(),
-            if results.cert_code_head_verified { "PASS" } else { "FAIL" },
-            if results.cert_summary_valid { "PASS" } else { "FAIL" }
+            criteria.iter().filter(|c| c["required"].as_bool().unwrap_or(false) && c["passed"].as_bool().unwrap_or(false)).count(),
+            criteria.iter().filter(|c| c["required"].as_bool().unwrap_or(false)).count(),
+            blocking_findings.len()
         ),
         "started_at": Utc::now().to_rfc3339(),
         "completed_at": Utc::now().to_rfc3339(),
@@ -1453,7 +1620,7 @@ async fn run_certification(
         serde_json::to_string_pretty(&cert)?,
     )?;
 
-    results.certification_passed = blocking_findings.is_empty();
+    results.certification_passed = verdict == "PASS";
     results.log(&format!(
         "Independent certification: {} ({} blocking findings)",
         if results.certification_passed {
