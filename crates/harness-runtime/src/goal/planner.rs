@@ -81,10 +81,12 @@ impl ProductionGoalPlanner {
         let output_json = self.call_adapter(&envelope, &rendered).await?;
 
         // 6. Parse the structured output
+        let raw_str = serde_json::to_string_pretty(&output_json).unwrap_or_default();
+        tracing::info!(planner_output = %raw_str, "Planner raw output");
         let proposal: PlanProposal = serde_json::from_value(output_json.clone()).map_err(|e| {
             CoreError::new(
                 ErrorCode::SerializationError,
-                format!("failed to parse PlanProposal: {e}"),
+                format!("failed to parse PlanProposal from: {raw_str}: {e}"),
                 ErrorSource::Harness,
             )
         })?;

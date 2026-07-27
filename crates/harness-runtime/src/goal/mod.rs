@@ -15,24 +15,39 @@ use chrono::{DateTime, Utc};
 use harness_core::contracts::goal::GoalId;
 use serde::{Deserialize, Serialize};
 
+/// Default schema version for structured LLM output when the LLM omits it.
+fn default_schema_version() -> String {
+    "1.0".to_string()
+}
+
 // ── Plan Proposal (from Planner LLM) ──────────────────────────────────
 
 /// Structured output that the Planner LLM must produce.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanProposal {
+    #[serde(default = "default_schema_version")]
     pub schema_version: String,
+    #[serde(default)]
     pub goal_summary: String,
+    #[serde(default)]
     pub assumptions: Vec<String>,
+    #[serde(default)]
     pub milestones: Vec<ProposedMilestone>,
+    #[serde(default)]
     pub tasks: Vec<ProposedTask>,
+    #[serde(default)]
     pub risks: Vec<ProposedRisk>,
+    #[serde(default)]
     pub completion_strategy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProposedMilestone {
+    #[serde(default)]
     pub client_ref: String,
+    #[serde(default)]
     pub title: String,
+    #[serde(default)]
     pub objective: String,
     #[serde(default)]
     pub success_criteria_refs: Vec<String>,
@@ -74,6 +89,7 @@ pub struct ProposedRisk {
 /// Structured output from the GoalEvaluator LLM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProgressAssessmentProposal {
+    #[serde(default = "default_schema_version")]
     pub schema_version: String,
     pub overall_assessment: String,
     pub criteria_assessments: Vec<CriterionAssessment>,

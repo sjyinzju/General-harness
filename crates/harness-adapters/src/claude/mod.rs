@@ -242,7 +242,12 @@ impl ClaudeCliAdapter {
                 })
             }
             "result" => {
-                let content = parsed["content"].as_str().unwrap_or("").to_string();
+                // Claude CLI uses "result" field (not "content") for the final result text
+                let content = parsed["result"]
+                    .as_str()
+                    .or_else(|| parsed["content"].as_str())
+                    .unwrap_or("")
+                    .to_string();
                 let is_error = parsed["is_error"].as_bool().unwrap_or(false);
                 Some(AgentEvent::Result { content, is_error })
             }

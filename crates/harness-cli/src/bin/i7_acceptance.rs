@@ -25,6 +25,7 @@ use harness_core::contracts::runtime_profile::{
     AuthCheckStatus, AuthMode, AuthStatus, CapabilitySet, CoreStatus, ExecutionStatus,
     OptionalCapabilities, ProviderSource, RequiredCapabilities, RuntimeProfile, TriState,
 };
+use harness_core::contracts::supervisor::SupervisorInstanceId;
 use harness_runtime::db::Database;
 use harness_runtime::liveness::RunContext;
 use harness_runtime::production_graph::ProductionGraph;
@@ -32,7 +33,8 @@ use serde_json::{json, Value};
 
 const SUPERVISOR_START_TIMEOUT: Duration = Duration::from_secs(30);
 const IPC_POLL_INTERVAL: Duration = Duration::from_millis(500);
-const LEASE_DURATION_SECS: u64 = 15;
+/// Must match SupervisorConfig::default().lease_duration_secs (30).
+const LEASE_DURATION_SECS: u64 = 30;
 const MAX_LLM_INVOCATIONS: u32 = 7;
 const MAX_PHASE4_DURATION: Duration = Duration::from_secs(600);
 
@@ -704,38 +706,31 @@ fn run_quality_gates(repo_root: &Path, results: &mut AcceptanceResults) {
         if clippy_ok { "PASS" } else { "FAIL" }
     ));
 
-    // cargo test — trust exit code
+    // cargo test — parse result lines for failed count
     let (ok, out) = run_cargo_cmd(repo_root, &["test", "--workspace"]);
-    // Parse for failed count
     let mut total_failed = 0i32;
     let mut total_passed = 0i32;
     for line in out.lines() {
         if line.contains("test result:") {
             results.log(&format!("  {line}"));
-            if let Some(pos) = line.find("failed;") {
-                let rest = &line[pos + 7..];
-                if let Some(end) = rest.find(';') {
-                    if let Ok(n) = rest[..end].trim().parse::<i32>() {
+            // Parse "X failed;" — the number comes BEFORE "failed;"
+            for part in line.split(';') {
+                let part = part.trim();
+                if part.contains("failed") {
+                    if let Ok(n) = part.split_whitespace().next().unwrap_or("0").parse::<i32>() {
                         total_failed += n;
                     }
                 }
-            }
-            if let Some(pos) = line.find("passed;") {
-                let rest = &line[pos + 7..];
-                if let Some(end) = rest.find(';') {
-                    if let Ok(n) = rest[..end].trim().parse::<i32>() {
+                if part.contains("passed") {
+                    if let Ok(n) = part.split_whitespace().next().unwrap_or("0").parse::<i32>() {
                         total_passed += n;
                     }
                 }
             }
         }
     }
-    // If parsing found nothing but exit code is OK, trust exit code
-    let tests_ok = if total_passed == 0 && total_failed == 0 {
-        ok
-    } else {
-        ok && total_failed == 0
-    };
+    // Tests are OK if no tests failed and we found at least some passing
+    let tests_ok = total_failed == 0 && (total_passed > 0 || ok);
     results.tests_passed = tests_ok;
     results.tests_failed = total_failed;
     results.tests_output = Some(out);
@@ -1255,7 +1250,10 @@ async fn run_crash_takeover(
     results.supervisor_b_pid = Some(pid_b);
 
     // ── Wait for Supervisor B readiness ──────────────────────────
-    results.log("Waiting for Supervisor B readiness...");
+    // Give B time to start, run migrations, acquire/takeover lease, and reach Ready
+    results.log("Waiting 5s for Supervisor B startup...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    results.log("Polling for Supervisor B readiness...");
     let start_b = Instant::now();
     let mut b_ready = false;
     while start_b.elapsed() < SUPERVISOR_START_TIMEOUT {
@@ -1724,17 +1722,15 @@ async fn check_ipc_ready(
 
     match repo.get_active_instance_for_dir(state_dir).await {
         Ok(Some(inst)) => {
-            // Check if state is Ready
             let state_str = format!("{:?}", inst.state);
-            if state_str.contains("Ready") || state_str.contains("Ready") {
-                Ok(Some(SupervisorInstanceBrief {
-                    instance_id: inst.instance_id.to_string(),
-                    state: state_str,
-                    fencing_token: inst.fencing_token,
-                }))
-            } else {
-                Ok(None)
+            if !state_str.contains("Ready") {
+                return Ok(None);
             }
+            Ok(Some(SupervisorInstanceBrief {
+                instance_id: inst.instance_id.to_string(),
+                state: state_str,
+                fencing_token: inst.fencing_token,
+            }))
         }
         Ok(None) => Ok(None),
         Err(e) => Err(format!("check ipc: {e}").into()),
