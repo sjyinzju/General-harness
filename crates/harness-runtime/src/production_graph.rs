@@ -245,6 +245,7 @@ impl ProductionGraph {
 
         // ── I7: Goal planner/evaluator (wired when adapters/profiles available) ─
         let profile_for_svc = profile.clone();
+        let adapter_for_svc = adapter.clone();
         let (goal_planner, goal_evaluator): (
             Option<Arc<ProductionGoalPlanner>>,
             Option<Arc<ProductionGoalEvaluator>>,
@@ -305,6 +306,13 @@ impl ProductionGraph {
             commit_service.clone(),
             integration_queue.clone(),
         );
+
+        // Propagate real adapter to GoalLoopService for I4.5/I4.6 task dispatch
+        if let Some(ref a) = adapter_for_svc {
+            goal_loop_svc.direct_adapter = Some(Arc::clone(a));
+            goal_loop_svc.direct_profile = profile_for_svc.clone();
+        }
+
         let goal_loop_service = Arc::new(goal_loop_svc);
 
         // ── I6: Supervisor repository ──────────────────────────────

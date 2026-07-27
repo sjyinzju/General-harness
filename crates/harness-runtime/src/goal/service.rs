@@ -89,6 +89,12 @@ pub struct GoalLoopService {
     pub commit_service: Option<Arc<ControlledCommitService>>,
     /// Integration queue service (I5) — enqueues and runs integrations.
     pub integration_queue: Option<Arc<IntegrationQueueService>>,
+    /// Direct agent adapter for task execution (propagated to I4.5 dispatch).
+    pub direct_adapter: Option<
+        Arc<dyn harness_core::contracts::agent_adapter::AgentAdapter>,
+    >,
+    /// Runtime profile for agent session creation.
+    pub direct_profile: Option<harness_core::contracts::runtime_profile::RuntimeProfile>,
 }
 
 impl std::fmt::Debug for GoalLoopService {
@@ -157,6 +163,8 @@ impl GoalLoopService {
             review_service: None,
             commit_service: None,
             integration_queue: None,
+            direct_adapter: None,
+            direct_profile: None,
         }
     }
 
@@ -876,15 +884,14 @@ impl GoalLoopService {
 
     // ── Goal Loop Run ──────────────────────────────────────────────
 
-    /// Start a new goal loop iteration and drive it asynchronously.
-    /// Creates a durable GoalLoopRun record and spawns the orchestration loop.
+    /// Start a new goal loop iteration and drive it to completion.
+    /// Creates a durable GoalLoopRun record and spawns a looping background
+    /// task that continues until the goal reaches a terminal state.
     pub async fn start_loop_run(&self, goal_id: &str) -> Result<String, CoreError> {
         let plan = self.repo.get_active_plan(goal_id).await?;
         let plan_id = plan.as_ref().map(|p| p.plan_revision_id.as_str());
         let run_id = self.repo.create_loop_run(goal_id, plan_id).await?;
 
-        // Drive the goal loop asynchronously using the SAME service instance
-        // (preserving planner/evaluator/production-service references)
         let goal_id_owned = goal_id.to_string();
         let pool = self.pool.clone();
         let planner = self.goal_planner.clone();
@@ -896,6 +903,8 @@ impl GoalLoopService {
         let runtime_config = self.runtime_config.clone();
         let planner_profile = self.planner_profile.clone();
         let evaluator_profile = self.evaluator_profile.clone();
+        let direct_adapter = self.direct_adapter.clone();
+        let direct_profile = self.direct_profile.clone();
 
         tokio::spawn(async move {
             let repo = GoalRepo::new(pool.clone());
@@ -911,13 +920,55 @@ impl GoalLoopService {
                 review_service: review,
                 commit_service: commit,
                 integration_queue: integration,
+                direct_adapter,
+                direct_profile,
             };
-            if let Err(e) = svc.drive_goal_loop(&goal_id_owned).await {
-                tracing::error!(
-                    goal_id = %goal_id_owned,
-                    error = %e,
-                    "goal loop drive failed"
-                );
+
+            // Loop until terminal state or max iterations
+            let mut iterations = 0u64;
+            let max_iterations = 60u64;
+            let mut last_state_digest = String::new();
+            let mut no_progress_count = 0u32;
+            loop {
+                iterations += 1;
+                if iterations > max_iterations {
+                    tracing::error!(goal_id = %goal_id_owned, iterations, "goal loop exceeded max iterations");
+                    break;
+                }
+
+                // Check current state
+                let current_state = get_goal_state(&svc.pool, &goal_id_owned).await.ok();
+                if let Some(ref s) = current_state {
+                    if s.is_terminal() {
+                        tracing::info!(goal_id = %goal_id_owned, state = %s.as_str(), "goal terminal");
+                        break;
+                    }
+                }
+
+                // Drive one iteration
+                match svc.drive_goal_loop(&goal_id_owned).await {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::warn!(goal_id = %goal_id_owned, error = %e, iterations, "goal loop iteration error");
+                    }
+                }
+
+                // Check for no-progress
+                let new_state = get_goal_state(&svc.pool, &goal_id_owned).await.ok();
+                let state_str = new_state.as_ref().map(|s| s.as_str()).unwrap_or("unknown");
+                if state_str == last_state_digest {
+                    no_progress_count += 1;
+                } else {
+                    no_progress_count = 0;
+                    last_state_digest = state_str.to_string();
+                }
+
+                if no_progress_count > 10 {
+                    tracing::warn!(goal_id = %goal_id_owned, no_progress_count, "goal loop stalled");
+                    break;
+                }
+
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
 
@@ -1151,6 +1202,28 @@ impl GoalLoopService {
                     let _ = task_loop
                         .start_or_resume_loop(&loop_id, "goal-loop", 300)
                         .await;
+
+                    // Dispatch full I4 execution with real adapter if available
+                    if let (Some(ref adapter), Some(ref profile)) =
+                        (&self.direct_adapter, &self.direct_profile)
+                    {
+                        let _ = task_loop
+                            .dispatch_attempt_full(
+                                &loop_id,
+                                &task_id,
+                                goal_id,
+                                &profile.id,
+                                None,
+                                None,
+                                goal_id,
+                                &pt.objective,
+                                300,
+                                &idempotency_key,
+                                &pt.task_fingerprint,
+                                adapter.as_ref(),
+                            )
+                            .await;
+                    }
 
                     tracing::info!(
                         goal_id = %goal_id,

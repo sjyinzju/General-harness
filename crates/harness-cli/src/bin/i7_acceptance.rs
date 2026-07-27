@@ -316,6 +316,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\nVerification evidence: {}", ver_dir.display());
     results.evidence_dir = Some(ver_dir.to_string_lossy().to_string());
 
+    // Final verdict: exit nonzero if any required phase or certification failed
+    if !results.certification_passed || results.crash_takeover_error.is_some() || results.provider_smoke_error.is_some() {
+        eprintln!("\nFINAL VERDICT: FAIL — certification or mandatory phase failed");
+        std::process::exit(1);
+    }
     Ok(())
 }
 
@@ -627,11 +632,8 @@ async fn run_real_provider_smoke_approved(
             }
         }
 
-        // Drive the goal loop directly with real adapter
-        if let Err(e) = graph.goal_loop_service.drive_goal_loop(&goal_id).await {
-            results.log(&format!("Loop iteration error: {}", e));
-        }
-
+        // Goal loop is driven by the Supervisor's spawned task.
+        // Just poll for state changes.
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
