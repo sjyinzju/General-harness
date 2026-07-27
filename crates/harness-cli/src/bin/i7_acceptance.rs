@@ -25,7 +25,6 @@ use harness_core::contracts::runtime_profile::{
     AuthCheckStatus, AuthMode, AuthStatus, CapabilitySet, CoreStatus, ExecutionStatus,
     OptionalCapabilities, ProviderSource, RequiredCapabilities, RuntimeProfile, TriState,
 };
-use harness_core::contracts::supervisor::SupervisorInstanceId;
 use harness_runtime::db::Database;
 use harness_runtime::liveness::RunContext;
 use harness_runtime::production_graph::ProductionGraph;
@@ -439,32 +438,29 @@ fn write_phase1_3_evidence(
     Ok(())
 }
 
-// ── Phase 4: Real Provider Smoke (approved, isolated) ─────────────────
+// ── Phase 4: Full Single-profile Real-Provider Goal E2E ─────────────────
 
 async fn run_real_provider_smoke_approved(
-    _repo_root: &Path,
+    repo_root: &Path,
     work_dir: &Path,
     code_head: &str,
     approval: &RealRuntimeApproval,
     results: &mut AcceptanceResults,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Use the approved writable root — isolated from harness source
     let smoke_dir = approval.writable_root.clone();
     std::fs::create_dir_all(&smoke_dir)?;
     results.log(&format!("Isolated repo: {}", smoke_dir.display()));
 
     let db_path = smoke_dir.join("harness.db");
     let test_repo = smoke_dir.join("test-repo");
-    // Worktree root MUST be outside the harness git worktree
     let worktree_root = std::env::temp_dir().join("harness-i7-wt").join(code_head);
+    let evidence_dir = work_dir.join("evidence");
+    std::fs::create_dir_all(&evidence_dir)?;
 
     // Create isolated git repo
     std::fs::create_dir_all(&test_repo)?;
     run_git(&["init", "."], &test_repo)?;
-    std::fs::write(
-        test_repo.join("README.md"),
-        "# I7 Provider Smoke (Approved)\n",
-    )?;
+    std::fs::write(test_repo.join("README.md"), "# I7 Full Provider Smoke\n")?;
     run_git(&["add", "."], &test_repo)?;
     run_git(
         &[
@@ -492,26 +488,12 @@ async fn run_real_provider_smoke_approved(
     let pm = Arc::new(harness_runtime::process::manager::ProcessManager::new(
         registry,
     ));
-
     let profile = make_operational_profile("claude-default-deepseek");
-    let adapter: Arc<dyn harness_core::contracts::agent_adapter::AgentAdapter> = {
-        let claude = harness_adapters::ClaudeCliAdapter::new(pm);
-        Arc::new(claude)
-    };
+    let adapter: Arc<dyn harness_core::contracts::agent_adapter::AgentAdapter> =
+        { Arc::new(harness_adapters::ClaudeCliAdapter::new(pm)) };
 
     results.log(&format!("Profile: {} ({})", profile.id, profile.agent_kind));
-    results.log(&format!(
-        "Max invocations: {}",
-        approval.maximum_llm_invocations
-    ));
-    results.log(&format!(
-        "Git push: {}",
-        if approval.allow_git_push {
-            "allowed"
-        } else {
-            "FORBIDDEN"
-        }
-    ));
+    results.real_provider_smoke_executed = true;
 
     let graph = ProductionGraph::build_with_adapter(
         pool.clone(),
@@ -524,119 +506,216 @@ async fn run_real_provider_smoke_approved(
     .map_err(|e| format!("build graph: {e}"))?;
 
     if graph.goal_planner.is_none() || graph.goal_evaluator.is_none() {
-        return Err("Adapter not wired — planner/evaluator are None".into());
+        return Err("Adapter not wired".into());
     }
     results.log("Real adapter wired: PASS");
 
-    // ── Create Goal ──────────────────────────────────────────────
-    let goal = make_normalize_whitespace_goal();
+    // ── Start Supervisor in-process ──────────────────────────────
+    let svc_config = harness_core::contracts::supervisor::SupervisorConfig {
+        state_directory_id: "i7-full-smoke".to_string(),
+        ..Default::default()
+    };
+    let supervisor = Arc::new(harness_runtime::supervisor::Supervisor::new(
+        svc_config,
+        pool.clone(),
+        graph.supervisor_services.clone(),
+    ));
+
+    // Spawn Supervisor in background tokio task
+    let sup_state_dir = "i7-full-smoke".to_string();
+    let _sup_handle = tokio::spawn({
+        let sup = supervisor.clone();
+        async move { sup.run(&sup_state_dir).await }
+    });
+
+    // Wait for Supervisor IPC readiness
+    results.log("Waiting for Supervisor readiness...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let start = Instant::now();
+    while start.elapsed() < SUPERVISOR_START_TIMEOUT {
+        if let Ok(Some(_)) = check_ipc_ready(&db_path, "i7-full-smoke").await {
+            results.log("Supervisor ready with IPC");
+            break;
+        }
+        tokio::time::sleep(IPC_POLL_INTERVAL).await;
+    }
+
+    // ── Create goal via CLI binary ────────────────────────────────
+    let harness_bin = find_harness_binary(repo_root)?;
+    let goal = make_single_task_goal();
+    let spec_path = smoke_dir.join("goal-spec.json");
+    std::fs::write(&spec_path, serde_json::to_string_pretty(&goal)?)?;
+    results.log(&format!("Goal spec: {}", spec_path.display()));
+
+    let create_out = Command::new(&harness_bin)
+        .args([
+            "goal",
+            "create",
+            "--spec-file",
+            &spec_path.to_string_lossy(),
+            "--db",
+            &db_path.to_string_lossy(),
+            "--worktree-root",
+            &worktree_root.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|e| format!("goal create: {e}"))?;
+    let create_stdout = String::from_utf8_lossy(&create_out.stdout);
+    results.log(&format!("Goal create: {}", create_stdout.trim()));
+    if !create_out.status.success() {
+        return Err(format!(
+            "Goal create failed: {}",
+            String::from_utf8_lossy(&create_out.stderr)
+        )
+        .into());
+    }
+
     let goal_id = goal.goal_id.clone();
 
-    graph
-        .goal_loop_service
-        .create_goal(goal)
-        .await
-        .map_err(|e| format!("create goal: {e}"))?;
-    results.log(&format!("Goal created: {goal_id}"));
-
-    graph
-        .goal_loop_service
-        .transition_goal(&goal_id, GoalState::Planning)
-        .await
-        .map_err(|e| format!("transition: {e}"))?;
-    results.log("Goal → Planning");
-
-    // ── Drive goal loop (calls REAL Planner via Claude CLI) ──────
-    results.log("Calling REAL Planner via ClaudeCliAdapter...");
-    let planner_start = Utc::now();
-
-    tokio::time::timeout(
-        approval.maximum_duration,
-        graph.goal_loop_service.drive_goal_loop(&goal_id),
-    )
-    .await
-    .map_err(|_| {
-        format!(
-            "Phase 4 timeout after {}s",
-            approval.maximum_duration.as_secs()
+    // ── Start goal via CLI binary ─────────────────────────────────
+    let start_out = Command::new(&harness_bin)
+        .args([
+            "goal",
+            "start",
+            "--goal-id",
+            &goal_id,
+            "--db",
+            &db_path.to_string_lossy(),
+            "--worktree-root",
+            &worktree_root.to_string_lossy(),
+        ])
+        .output()
+        .map_err(|e| format!("goal start: {e}"))?;
+    results.log(&format!(
+        "Goal start: {}",
+        String::from_utf8_lossy(&start_out.stdout).trim()
+    ));
+    if !start_out.status.success() {
+        return Err(format!(
+            "Goal start failed: {}",
+            String::from_utf8_lossy(&start_out.stderr)
         )
-    })?
-    .map_err(|e| format!("Planner invocation failed: {e}"))?;
+        .into());
+    }
 
-    let planner_duration = (Utc::now() - planner_start).num_seconds();
-    results.log(&format!(
-        "Planner invoked via real Claude CLI ({}s)",
-        planner_duration
-    ));
+    // ── Poll for Goal completion ──────────────────────────────────
+    results.log("Polling for Goal completion...");
+    let max_poll = approval.maximum_duration;
+    let poll_start = Instant::now();
+    let mut goal_succeeded = false;
 
-    // ── Check plan ───────────────────────────────────────────────
+    while poll_start.elapsed() < max_poll {
+        let state_row: Option<(String,)> =
+            sqlx::query_as("SELECT state FROM goals WHERE goal_id = ?")
+                .bind(&goal_id)
+                .fetch_optional(&pool)
+                .await
+                .unwrap_or(None);
+
+        if let Some((state,)) = state_row {
+            if state == "succeeded" {
+                goal_succeeded = true;
+                results.log(&format!(
+                    "Goal SUCCEEDED after {}s",
+                    poll_start.elapsed().as_secs()
+                ));
+                break;
+            }
+            if state == "failed" || state == "cancelled" {
+                results.log(&format!("Goal terminal: {}", state));
+                break;
+            }
+        }
+
+        // Check invocation counts
+        let planner_count = count_role_invocations(&pool, "GoalPlanner").await;
+        let executor_count = count_task_executions(&pool, &goal_id).await;
+        if planner_count > 0 && executor_count > 0 {
+            // Progress being made, keep polling
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    // ── Collect evidence ──────────────────────────────────────────
     let goal_repo = harness_runtime::goal::repo::GoalRepo::new(pool.clone());
-    let plan = goal_repo
-        .get_active_plan(&goal_id)
-        .await
-        .map_err(|e| format!("get plan: {e}"))?
-        .ok_or("No active plan after planner invocation")?;
 
-    results.log(&format!(
-        "PlanRevision: {} (#{})",
-        plan.plan_revision_id, plan.revision_number
-    ));
-    results.log(&format!("Planner invoc: {}", plan.planner_invocation_id));
-
-    let tasks = goal_repo
-        .get_all_planned_tasks(&plan.plan_revision_id)
-        .await
-        .map_err(|e| format!("get tasks: {e}"))?;
-    results.log(&format!("Planned tasks: {}", tasks.len()));
-
-    // ── Record invocations with session provenance ───────────────
+    // Planner invocations
     if let Some(ref planner) = graph.goal_planner {
         let invocations = planner.get_invocations();
         results.real_planner_invocations = invocations.len() as i32;
-        results.log(&format!(
-            "Planner invocations recorded: {}",
-            invocations.len()
-        ));
-
         for inv in &invocations {
-            results.log(&format!(
-                "  inv: {} | hs: {} | role: {} | mode: {} | resume: {}",
-                inv.invocation_id,
-                inv.harness_session_id,
-                inv.role,
-                inv.session_mode,
-                inv.resume_requested
-            ));
             results.invocation_ids.push(inv.invocation_id.clone());
             results
                 .harness_session_ids
                 .push(inv.harness_session_id.clone());
+            results.log(&format!(
+                "Planner: inv={} hs={} mode={} resume={}",
+                inv.invocation_id, inv.harness_session_id, inv.session_mode, inv.resume_requested
+            ));
         }
-
-        if invocations.is_empty() {
-            return Err("No planner invocations recorded".into());
+    }
+    // Evaluator invocations
+    if let Some(ref evaluator) = graph.goal_evaluator {
+        let invocations = evaluator.get_invocations();
+        results.real_evaluator_invocations = invocations.len() as i32;
+        for inv in &invocations {
+            results.invocation_ids.push(inv.invocation_id.clone());
+            results
+                .harness_session_ids
+                .push(inv.harness_session_id.clone());
+            results.log(&format!(
+                "Evaluator: inv={} hs={} mode={} resume={}",
+                inv.invocation_id, inv.harness_session_id, inv.session_mode, inv.resume_requested
+            ));
         }
     }
 
-    // Check goal state
+    // Task execution count
+    let task_count = count_task_executions(&pool, &goal_id).await;
+    results.real_executor_invocations = task_count as i32;
+    results.log(&format!("Task executions: {}", task_count));
+
+    // Reviewer count from review_invocation_log
+    let reviewer_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_invocation_log")
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
+    results.real_reviewer_invocations = reviewer_count as i32;
+    results.log(&format!("Reviewer invocations: {}", reviewer_count));
+
+    // ── Goal state summary ────────────────────────────────────────
     let state_row: (String,) = sqlx::query_as("SELECT state FROM goals WHERE goal_id = ?")
         .bind(&goal_id)
         .fetch_one(&pool)
         .await
         .map_err(|e| format!("query state: {e}"))?;
-    results.log(&format!("Goal state: {}", state_row.0));
+    results.log(&format!("Final goal state: {}", state_row.0));
 
-    // Save evidence
+    if !goal_succeeded {
+        let plan = goal_repo.get_active_plan(&goal_id).await.ok().flatten();
+        results.log(&format!(
+            "Plan: {:?}",
+            plan.as_ref().map(|p| &p.plan_revision_id)
+        ));
+        return Err(format!(
+            "Goal did not reach Succeeded within {:?}. Final state: {}",
+            max_poll, state_row.0
+        )
+        .into());
+    }
+
+    // ── Save evidence ─────────────────────────────────────────────
+    let plan = goal_repo.get_active_plan(&goal_id).await.ok().flatten();
     let provider_evidence = json!({
         "goal_id": goal_id,
         "profile_id": profile.id,
-        "plan_revision_id": plan.plan_revision_id,
-        "revision_number": plan.revision_number,
-        "planner_invocation_id": plan.planner_invocation_id,
-        "planned_tasks": tasks.len(),
+        "plan": plan.as_ref().map(|p| json!({"revision_id": p.plan_revision_id, "revision_number": p.revision_number})),
         "goal_state": state_row.0,
-        "planner_invocations_recorded": results.real_planner_invocations,
-        "duration_secs": planner_duration,
+        "planner_invocations": results.real_planner_invocations,
+        "executor_invocations": results.real_executor_invocations,
+        "reviewer_invocations": results.real_reviewer_invocations,
+        "evaluator_invocations": results.real_evaluator_invocations,
         "approval_id": approval.approval_id,
         "timestamp": Utc::now().to_rfc3339(),
     });
@@ -647,8 +726,11 @@ async fn run_real_provider_smoke_approved(
 
     results.real_provider_smoke_executed = true;
     results.log(&format!(
-        "Real provider smoke: planner_invocations={}, duration={}s",
-        results.real_planner_invocations, planner_duration
+        "Real provider smoke: planner={}, exec={}, review={}, eval={}",
+        results.real_planner_invocations,
+        results.real_executor_invocations,
+        results.real_reviewer_invocations,
+        results.real_evaluator_invocations
     ));
 
     // Copy smoke evidence
@@ -928,7 +1010,7 @@ async fn _run_real_provider_smoke_removed(
     results.log(&format!("Profile: {} ({})", profile.id, profile.agent_kind));
 
     // ── Create Goal ──────────────────────────────────────────────
-    let goal = make_normalize_whitespace_goal();
+    let goal = make_single_task_goal();
     let goal_id = goal.goal_id.clone();
 
     graph
@@ -1753,6 +1835,27 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error>
     Ok(())
 }
 
+/// Count role invocations for a specific role from the planner_invocations table.
+async fn count_role_invocations(pool: &sqlx::Pool<sqlx::Sqlite>, role: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM planner_invocations WHERE role = ?")
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0)
+}
+
+/// Count task executions for a given goal.
+async fn count_task_executions(pool: &sqlx::Pool<sqlx::Sqlite>, goal_id: &str) -> i64 {
+    let pattern = format!("goal-{}%", goal_id);
+    sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*) FROM task_engineering_attempts WHERE task_id LIKE ?",
+    )
+    .bind(&pattern)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0)
+}
+
 fn make_operational_profile(profile_id: &str) -> RuntimeProfile {
     let now = Utc::now();
     RuntimeProfile {
@@ -1807,12 +1910,12 @@ fn make_operational_profile(profile_id: &str) -> RuntimeProfile {
     }
 }
 
-fn make_normalize_whitespace_goal() -> GoalSpec {
+fn make_single_task_goal() -> GoalSpec {
     GoalSpec {
         goal_id: format!("g-i7-{}", uuid::Uuid::new_v4()),
         revision: 1,
-        title: "Implement normalize_whitespace".into(),
-        objective: "Implement a Rust function:\n\npub fn normalize_whitespace(input: &str) -> String\n\nRequirements:\n- Collapse consecutive whitespace to a single space\n- Trim leading and trailing whitespace\n- Support empty strings\n- Support spaces, tabs, and newlines\n- cargo test must pass\n\nCreate implementation in src/lib.rs and tests in a test module. Do NOT edit files outside src/.".into(),
+        title: "Implement normalize_whitespace (single task)".into(),
+        objective: "CRITICAL CONSTRAINT: Create EXACTLY ONE PlannedTask. Do NOT split into multiple tasks.\n\nImplement a Rust function:\n\npub fn normalize_whitespace(input: &str) -> String\n\nRequirements:\n- Collapse consecutive Unicode whitespace to a single ASCII space\n- Trim leading and trailing whitespace\n- Support empty strings, spaces, tabs, and newlines\n- Write tests covering all scenarios\n- cargo test must pass\n\nCreate implementation AND tests in src/lib.rs as a single task. Do NOT create separate implementation and test tasks.\n\nDo NOT edit files outside src/.".into(),
         repository_id: "i7-acceptance-repo".into(),
         target_ref: "refs/heads/main".into(),
         initial_base_head: "abc123def456".into(),
@@ -1845,9 +1948,9 @@ fn make_normalize_whitespace_goal() -> GoalSpec {
         constraints: vec![],
         non_goals: vec![],
         budget: GoalBudget {
-            max_plan_revisions: 3,
-            max_total_tasks: 10,
-            max_active_tasks: 4,
+            max_plan_revisions: 2,
+            max_total_tasks: 1,
+            max_active_tasks: 1,
             max_consecutive_failures: 3,
             max_no_progress_iterations: 5,
             ..Default::default()
