@@ -627,11 +627,9 @@ async fn run_real_provider_smoke_approved(
             }
         }
 
-        // Check invocation counts
-        let planner_count = count_role_invocations(&pool, "GoalPlanner").await;
-        let executor_count = count_task_executions(&pool, &goal_id).await;
-        if planner_count > 0 && executor_count > 0 {
-            // Progress being made, keep polling
+        // Drive the goal loop directly with real adapter
+        if let Err(e) = graph.goal_loop_service.drive_goal_loop(&goal_id).await {
+            results.log(&format!("Loop iteration error: {}", e));
         }
 
         tokio::time::sleep(Duration::from_secs(2)).await;
