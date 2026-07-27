@@ -1,61 +1,37 @@
-# I7 Final Report: Executable Runtime Acceptance — Root-Cause Closure
+# I7 Final Report: Runtime Root-Cause Repair
 
 **Date**: 2026-07-26
-**I7 Acceptance Code HEAD**: `fc5b17150b85a6cafbd72f5ef532c3b71559eae5`
-**Previous Code HEAD**: `129f3e462445ea3b3815cacc39077ccceea1c342`
+**I7 Acceptance Code HEAD**: `1c35e5e0eb6ef52ad364ad2d8c3d9a95b87e389d`
+**Previous Acceptance Code HEAD**: `5f53a78e236b14d6079a9cdaeb374127c23d5019`
 
 ---
 
 ## Verdict
 
-**PASS — I7 executable acceptance infrastructure complete. All six root causes (RC-A through RC-F) confirmed and fixed.**
+**APPROVAL REQUIRED — I7 repaired real runtime acceptance is ready for re-execution.**
 
-Real Provider Smoke and Real Crash/Takeover infrastructure is fully implemented. Actual execution requires running the acceptance runner binary (`cargo run --bin i7-acceptance`) which invokes the real Claude CLI.
+Three root-cause gaps confirmed and fixed in this round. The acceptance runner must be re-executed with new approval to verify fixes.
 
 ---
 
 ## Root Cause Closure
 
-| RC | Finding | Status | Fix |
-|----|---------|--------|-----|
-| RC-A | Real Supervisor Bootstrap does not construct real Adapter | **CONFIRMED → FIXED** | `bootstrap.rs` — passive discovery + adapter construction + `build_with_adapter` |
-| RC-B | Acceptance Runner does not exist | **CONFIRMED → FIXED** | `i7_acceptance.rs` binary — full E2E orchestration |
-| RC-C | Session provenance not recorded | **CONFIRMED → FIXED** | `RoleInvocation` extension + planner/evaluator invocation tracking |
-| RC-D | Failpoint hit signal not deterministic | **CONFIRMED → FIXED** | `.hit` marker file + `check_failpoint_hit()` API |
-| RC-E | Supervisor child process missing isolation args | **CONFIRMED → FIXED** | `--repo`, `--worktree-root`, `--code-head` forwarding |
-| RC-F | Independent certification invocation missing | **CONFIRMED → FIXED** | `run_independent_certification()` + `CertificationResult` |
+| Gap | Finding | Root Cause | Fix |
+|-----|---------|-----------|-----|
+| GAP-A | `PlannerEventCollector.final_result = None` | `ANTHROPIC_API_KEY` filtered by `is_safe_env()`; `env_overrides` was empty | Planner/Evaluator now read and pass ANTHROPIC env vars via `env_overrides` |
+| GAP-B | A token=0, B token=0 (no takeover) | A used `state_dir_a="i7-accept-a"`, B used `state_dir_b="i7-accept-b"` — separate ownership domains | Both now use `state_dir="i7-accept-shared"` — shared lease domain |
+| GAP-C | Certification PASS despite Phase 4/5 failures | `blocking_findings` always empty; no mandatory criteria enforcement | Per-criterion verdicts with required flag; verdict FAIL when any mandatory check fails |
+| RC-K | Runner continues after Phase 5 failure | Error logged but not returned | Phase 5 takeover failure now returns `Err` |
 
 ---
 
-## Real Provider Smoke
+## Fixes Applied
 
-- **Profile**: `claude-default-deepseek` (claude-code via ClaudeCliAdapter)
-- **Adapter Wired**: YES — real `ClaudeCliAdapter` constructed and wired into `ProductionGraph`
-- **Role Isolation**: `IsolatedSessions` — single profile, fresh sessions per role
-- **Planner**: ProductionGoalPlanner with real ClaudeCliAdapter
-- **Evaluator**: ProductionGoalEvaluator with real ClaudeCliAdapter
+1. **GAP-A**: `planner.rs` and `evaluator.rs` now read `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `NO_PROXY` from parent env and pass via `env_overrides` to ProcessManager.
 
-Status: **INFRASTRUCTURE COMPLETE** — execute `cargo run --bin i7-acceptance` to run real provider smoke.
+2. **GAP-B**: `i7_acceptance.rs` Supervisor A and B use shared `state_dir="i7-accept-shared"`. Mandatory token comparison: `B token > A token` returns error if false. Old owner fencing verified.
 
----
-
-## Real Crash / Takeover
-
-- **Failpoint**: `.hit` marker written atomically before blocking; deterministic observation
-- **Process Isolation**: Full args forwarding for isolated multi-instance operation
-- **Fencing**: Token increment + old-owner rejection at database level
-
-Status: **INFRASTRUCTURE COMPLETE** — execute with `HARNESS_FAILPOINT_ENABLE=1 cargo run --bin i7-acceptance`
-
----
-
-## Independent Certification
-
-- **Session**: Fresh, read-only `AgentSession` with unique `harness_session_id`
-- **Evidence**: Frozen before certification reads
-- **Output**: `CertificationResult` with `verdict`, `blocking_findings`, `contradiction_count`
-
-Status: **INFRASTRUCTURE COMPLETE** — `run_independent_certification()` available in bootstrap.rs
+3. **GAP-C**: `run_certification()` now enforces mandatory criteria: quality gates, migration, E2E, provider smoke invocations, crash/takeover token comparison, error-free phases. `blocking_findings` populated for failures.
 
 ---
 
@@ -63,52 +39,10 @@ Status: **INFRASTRUCTURE COMPLETE** — `run_independent_certification()` availa
 
 | Gate | Result |
 |------|--------|
-| `cargo fmt --all --check` | **PASS** |
-| `cargo clippy --workspace --all-targets -- -D warnings` | **PASS** (0 errors) |
-| `cargo test --workspace` | **PASS** (~1364 tests, 0 failed, 0 ignored) |
+| `cargo fmt --all --check` | PASS |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
+| `cargo test --workspace` | PASS (0 failed, 0 ignored) |
 
 ---
 
-## Evidence Bundle
-
-```
-verification/i7-accepted-fc5b171-20260726-200553/
-├── code-head.txt
-├── summary.json
-├── commands.jsonl
-├── acceptance-root-causes.json
-├── production-bootstrap.json
-├── adapter-construction.json
-├── role-session-isolation.json
-├── failpoint-handshake.json
-├── process-cleanup.json
-├── independent-certification.json
-└── report-consistency.json
-```
-
----
-
-## Findings
-
-- **Critical**: 0
-- **High**: 0
-- **Medium**: 0
-- **Low**: 0
-
-No blocking findings.
-
----
-
-## NOT I7 Blockers
-
-- Codex authentication / quota
-- OPENAI_API_KEY
-- Second RuntimeProfile
-- StrictProfileDiversity real multi-profile smoke
-- Qoder integration
-- I8 work
-
----
-
-*I7_ACCEPTANCE_CODE_HEAD: fc5b17150b85a6cafbd72f5ef532c3b71559eae5*
-*Previous Report HEAD: f2df832048f2f4fdc730979f8f2d0c1a5478b137*
+*I7_ACCEPTANCE_CODE_HEAD: 1c35e5e0eb6ef52ad364ad2d8c3d9a95b87e389d*
