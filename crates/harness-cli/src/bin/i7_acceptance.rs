@@ -605,6 +605,7 @@ async fn run_real_provider_smoke_approved(
 
     // ── Poll for Goal completion ──────────────────────────────────
     results.log("Polling for Goal completion...");
+    let goal_repo = harness_runtime::goal::repo::GoalRepo::new(pool.clone());
     let max_poll = approval.maximum_duration;
     let poll_start = Instant::now();
     let mut goal_succeeded = false;
@@ -632,14 +633,20 @@ async fn run_real_provider_smoke_approved(
             }
         }
 
-        // Goal loop is driven by the Supervisor's spawned task.
-        // Just poll for state changes.
+        // Drive goal loop directly from adapter-wired graph
+        match graph.goal_loop_service.drive_goal_loop(&goal_id).await {
+            Ok(()) => {}
+            Err(e) => results.log(&format!("drive_goal_loop error: {}", e)),
+        }
+        // Check plan state
+        if let Ok(Some(plan)) = goal_repo.get_active_plan(&goal_id).await {
+            let tasks = goal_repo.get_all_planned_tasks(&plan.plan_revision_id).await.unwrap_or_default();
+            results.log(&format!("Plan: {} tasks={} state={:?}", plan.plan_revision_id, tasks.len(), plan.state));
+        }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
     // ── Collect evidence ──────────────────────────────────────────
-    let goal_repo = harness_runtime::goal::repo::GoalRepo::new(pool.clone());
-
     // Planner invocations
     if let Some(ref planner) = graph.goal_planner {
         let invocations = planner.get_invocations();

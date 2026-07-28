@@ -1281,12 +1281,77 @@ impl GoalLoopService {
                     .await?;
                 }
             }
+        } else if let (Some(ref adapter), Some(ref profile)) =
+            (&self.direct_adapter, &self.direct_profile)
+        {
+            // No I4.5 service — execute task directly via adapter
+            let task_id = format!("goal-{}-{}", goal_id, pt.client_ref);
+            tracing::info!(
+                goal_id = %goal_id,
+                planned_task_id = %pt.planned_task_id,
+                task_id = %task_id,
+                "executing planned task directly via adapter"
+            );
+
+            match execute_planned_task_directly(
+                adapter,
+                profile,
+                &task_id,
+                &pt.objective,
+                &pt.acceptance_criteria,
+                goal_id,
+            )
+            .await
+            {
+                Ok(true) => {
+                    self.repo
+                        .update_planned_task_state(
+                            &pt.planned_task_id,
+                            PlannedTaskState::Completed,
+                            Some(&task_id),
+                        )
+                        .await?;
+                    self.import_observation(
+                        goal_id,
+                        Some(plan_revision_id),
+                        Some(&pt.planned_task_id),
+                        "direct_executor",
+                        &task_id,
+                        &format!("task-completed-{}", task_id),
+                        &format!(
+                            "PlannedTask {} completed via direct execution",
+                            pt.client_ref
+                        ),
+                        "task_completed",
+                        goal_id,
+                    )
+                    .await?;
+                }
+                Ok(false) => {
+                    self.repo
+                        .update_planned_task_state(
+                            &pt.planned_task_id,
+                            PlannedTaskState::Failed,
+                            Some(&task_id),
+                        )
+                        .await?;
+                }
+                Err(e) => {
+                    tracing::error!(goal_id=%goal_id, task_id=%task_id, error=%e, "direct execution error");
+                    self.repo
+                        .update_planned_task_state(
+                            &pt.planned_task_id,
+                            PlannedTaskState::Failed,
+                            Some(&task_id),
+                        )
+                        .await?;
+                }
+            }
         } else {
-            // No I4.5 service wired — mark as running but note the gap
             tracing::warn!(
                 goal_id = %goal_id,
                 planned_task_id = %pt.planned_task_id,
-                "no I4.5 task loop service wired — planned task cannot be dispatched"
+                "no I4.5 or direct adapter — planned task cannot be executed"
             );
         }
 
@@ -1534,6 +1599,120 @@ fn parse_goal_state_from_db(s: &str) -> Result<GoalState, CoreError> {
             format!("unknown goal state: {s}"),
             ErrorSource::Harness,
         )),
+    }
+}
+
+/// Execute a single planned task directly via the AgentAdapter.
+/// Uses a real Claude CLI session to implement the task in the repository.
+async fn execute_planned_task_directly(
+    adapter: &Arc<dyn harness_core::contracts::agent_adapter::AgentAdapter>,
+    profile: &harness_core::contracts::runtime_profile::RuntimeProfile,
+    task_id: &str,
+    objective: &str,
+    acceptance_criteria: &[String],
+    working_dir: &str,
+) -> Result<bool, CoreError> {
+    use harness_core::contracts::agent_adapter::SessionOptions;
+    use harness_core::contracts::agent_event::AgentEvent;
+    use std::collections::HashMap;
+
+    let criteria_text: String = acceptance_criteria
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{}. {}", i + 1, c))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let prompt = format!(
+        "Execute this task in the current repository:\n\nOBJECTIVE:\n{}\n\nACCEPTANCE CRITERIA:\n{}\n\n\
+         Write the implementation and tests in src/lib.rs. Run `cargo test` to verify all tests pass.\n\
+         At the end, output JSON: {{\"ok\":true,\"summary\":\"what you did\"}} or {{\"ok\":false,\"summary\":\"why it failed\"}}",
+        objective, criteria_text
+    );
+
+    let mut env = HashMap::new();
+    for key in &[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "NO_PROXY",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            env.insert(key.to_string(), val);
+        }
+    }
+
+    let work_dir = std::path::PathBuf::from(working_dir);
+    let opts = SessionOptions {
+        working_directory: work_dir.clone(),
+        env,
+        timeout: std::time::Duration::from_secs(120),
+        max_turns: Some(1),
+        resume_session_id: None,
+        model_override: profile.model.clone(),
+        effort_override: Some("high".into()),
+        extra_args: vec![],
+    };
+
+    let mut session = adapter.start_session(profile, &opts).await?;
+    let envelope = harness_core::contracts::task_envelope::TaskEnvelope {
+        task_id: task_id.to_string(),
+        project_id: "goal-loop-direct".to_string(),
+        task_goal: prompt,
+        scope: harness_core::contracts::task_envelope::FileScope {
+            allowed_paths: vec!["src/".to_string()],
+            forbidden_paths: vec![],
+            readable_paths: vec![".".to_string()],
+            scope_expansion_allowed: false,
+        },
+        resource_claims: vec![],
+        dependencies: vec![],
+        acceptance_checks: acceptance_criteria.to_vec(),
+        allowed_tools: vec!["bash".to_string(), "read".to_string(), "write".to_string(), "edit".to_string()],
+        output_schema: r#"{"ok": true, "summary": "..."}"#.to_string(),
+        budget: harness_core::contracts::task_envelope::TaskBudget {
+            max_turns: 1,
+            max_time_ms: 120_000,
+            max_cost_cents: None,
+        },
+        goal_contract_version: 1,
+        plan_version: 1,
+    };
+    session.send_task(&envelope).await?;
+
+    struct DirectCollector {
+        result: Option<String>,
+    }
+    impl harness_core::contracts::agent_adapter::AgentEventSink for DirectCollector {
+        fn send(
+            &mut self,
+            event: AgentEvent,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), CoreError>> + Send + '_>,
+        > {
+            Box::pin(async move {
+                if let AgentEvent::Result {
+                    content, is_error, ..
+                } = &event
+                {
+                    self.result = Some(if *is_error {
+                        format!("ERROR:{}", content)
+                    } else {
+                        content.clone()
+                    });
+                }
+                Ok(())
+            })
+        }
+    }
+    let mut collector = DirectCollector { result: None };
+    session.receive_events(&mut collector).await?;
+    session.dispose().await?;
+
+    match collector.result {
+        Some(ref r) if r.starts_with("ERROR:") => Ok(false),
+        Some(_) => Ok(true),
+        None => Ok(false),
     }
 }
 
