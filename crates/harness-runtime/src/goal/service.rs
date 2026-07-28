@@ -1233,22 +1233,30 @@ impl GoalLoopService {
                         "planned task materialized and dispatched to I4.5"
                     );
 
-                    // Import initial observation (task started)
-                    self.import_observation(
-                        goal_id,
-                        Some(plan_revision_id),
-                        Some(&pt.planned_task_id),
-                        "task_loop",
-                        &loop_id,
-                        &format!("task-materialized-{}", loop_id),
-                        &format!(
-                            "PlannedTask {} materialized as Task {}",
-                            pt.client_ref, task_id
-                        ),
-                        "task_materialized",
-                        goal_id,
-                    )
-                    .await?;
+                    // Execute task directly via adapter (I4.5 dispatch may not complete)
+                    if let (Some(ref adapter), Some(ref profile)) =
+                        (&self.direct_adapter, &self.direct_profile)
+                    {
+                        match execute_planned_task_directly(
+                            adapter, profile, &task_id,
+                            &pt.objective, &pt.acceptance_criteria, goal_id,
+                        ).await {
+                            Ok(true) => {
+                                self.repo.update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Completed, Some(&task_id)).await?;
+                                self.import_observation(goal_id, Some(plan_revision_id), Some(&pt.planned_task_id), "executor", &task_id, &format!("task-completed-{}", task_id), &format!("PlannedTask {} completed", pt.client_ref), "task_completed", goal_id).await?;
+                            }
+                            Ok(false) => {
+                                self.repo.update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Failed, Some(&task_id)).await?;
+                            }
+                            Err(e) => {
+                                tracing::error!(goal_id=%goal_id, error=%e, "direct execution failed");
+                                self.repo.update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Failed, Some(&task_id)).await?;
+                            }
+                        }
+                    } else {
+                        // Import initial observation (task started)
+                        self.import_observation(goal_id, Some(plan_revision_id), Some(&pt.planned_task_id), "task_loop", &loop_id, &format!("task-materialized-{}", loop_id), &format!("PlannedTask {} materialized as Task {}", pt.client_ref, task_id), "task_materialized", goal_id).await?;
+                    }
                 }
                 Err(e) => {
                     tracing::error!(

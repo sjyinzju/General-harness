@@ -638,10 +638,11 @@ async fn run_real_provider_smoke_approved(
             Ok(()) => {}
             Err(e) => results.log(&format!("drive_goal_loop error: {}", e)),
         }
-        // Check plan state
+        // Check plan and task state
         if let Ok(Some(plan)) = goal_repo.get_active_plan(&goal_id).await {
             let tasks = goal_repo.get_all_planned_tasks(&plan.plan_revision_id).await.unwrap_or_default();
-            results.log(&format!("Plan: {} tasks={} state={:?}", plan.plan_revision_id, tasks.len(), plan.state));
+            let task_states: Vec<String> = tasks.iter().map(|t| format!("{}({})", t.client_ref, t.state.as_str())).collect();
+            results.log(&format!("Plan: {} tasks={} states={:?} has_adapter={}", plan.plan_revision_id, tasks.len(), task_states, graph.goal_loop_service.direct_adapter.is_some()));
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
