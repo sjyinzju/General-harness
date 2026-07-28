@@ -307,11 +307,12 @@ impl ProductionGraph {
             integration_queue.clone(),
         );
 
-        // Propagate real adapter to GoalLoopService for I4.5/I4.6 task dispatch
+        // Propagate real adapter and work dir to GoalLoopService
         if let Some(ref a) = adapter_for_svc {
             goal_loop_svc.direct_adapter = Some(Arc::clone(a));
             goal_loop_svc.direct_profile = profile_for_svc.clone();
         }
+        goal_loop_svc.work_dir = Some(repo_root.to_path_buf());
 
         let goal_loop_service = Arc::new(goal_loop_svc);
 

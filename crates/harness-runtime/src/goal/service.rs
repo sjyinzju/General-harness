@@ -95,6 +95,8 @@ pub struct GoalLoopService {
     >,
     /// Runtime profile for agent session creation.
     pub direct_profile: Option<harness_core::contracts::runtime_profile::RuntimeProfile>,
+    /// Working directory (repository root) for direct task execution.
+    pub work_dir: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for GoalLoopService {
@@ -165,6 +167,7 @@ impl GoalLoopService {
             integration_queue: None,
             direct_adapter: None,
             direct_profile: None,
+            work_dir: None,
         }
     }
 
@@ -905,6 +908,7 @@ impl GoalLoopService {
         let evaluator_profile = self.evaluator_profile.clone();
         let direct_adapter = self.direct_adapter.clone();
         let direct_profile = self.direct_profile.clone();
+        let work_dir = self.work_dir.clone();
 
         tokio::spawn(async move {
             let repo = GoalRepo::new(pool.clone());
@@ -922,6 +926,7 @@ impl GoalLoopService {
                 integration_queue: integration,
                 direct_adapter,
                 direct_profile,
+                work_dir,
             };
 
             // Loop until terminal state or max iterations
@@ -1149,6 +1154,14 @@ impl GoalLoopService {
                 goal_id, plan_revision_id, pt.planned_task_id
             );
 
+            // Ensure the task and project records exist (FK requirements)
+            let _ = sqlx::query(
+                "INSERT OR IGNORE INTO projects (id, objective, lifecycle) VALUES (?, ?, 'active')"
+            ).bind(goal_id).execute(&self.pool).await;
+            let _ = sqlx::query(
+                "INSERT OR IGNORE INTO tasks (id, project_id, goal, lifecycle) VALUES (?, ?, ?, 'submitted')"
+            ).bind(&task_id).bind(goal_id).bind(&pt.objective).execute(&self.pool).await;
+
             // Create a TaskEngineeringLoop for this planned task
             let req = CreateLoopRequest {
                 project_id: goal_id.to_string(),
@@ -1237,9 +1250,12 @@ impl GoalLoopService {
                     if let (Some(ref adapter), Some(ref profile)) =
                         (&self.direct_adapter, &self.direct_profile)
                     {
+                        let work_dir = self.work_dir.as_ref()
+                            .map(|p| p.to_string_lossy().to_string())
+                            .unwrap_or_else(|| goal_id.to_string());
                         match execute_planned_task_directly(
                             adapter, profile, &task_id,
-                            &pt.objective, &pt.acceptance_criteria, goal_id,
+                            &pt.objective, &pt.acceptance_criteria, &work_dir,
                         ).await {
                             Ok(true) => {
                                 self.repo.update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Completed, Some(&task_id)).await?;
