@@ -1,0 +1,15 @@
+{
+  "approval_id": "apr-025c2d8f-5b9b-4aef-9770-9e8bf02ed95d",
+  "evaluator_invocations": 3,
+  "executor_invocations": 0,
+  "goal_id": "g-i7-fea26d44-dc12-4111-8ee5-a9cbfc3f69ab",
+  "goal_state": "succeeded",
+  "plan": {
+    "revision_id": "pr-ea1d57ec-b7b3-4973-970a-e4b29ba742a7",
+    "revision_number": 1
+  },
+  "planner_invocations": 2,
+  "profile_id": "claude-default-deepseek",
+  "reviewer_invocations": 0,
+  "timestamp": "2026-07-28T15:58:10.701678800+00:00"
+}

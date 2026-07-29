@@ -1,0 +1,36 @@
+[
+  {
+    "command": "cargo fmt --all -- --check",
+    "output_preview": "Diff in \\\\?\\E:\\General-harness\\crates\\harness-cli\\src\\bin\\i7_acceptance.rs:317:\n     results.evidence_dir = Some(ver_dir.to_string_lossy().to_string());\n \n     // Final verdict: exit nonzero if any required phase or certification failed\n\u001b[31m-    if !results.certification_passed || results.crash_takeover_error.is_some() || results.provider_smoke_error.is_some() {\n\u001b[0m\u001b[32m+    if !results.certification_passed\n\u001b[0m\u001b[32m+        || results.crash_takeover_error.is_some()\n\u001b[0m\u001b[32m+        || result",
+    "passed": false,
+    "phase": "quality_gates"
+  },
+  {
+    "command": "cargo clippy --workspace --all-targets",
+    "passed": true,
+    "phase": "quality_gates"
+  },
+  {
+    "command": "cargo test --workspace",
+    "exit_ok": false,
+    "phase": "quality_gates",
+    "tests_failed_count": 0,
+    "tests_passed_count": 0
+  },
+  {
+    "command": "cargo test -p harness-runtime --test i7_acceptance_tests acceptance_migration",
+    "fresh_install": true,
+    "phase": "migration",
+    "v23_upgrade": true
+  },
+  {
+    "command": "cargo test scene_a_deterministic_two_task_goal_e2e",
+    "passed": true,
+    "phase": "deterministic_e2e"
+  },
+  {
+    "command": "cargo test scene_b_failure_replan_success",
+    "passed": true,
+    "phase": "deterministic_e2e"
+  }
+]

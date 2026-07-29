@@ -1,0 +1,14 @@
+cargo fmt: FAIL
+cargo clippy: PASS
+cargo test: FAIL (exit_ok=false, 0 failed)
+migration fresh install: PASS
+migration v23 upgrade:   PASS
+deterministic two-task E2E: PASS
+failure-replan E2E:      PASS
+Isolated repo: E:\General-harness\target\harness-i7-acceptance\run-20260726-150528\real-provider-repo
+Profile: claude-default-deepseek (claude-code)
+Max invocations: 7
+Git push: FORBIDDEN
+Evidence files: 1
+  real-runtime-approval.json
+Independent certification: PASS (0 blocking findings)

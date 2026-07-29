@@ -1,0 +1,15 @@
+{
+  "b_fencing_higher": false,
+  "instances_different": true,
+  "lease_duration_secs": 15,
+  "pids_different": true,
+  "supervisor_a_fencing_token": 0,
+  "supervisor_a_instance_id": "44ac920d-8fda-48ec-a044-dd85b1a792e2",
+  "supervisor_a_pid": 41276,
+  "supervisor_a_terminated": true,
+  "supervisor_b_fencing_token": 0,
+  "supervisor_b_instance_id": "4d415fe9-f85e-47cf-8c7f-c5206f62cc53",
+  "supervisor_b_pid": 39600,
+  "takeover_passed": false,
+  "timestamp": "2026-07-26T15:08:34.106202400+00:00"
+}

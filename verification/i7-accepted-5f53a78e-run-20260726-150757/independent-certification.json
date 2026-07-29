@@ -1,0 +1,16 @@
+{
+  "blocking_findings": [],
+  "certification_id": "cert-53c438fd-bfd2-4da5-a64e-894d52443466",
+  "code_head_verified": false,
+  "completed_at": "2026-07-26T15:08:34.110569+00:00",
+  "evidence_files": [
+    "real-runtime-approval.json",
+    "takeover.json"
+  ],
+  "evidence_files_count": 2,
+  "fresh_session_verified": true,
+  "read_only": true,
+  "started_at": "2026-07-26T15:08:34.110559500+00:00",
+  "summary": "Evidence bundle contains 2 files. Code head verification: FAIL. Summary valid: FAIL.",
+  "verdict": "PASS"
+}

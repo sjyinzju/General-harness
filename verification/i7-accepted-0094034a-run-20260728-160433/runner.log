@@ -1,0 +1,70 @@
+cargo fmt: FAIL
+cargo clippy: PASS
+cargo test: PASS (exit_ok=false, 0 failed)
+migration fresh install: PASS
+migration v23 upgrade:   PASS
+deterministic two-task E2E: PASS
+failure-replan E2E:      PASS
+Isolated repo: E:\General-harness\target\harness-i7-acceptance\run-20260728-160433\real-provider-repo
+Profile: claude-default-deepseek (claude-code)
+Real adapter wired: PASS
+Waiting for Supervisor readiness...
+Supervisor ready with IPC
+Goal spec: E:\General-harness\target\harness-i7-acceptance\run-20260728-160433\real-provider-repo\goal-spec.json
+Goal create: {
+  "goal_id": "g-i7-6f020989-f353-4570-8699-53f38b762a9d",
+  "revision": 1,
+  "state": "draft",
+  "status": "created",
+  "title": "Implement normalize_whitespace (single task)"
+}
+Goal start: {
+  "goal_id": "g-i7-6f020989-f353-4570-8699-53f38b762a9d",
+  "run_id": "glr-40469c27-562e-4bf2-84ea-807bc5f6b473",
+  "status": "started"
+}
+Polling for Goal completion...
+drive_goal_loop error: ["internal"] Planner produced no final result (retryable=false, source=Harness)
+drive_goal_loop error: ["invalid_state"] PlanProposal has no milestones (retryable=false, source=Harness)
+drive_goal_loop error: ["internal"] Planner produced no final result (retryable=false, source=Harness)
+drive_goal_loop error: ["internal"] Planner produced no final result (retryable=false, source=Harness)
+drive_goal_loop error: ["internal"] Planner produced no final result (retryable=false, source=Harness)
+Plan: pr-3cff1726-90e8-4743-8789-e26441e10681 tasks=1 states=["T1(completed)"] has_adapter=true
+Plan: pr-3cff1726-90e8-4743-8789-e26441e10681 tasks=1 states=["T1(completed)"] has_adapter=true
+Goal SUCCEEDED after 153s
+Planner: inv=inv-planner-6a0f9ffb-ac61-428e-8997-2783d6dfba80 hs=hs-planner-6a8a9c3a-68ca-4f3d-8cff-e6e6b14c8d40 mode=fresh resume=false
+Planner: inv=inv-planner-1d98a296-2111-445e-b8b4-2e5d47a1e810 hs=hs-planner-3aef9e1f-b969-4da9-aec3-43a4af09a809 mode=fresh resume=false
+Planner: inv=inv-planner-9a8f9da6-77fe-43dd-810f-dc040cf18271 hs=hs-planner-ed051a01-8209-4d26-bbbb-30dd06b0514c mode=fresh resume=false
+Evaluator: inv=inv-evaluator-32d08b94-45bb-405a-9329-6a73001be38b hs=hs-evaluator-b483a141-b458-47bf-8935-0ade07f92a98 mode=fresh resume=false
+Evaluator: inv=inv-evaluator-561ac6d3-80e6-4792-ae93-79b05e9a3bf8 hs=hs-evaluator-67d99186-581d-45e8-bdaa-0d4a3371ed35 mode=fresh resume=false
+Real provider smoke: planner=3, exec=1, review=1, eval=2
+Final goal state: succeeded
+Real provider smoke: planner=3, exec=1, review=1, eval=2
+DB initialized: E:\General-harness\target\harness-i7-acceptance\run-20260728-160433\crash-takeover\harness.db
+Starting Supervisor A (state_dir=i7-accept-shared)...
+Supervisor A PID: 29152
+Waiting for Supervisor A readiness...
+Supervisor A ready: instance=0ff022c5-2838-4b96-831d-cbc34a860200, state="Ready", token=0
+Force-killing Supervisor A (PID 29152)...
+Supervisor A terminated: true (exit: ExitStatus(ExitStatus(1)), still_alive: false)
+Waiting 35s for lease expiry...
+Starting Supervisor B (state_dir=i7-accept-shared)...
+Supervisor B PID: 17320
+Waiting 5s for Supervisor B startup...
+Polling for Supervisor B readiness...
+Supervisor B ready: instance=c463335a-853c-40e8-a89d-698c204e515d, state="Ready", token=2
+Takeover: A_token=0, B_token=2, B > A: true
+PID check: A=29152, B=17320, different: true
+Instance check: different=true
+Active lease after takeover: instance=c463335a-853c-40e8-a89d-698c204e515d, token=2
+Old owner fencing: REJECTED (PASS) (A instance=0ff022c5-2838-4b96-831d-cbc34a860200, active instance=c463335a-853c-40e8-a89d-698c204e515d)
+Stopping supervisors...
+Evidence files: 7
+  goal-spec.json
+  harness.db
+  harness.db-shm
+  harness.db-wal
+  real-runtime-approval.json
+  single-profile-real-provider-smoke.json
+  takeover.json
+Independent certification: PASS (0 blocking findings)

@@ -1,0 +1,54 @@
+﻿cargo :    Compiling harness-cli v0.1.0 (E:\General-harness\crates\harness-cli)
+At line:1 char:325
++ ... ; cd E:\General-harness; cargo build --bin i7-acceptance 2>&1 | Out-F ...
++                              ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (   Compiling ha...es\harness-cli):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+warning: unused imports: `FileScope`, `TaskBudget`, and `TaskEnvelope`
+  --> crates\harness-cli\src\bin\i7_acceptance.rs:26:46
+   |
+26 | use harness_core::contracts::task_envelope::{FileScope, TaskBudget, TaskEnvelope};
+   |                                              ^^^^^^^^^  ^^^^^^^^^^  ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+    --> crates\harness-cli\src\bin\i7_acceptance.rs:660:49
+     |
+ 660 |         if let Ok(Some(inst)) = check_ipc_ready(&db_path, state_dir_a).await {
+     |                                 --------------- ^^^^^^^^ expected `&str`, found `&PathBuf`
+     |                                 |
+     |                                 arguments to this function are incorrect
+     |
+     = note: expected reference `&str`
+                found reference `&PathBuf`
+note: function defined here
+    --> crates\harness-cli\src\bin\i7_acceptance.rs:1050:10
+     |
+1050 | async fn check_ipc_ready(
+     |          ^^^^^^^^^^^^^^^
+1051 |     db_path: &str,
+     |     -------------
+
+error[E0308]: mismatched types
+    --> crates\harness-cli\src\bin\i7_acceptance.rs:761:49
+     |
+ 761 |         if let Ok(Some(inst)) = check_ipc_ready(&db_path, state_dir_b).await {
+     |                                 --------------- ^^^^^^^^ expected `&str`, found `&PathBuf`
+     |                                 |
+     |                                 arguments to this function are incorrect
+     |
+     = note: expected reference `&str`
+                found reference `&PathBuf`
+note: function defined here
+    --> crates\harness-cli\src\bin\i7_acceptance.rs:1050:10
+     |
+1050 | async fn check_ipc_ready(
+     |          ^^^^^^^^^^^^^^^
+1051 |     db_path: &str,
+     |     -------------
+
+For more information about this error, try `rustc --explain E0308`.
+warning: `harness-cli` (bin "i7-acceptance") generated 1 warning
+error: could not compile `harness-cli` (bin "i7-acceptance") due to 2 previous errors; 1 warning emitted

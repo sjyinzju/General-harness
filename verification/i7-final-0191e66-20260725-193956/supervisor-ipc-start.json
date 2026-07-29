@@ -1,0 +1,46 @@
+{
+  "ipc_server_wired": true,
+  "code_location": "crates/harness-runtime/src/supervisor/mod.rs",
+  "method": "Supervisor::run() -> run_ready_and_serve()",
+  "lifecycle": {
+    "order": [
+      "Created",
+      "Starting",
+      "AcquiringOwnership",
+      "Recovering",
+      "Ready",
+      "Heartbeat started",
+      "IpcServer.serve() spawned on tokio",
+      "ControlLoop.run() spawned on tokio",
+      "Named Pipe bound: \\\\.\\pipe\\{ipc_endpoint}",
+      "SupervisorCommandHandler installed",
+      "Await shutdown signal (Ctrl+C or internal cancellation)",
+      "Shutdown: stop IPC accept → cancel ControlLoop → stop heartbeat → release lease → Stopped"
+    ],
+    "ipc_endpoint_configurable": true,
+    "ipc_endpoint_field": "SupervisorConfig.ipc_endpoint",
+    "ipc_endpoint_default": "harness-supervisor"
+  },
+  "shared_dependencies": {
+    "database": "SqlitePool (shared via Arc/SupervisorServices)",
+    "production_graph": "SupervisorServices (shared via Arc)",
+    "supervisor_identity": "SupervisorInstance + fencing_token (shared with command handler)",
+    "cancellation": "tokio_util::sync::CancellationToken (coordinated shutdown)"
+  },
+  "ipc_ready_gate": "IpcServer.serve() spawns BEFORE 'supervisor ready' log; bind failures propagate as errors",
+  "ipc_shutdown_sequence": [
+    "Stop accepting new connections (ipc_server.shutdown())",
+    "Cancel CancellationToken (signals ControlLoop + IPC tasks)",
+    "Wait for task drain (bounded by shutdown_grace_period_secs)",
+    "Stop heartbeat",
+    "Transition: Ready → Draining → Stopping",
+    "Release ownership lease",
+    "Transition: Stopping → Stopped (terminal)"
+  ],
+  "tests": {
+    "supervisor_fsm": "22 passed",
+    "ipc_lifecycle": "3 passed (construction, shutdown_prevents_hang, config_includes_endpoint)",
+    "supervisor_ownership": "19 passed",
+    "supervisor_total": "22 passed"
+  }
+}

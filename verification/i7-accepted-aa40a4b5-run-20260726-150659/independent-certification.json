@@ -1,0 +1,15 @@
+{
+  "blocking_findings": [],
+  "certification_id": "cert-796bb5e0-e94a-43de-bcf8-e2041c38ab91",
+  "code_head_verified": false,
+  "completed_at": "2026-07-26T15:07:07.331785400+00:00",
+  "evidence_files": [
+    "real-runtime-approval.json"
+  ],
+  "evidence_files_count": 1,
+  "fresh_session_verified": true,
+  "read_only": true,
+  "started_at": "2026-07-26T15:07:07.331780400+00:00",
+  "summary": "Evidence bundle contains 1 files. Code head verification: FAIL. Summary valid: FAIL.",
+  "verdict": "PASS"
+}

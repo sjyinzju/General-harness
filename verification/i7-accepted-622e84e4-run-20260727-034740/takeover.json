@@ -1,0 +1,18 @@
+{
+  "b_fencing_higher": true,
+  "instances_different": true,
+  "lease_duration_secs": 30,
+  "old_owner_fenced": true,
+  "pids_different": true,
+  "shared_database": "E:\\General-harness\\target\\harness-i7-acceptance\\run-20260727-034740\\crash-takeover\\harness.db",
+  "shared_state_dir": "i7-accept-shared",
+  "supervisor_a_fencing_token": 0,
+  "supervisor_a_instance_id": "da819b0d-b7a2-4ce5-b4aa-4a4bf9b95c1b",
+  "supervisor_a_pid": 7308,
+  "supervisor_a_terminated": true,
+  "supervisor_b_fencing_token": 2,
+  "supervisor_b_instance_id": "cd4dbe32-9323-4225-ba59-ccd22c1e808a",
+  "supervisor_b_pid": 3480,
+  "takeover_passed": true,
+  "timestamp": "2026-07-27T03:59:12.006874+00:00"
+}

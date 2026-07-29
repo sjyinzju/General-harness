@@ -1,0 +1,10 @@
+﻿cargo :     Checking harness-runtime v0.1.0 (E:\General-harness\crates\harness-runtime)
+At line:1 char:325
++ ... al-harness; cargo clippy --workspace --all-targets -- -D warnings 2>& ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (    Checking ha...arness-runtime):String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+    Checking harness-cli v0.1.0 (E:\General-harness\crates\harness-cli)
+    Checking harness-adapters v0.1.0 (E:\General-harness\crates\harness-adapters)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.30s

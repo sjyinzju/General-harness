@@ -1,0 +1,64 @@
+{
+  "goal_id": "g-i7-de311e09-3701-4544-b7d9-b96e18d4d95c",
+  "revision": 1,
+  "title": "Implement normalize_whitespace (single task)",
+  "objective": "CRITICAL CONSTRAINT: Create EXACTLY ONE PlannedTask. Do NOT split into multiple tasks.\n\nImplement a Rust function:\n\npub fn normalize_whitespace(input: &str) -> String\n\nRequirements:\n- Collapse consecutive Unicode whitespace to a single ASCII space\n- Trim leading and trailing whitespace\n- Support empty strings, spaces, tabs, and newlines\n- Write tests covering all scenarios\n- cargo test must pass\n\nCreate implementation AND tests in src/lib.rs as a single task. Do NOT create separate implementation and test tasks.\n\nDo NOT edit files outside src/.",
+  "repository_id": "i7-acceptance-repo",
+  "target_ref": "refs/heads/main",
+  "initial_base_head": "abc123def456",
+  "success_criteria": [
+    {
+      "criterion_id": "c1",
+      "description": "normalize_whitespace function compiles",
+      "evidence_policy": "task_terminal_result",
+      "verification_policy": "existence_only",
+      "subjectivity": "objective",
+      "required": true
+    },
+    {
+      "criterion_id": "c2",
+      "description": "All tests pass (cargo test)",
+      "evidence_policy": "task_terminal_result",
+      "verification_policy": "existence_only",
+      "subjectivity": "objective",
+      "required": true
+    },
+    {
+      "criterion_id": "c3",
+      "description": "Function handles empty strings, spaces, tabs, newlines correctly",
+      "evidence_policy": "task_terminal_result",
+      "verification_policy": "existence_only",
+      "subjectivity": "objective",
+      "required": true
+    }
+  ],
+  "constraints": [],
+  "non_goals": [],
+  "budget": {
+    "max_plan_revisions": 2,
+    "max_total_tasks": 1,
+    "max_active_tasks": 1,
+    "max_consecutive_failures": 3,
+    "max_no_progress_iterations": 5,
+    "max_total_agent_invocations": 50,
+    "max_planner_invocations": 5,
+    "max_evaluator_invocations": 10,
+    "max_elapsed_seconds": 3600
+  },
+  "approval_policy": {
+    "require_initial_plan_approval": false,
+    "require_high_risk_task_approval": true,
+    "require_scope_change_approval": true,
+    "require_budget_increase_approval": true,
+    "require_completion_approval": false,
+    "require_resume_after_no_progress_approval": true,
+    "approval_timeout_secs": 86400
+  },
+  "created_by": {
+    "user": {
+      "user_id": "i7-acceptance",
+      "user_name": "I7 Acceptance Runner"
+    }
+  },
+  "created_at": "2026-07-28T16:00:39.277840800Z"
+}

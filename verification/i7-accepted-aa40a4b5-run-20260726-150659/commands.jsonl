@@ -1,0 +1,36 @@
+[
+  {
+    "command": "cargo fmt --all -- --check",
+    "output_preview": "Diff in \\\\?\\E:\\General-harness\\crates\\harness-cli\\src\\bin\\i7_acceptance.rs:166:\n     // ── Phase 2: Migration Tests ─────────────────────────────────\n     println!(\"\\n═══ Phase 2: Migration Tests ═══\");\n     run_migration_tests(&repo_root, results);\n\u001b[31m-    println!(\"Phase 2: COMPLETE (fresh={}, v23={})\", results.migration_fresh_passed, results.migration_v23_passed);\n\u001b[0m\u001b[32m+    println!(\n\u001b[0m\u001b[32m+        \"Pha",
+    "passed": false,
+    "phase": "quality_gates"
+  },
+  {
+    "command": "cargo clippy --workspace --all-targets",
+    "passed": true,
+    "phase": "quality_gates"
+  },
+  {
+    "command": "cargo test --workspace",
+    "exit_ok": false,
+    "phase": "quality_gates",
+    "tests_failed_count": 0,
+    "tests_passed_count": 0
+  },
+  {
+    "command": "cargo test -p harness-runtime --test i7_acceptance_tests acceptance_migration",
+    "fresh_install": true,
+    "phase": "migration",
+    "v23_upgrade": true
+  },
+  {
+    "command": "cargo test scene_a_deterministic_two_task_goal_e2e",
+    "passed": true,
+    "phase": "deterministic_e2e"
+  },
+  {
+    "command": "cargo test scene_b_failure_replan_success",
+    "passed": true,
+    "phase": "deterministic_e2e"
+  }
+]

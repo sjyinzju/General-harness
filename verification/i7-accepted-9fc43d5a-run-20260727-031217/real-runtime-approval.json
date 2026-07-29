@@ -1,0 +1,28 @@
+{
+  "allow_git_commit": true,
+  "allow_git_integration": true,
+  "allow_git_push": false,
+  "allow_global_config_changes": false,
+  "allow_shell_execution": true,
+  "allow_workspace_edits": true,
+  "approval_digest": "ce6f5df98ed9e4ef",
+  "approval_id": "apr-3d3e3a0c-d325-4ec3-b3f1-c75da16ff71a",
+  "approved_at": "2026-07-27T03:12:17.533773800+00:00",
+  "approved_by": "human",
+  "code_head": "9fc43d5a8de5e9d9a20d61f9807a51de4872c85f",
+  "evidence_dir": "E:\\General-harness\\target\\harness-i7-acceptance\\run-20260727-031217\\evidence",
+  "maximum_duration_secs": 600,
+  "maximum_llm_invocations": 7,
+  "profile_ids": [
+    "claude-default-deepseek"
+  ],
+  "repository_root": "E:\\General-harness",
+  "roles": [
+    "planner",
+    "executor",
+    "reviewer",
+    "evaluator"
+  ],
+  "run_id": "run-20260727-031217",
+  "writable_root": "E:\\General-harness\\target\\harness-i7-acceptance\\run-20260727-031217\\real-provider-repo"
+}
