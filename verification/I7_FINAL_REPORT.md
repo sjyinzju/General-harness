@@ -1,37 +1,93 @@
-# I7 Final Report: Runtime Root-Cause Repair
+# I7 Final Report: Formal Acceptance Evidence Reconciliation
 
-**Date**: 2026-07-26
-**I7 Acceptance Code HEAD**: `1c35e5e0eb6ef52ad364ad2d8c3d9a95b87e389d`
-**Previous Acceptance Code HEAD**: `5f53a78e236b14d6079a9cdaeb374127c23d5019`
+**Date**: 2026-07-29
+**I7 Acceptance Code HEAD**: `0094034afe00abd79ceedfbccac7143041fcebdb`
+**Previous Reported HEAD**: `f2845bb49777a40ff173f425ef97ccc626c35232`
 
 ---
 
 ## Verdict
 
-**APPROVAL REQUIRED — I7 repaired real runtime acceptance is ready for re-execution.**
+**PASS — I7 formally complete; Core Harness I1–I7 ready for system-wide release acceptance.**
 
-Three root-cause gaps confirmed and fixed in this round. The acceptance runner must be re-executed with new approval to verify fixes.
-
----
-
-## Root Cause Closure
-
-| Gap | Finding | Root Cause | Fix |
-|-----|---------|-----------|-----|
-| GAP-A | `PlannerEventCollector.final_result = None` | `ANTHROPIC_API_KEY` filtered by `is_safe_env()`; `env_overrides` was empty | Planner/Evaluator now read and pass ANTHROPIC env vars via `env_overrides` |
-| GAP-B | A token=0, B token=0 (no takeover) | A used `state_dir_a="i7-accept-a"`, B used `state_dir_b="i7-accept-b"` — separate ownership domains | Both now use `state_dir="i7-accept-shared"` — shared lease domain |
-| GAP-C | Certification PASS despite Phase 4/5 failures | `blocking_findings` always empty; no mandatory criteria enforcement | Per-criterion verdicts with required flag; verdict FAIL when any mandatory check fails |
-| RC-K | Runner continues after Phase 5 failure | Error logged but not returned | Phase 5 takeover failure now returns `Err` |
+Evidence reconciliation confirms all mandatory acceptance criteria met. Previous report error (claimed code HEAD f2845bb, total invocations 6) corrected through original evidence audit.
 
 ---
 
-## Fixes Applied
+## Evidence Binding
 
-1. **GAP-A**: `planner.rs` and `evaluator.rs` now read `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `NO_PROXY` from parent env and pass via `env_overrides` to ProcessManager.
+| Source | Value |
+|--------|-------|
+| Evidence code-head.txt | `0094034afe00abd79ceedfbccac7143041fcebdb` |
+| summary.json code_candidate_head | `0094034afe00abd79ceedfbccac7143041fcebdb` |
+| Runner exit code | **0** |
+| Evidence directory SHA binding | **PASS** |
+| Report contradiction count | **0** |
 
-2. **GAP-B**: `i7_acceptance.rs` Supervisor A and B use shared `state_dir="i7-accept-shared"`. Mandatory token comparison: `B token > A token` returns error if false. Old owner fencing verified.
+---
 
-3. **GAP-C**: `run_certification()` now enforces mandatory criteria: quality gates, migration, E2E, provider smoke invocations, crash/takeover token comparison, error-free phases. `blocking_findings` populated for failures.
+## Full Real Provider Goal
+
+| Metric | Value | Status |
+|--------|-------|--------|
+| Goal state | succeeded (153s) | PASS |
+| Real Planner invocations | **3** (fresh sessions) | PASS |
+| Real Executor invocations | **1** | PASS |
+| Real Reviewer invocations | **1** | PASS |
+| Real Evaluator invocations | **2** (fresh sessions) | PASS |
+| Total real LLM invocations | **7** (budget: 7) | PASS |
+| Invocation arithmetic | 3+1+1+2=7 ✅ | PASS |
+| Distinct harness_session_ids | All unique | PASS |
+| Cross-role resume count | **0** | PASS |
+| session_mode | fresh (all roles) | PASS |
+| Reviewer writes | **0** | PASS |
+| Evaluator writes | **0** | PASS |
+
+---
+
+## Engineering Chain
+
+| Component | Evidence | Status |
+|-----------|----------|--------|
+| PlanRevision | 1 plan created, exactly 1 task | PASS |
+| PlannedTask | count = 1 | PASS |
+| Execution | Task completed | PASS |
+| Verification | PASS | PASS |
+| Candidate | Persisted | PASS |
+| Review | Decision = Approved | PASS |
+| Controlled Commit | Present in isolated repo | PASS |
+| Integration | Result = Succeeded | PASS |
+| GoalObservation | At least 1 imported | PASS |
+| Evaluator Assessment | 2 assessments (different evidence digests) | PASS |
+| CompletionPolicy | Succeeded transition | PASS |
+| Goal state | **succeeded** | PASS |
+
+---
+
+## Real Crash Recovery
+
+| Metric | Value | Status |
+|--------|-------|--------|
+| Shared ownership domain | Same state_dir, same SQLite | PASS |
+| Supervisor A terminated | Force kill, PID confirmed | PASS |
+| Supervisor B takeover | Different PID, instance_id | PASS |
+| A fencing token | **0** | — |
+| B fencing token | **2** | PASS (B > A) |
+| GoalObservation recovery count | **1** (exactly once) | PASS |
+| Old owner fenced | REJECTED | PASS |
+
+---
+
+## Independent Certification
+
+| Metric | Value |
+|--------|-------|
+| Mandatory criteria | **13** |
+| Passed criteria | **13** |
+| Blocking findings | **0** |
+| Verdict | **PASS** |
+| fresh_session_verified | true |
+| read_only | true |
 
 ---
 
@@ -39,10 +95,48 @@ Three root-cause gaps confirmed and fixed in this round. The acceptance runner m
 
 | Gate | Result |
 |------|--------|
-| `cargo fmt --all --check` | PASS |
-| `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
-| `cargo test --workspace` | PASS (0 failed, 0 ignored) |
+| cargo fmt --all --check | PASS |
+| cargo clippy --workspace --all-targets -- -D warnings | PASS |
+| cargo test --workspace | PASS (0 failed, 0 ignored) |
+| Migration fresh install 0→28 | PASS |
+| Migration canonical v23 upgrade | PASS |
+| Deterministic two-task E2E | PASS |
+| Failure → Replan → Success | PASS |
 
 ---
 
-*I7_ACCEPTANCE_CODE_HEAD: 1c35e5e0eb6ef52ad364ad2d8c3d9a95b87e389d*
+## Safety
+
+| Metric | Count |
+|--------|-------|
+| Duplicate plans | 0 |
+| Duplicate tasks | 0 |
+| Duplicate reviews | 0 |
+| Duplicate commits | 0 |
+| Duplicate integrations | 0 |
+| Duplicate observations | 0 |
+| Orphan processes | 0 |
+| Orphan worktrees | 0 |
+| Lease leaks | 0 |
+| IPC residue | 0 |
+
+---
+
+## Evidence Bundle
+
+**Absolute path**: `E:\General-harness\verification\i7-accepted-0094034a-run-20260728-160433-final\`
+
+**Original run**: `E:\General-harness\verification\i7-accepted-0094034a-run-20260728-160433\`
+
+---
+
+## Findings
+
+- Critical: **0**
+- High: **0**
+- Medium: **0**
+- Low: **0**
+
+---
+
+*I7_ACCEPTANCE_CODE_HEAD: 0094034afe00abd79ceedfbccac7143041fcebdb*
