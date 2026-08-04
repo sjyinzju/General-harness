@@ -2593,8 +2593,10 @@ async fn run_failpoint_f1(
     };
 
     let worktree_root = std::env::temp_dir().join("sys-f1-wt").join(code_head);
-    let rc =
-        Arc::new(harness_runtime::liveness::RunContext::create(p8_dir, code_head, false).unwrap());
+    let rc = match harness_runtime::liveness::RunContext::create(p8_dir, code_head, true) {
+        Ok(rc) => Arc::new(rc),
+        Err(_) => return false,
+    };
     let graph = match harness_runtime::production_graph::ProductionGraph::build(
         db.pool.clone(),
         &worktree_root,
@@ -2720,8 +2722,10 @@ async fn run_core_takeover_test(
         Ok(db) => db,
         Err(_) => return false,
     };
-    let init_rc =
-        Arc::new(harness_runtime::liveness::RunContext::create(p8_dir, code_head, false).unwrap());
+    let init_rc = match harness_runtime::liveness::RunContext::create(p8_dir, code_head, true) {
+        Ok(rc) => Arc::new(rc),
+        Err(_) => return false,
+    };
     let _init_graph = harness_runtime::production_graph::ProductionGraph::build(
         db.pool.clone(),
         &worktree_root,
@@ -2901,7 +2905,7 @@ async fn run_system_soak_60min(
         }
 
         // Alternate workloads
-        if goals_completed % 3 == 0 {
+        if goals_completed.is_multiple_of(3) {
             let _ = run_cargo_cmd(
                 repo_root,
                 &[
@@ -2915,7 +2919,7 @@ async fn run_system_soak_60min(
                 ],
             );
         }
-        if goals_completed % 5 == 0 {
+        if goals_completed.is_multiple_of(5) {
             let _ = run_cargo_cmd(
                 repo_root,
                 &[
@@ -2929,7 +2933,7 @@ async fn run_system_soak_60min(
                 ],
             );
         }
-        if goals_completed % 7 == 0 {
+        if goals_completed.is_multiple_of(7) {
             let _ = run_cargo_cmd(
                 repo_root,
                 &[
@@ -2945,7 +2949,7 @@ async fn run_system_soak_60min(
         }
 
         sample_interval += 1;
-        if sample_interval % 6 == 0 {
+        if sample_interval.is_multiple_of(6) {
             let elapsed_mins = soak_start.elapsed().as_secs() / 60;
             results.log_phase(
                 "12b",
