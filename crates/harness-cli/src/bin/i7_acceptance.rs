@@ -317,7 +317,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     results.evidence_dir = Some(ver_dir.to_string_lossy().to_string());
 
     // Final verdict: exit nonzero if any required phase or certification failed
-    if !results.certification_passed || results.crash_takeover_error.is_some() || results.provider_smoke_error.is_some() {
+    if !results.certification_passed
+        || results.crash_takeover_error.is_some()
+        || results.provider_smoke_error.is_some()
+    {
         eprintln!("\nFINAL VERDICT: FAIL — certification or mandatory phase failed");
         std::process::exit(1);
     }
@@ -640,9 +643,21 @@ async fn run_real_provider_smoke_approved(
         }
         // Check plan and task state
         if let Ok(Some(plan)) = goal_repo.get_active_plan(&goal_id).await {
-            let tasks = goal_repo.get_all_planned_tasks(&plan.plan_revision_id).await.unwrap_or_default();
-            let task_states: Vec<String> = tasks.iter().map(|t| format!("{}({})", t.client_ref, t.state.as_str())).collect();
-            results.log(&format!("Plan: {} tasks={} states={:?} has_adapter={}", plan.plan_revision_id, tasks.len(), task_states, graph.goal_loop_service.direct_adapter.is_some()));
+            let tasks = goal_repo
+                .get_all_planned_tasks(&plan.plan_revision_id)
+                .await
+                .unwrap_or_default();
+            let task_states: Vec<String> = tasks
+                .iter()
+                .map(|t| format!("{}({})", t.client_ref, t.state.as_str()))
+                .collect();
+            results.log(&format!(
+                "Plan: {} tasks={} states={:?} has_adapter={}",
+                plan.plan_revision_id,
+                tasks.len(),
+                task_states,
+                graph.goal_loop_service.direct_adapter.is_some()
+            ));
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -688,12 +703,18 @@ async fn run_real_provider_smoke_approved(
         results.real_executor_invocations = task_count as i32;
         results.log(&format!("Task executions: {}", task_count));
         let reviewer_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_invocation_log")
-            .fetch_one(&pool).await.unwrap_or(0);
+            .fetch_one(&pool)
+            .await
+            .unwrap_or(0);
         results.real_reviewer_invocations = reviewer_count as i32;
     }
-    results.log(&format!("Real provider smoke: planner={}, exec={}, review={}, eval={}",
-        results.real_planner_invocations, results.real_executor_invocations,
-        results.real_reviewer_invocations, results.real_evaluator_invocations));
+    results.log(&format!(
+        "Real provider smoke: planner={}, exec={}, review={}, eval={}",
+        results.real_planner_invocations,
+        results.real_executor_invocations,
+        results.real_reviewer_invocations,
+        results.real_evaluator_invocations
+    ));
     // ── Goal state summary ────────────────────────────────────────
     let state_row: (String,) = sqlx::query_as("SELECT state FROM goals WHERE goal_id = ?")
         .bind(&goal_id)
@@ -1846,6 +1867,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> Result<(), Box<dyn std::error::Error>
 }
 
 /// Count role invocations for a specific role from the planner_invocations table.
+#[allow(dead_code)]
 async fn count_role_invocations(pool: &sqlx::Pool<sqlx::Sqlite>, role: &str) -> i64 {
     sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM planner_invocations WHERE role = ?")
         .bind(role)

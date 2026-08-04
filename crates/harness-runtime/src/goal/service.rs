@@ -90,9 +90,7 @@ pub struct GoalLoopService {
     /// Integration queue service (I5) — enqueues and runs integrations.
     pub integration_queue: Option<Arc<IntegrationQueueService>>,
     /// Direct agent adapter for task execution (propagated to I4.5 dispatch).
-    pub direct_adapter: Option<
-        Arc<dyn harness_core::contracts::agent_adapter::AgentAdapter>,
-    >,
+    pub direct_adapter: Option<Arc<dyn harness_core::contracts::agent_adapter::AgentAdapter>>,
     /// Runtime profile for agent session creation.
     pub direct_profile: Option<harness_core::contracts::runtime_profile::RuntimeProfile>,
     /// Working directory (repository root) for direct task execution.
@@ -1160,8 +1158,25 @@ impl GoalLoopService {
         // provide real Claude invocations for acceptance verification.
         if self.direct_adapter.is_some() {
             let task_id = format!("goal-{}-{}", goal_id, pt.client_ref);
-            self.repo.update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Completed, Some(&task_id)).await?;
-            self.import_observation(goal_id, Some(plan_revision_id), Some(&pt.planned_task_id), "executor", &task_id, &format!("task-completed-{}", task_id), &format!("PlannedTask {} completed", pt.client_ref), "task_completed", goal_id).await?;
+            self.repo
+                .update_planned_task_state(
+                    &pt.planned_task_id,
+                    PlannedTaskState::Completed,
+                    Some(&task_id),
+                )
+                .await?;
+            self.import_observation(
+                goal_id,
+                Some(plan_revision_id),
+                Some(&pt.planned_task_id),
+                "executor",
+                &task_id,
+                &format!("task-completed-{}", task_id),
+                &format!("PlannedTask {} completed", pt.client_ref),
+                "task_completed",
+                goal_id,
+            )
+            .await?;
             tracing::info!(goal_id=%goal_id, task_id=%task_id, "task marked completed (adapter wired)");
             return Ok(());
         }
@@ -1176,8 +1191,11 @@ impl GoalLoopService {
 
             // Ensure the task and project records exist (FK requirements)
             let _ = sqlx::query(
-                "INSERT OR IGNORE INTO projects (id, objective, lifecycle) VALUES (?, ?, 'active')"
-            ).bind(goal_id).execute(&self.pool).await;
+                "INSERT OR IGNORE INTO projects (id, objective, lifecycle) VALUES (?, ?, 'active')",
+            )
+            .bind(goal_id)
+            .execute(&self.pool)
+            .await;
             let _ = sqlx::query(
                 "INSERT OR IGNORE INTO tasks (id, project_id, goal, lifecycle) VALUES (?, ?, ?, 'submitted')"
             ).bind(&task_id).bind(goal_id).bind(&pt.objective).execute(&self.pool).await;
@@ -1270,28 +1288,79 @@ impl GoalLoopService {
                     if let (Some(ref adapter), Some(ref profile)) =
                         (&self.direct_adapter, &self.direct_profile)
                     {
-                        let work_dir = self.work_dir.as_ref()
+                        let work_dir = self
+                            .work_dir
+                            .as_ref()
                             .map(|p| p.to_string_lossy().to_string())
                             .unwrap_or_else(|| goal_id.to_string());
                         match execute_planned_task_directly(
-                            adapter, profile, &task_id,
-                            &pt.objective, &pt.acceptance_criteria, &work_dir,
-                        ).await {
+                            adapter,
+                            profile,
+                            &task_id,
+                            &pt.objective,
+                            &pt.acceptance_criteria,
+                            &work_dir,
+                        )
+                        .await
+                        {
                             Ok(true) => {
-                                self.repo.update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Completed, Some(&task_id)).await?;
-                                self.import_observation(goal_id, Some(plan_revision_id), Some(&pt.planned_task_id), "executor", &task_id, &format!("task-completed-{}", task_id), &format!("PlannedTask {} completed", pt.client_ref), "task_completed", goal_id).await?;
+                                self.repo
+                                    .update_planned_task_state(
+                                        &pt.planned_task_id,
+                                        PlannedTaskState::Completed,
+                                        Some(&task_id),
+                                    )
+                                    .await?;
+                                self.import_observation(
+                                    goal_id,
+                                    Some(plan_revision_id),
+                                    Some(&pt.planned_task_id),
+                                    "executor",
+                                    &task_id,
+                                    &format!("task-completed-{}", task_id),
+                                    &format!("PlannedTask {} completed", pt.client_ref),
+                                    "task_completed",
+                                    goal_id,
+                                )
+                                .await?;
                             }
                             Ok(false) => {
-                                self.repo.update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Failed, Some(&task_id)).await?;
+                                self.repo
+                                    .update_planned_task_state(
+                                        &pt.planned_task_id,
+                                        PlannedTaskState::Failed,
+                                        Some(&task_id),
+                                    )
+                                    .await?;
                             }
                             Err(e) => {
                                 tracing::error!(goal_id=%goal_id, error=%e, "direct execution failed");
-                                self.repo.update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Failed, Some(&task_id)).await?;
+                                self.repo
+                                    .update_planned_task_state(
+                                        &pt.planned_task_id,
+                                        PlannedTaskState::Failed,
+                                        Some(&task_id),
+                                    )
+                                    .await?;
                             }
                         }
                     } else {
                         // Import initial observation (task started)
-                        self.import_observation(goal_id, Some(plan_revision_id), Some(&pt.planned_task_id), "task_loop", &loop_id, &format!("task-materialized-{}", loop_id), &format!("PlannedTask {} materialized as Task {}", pt.client_ref, task_id), "task_materialized", goal_id).await?;
+                        self.import_observation(
+                            goal_id,
+                            Some(plan_revision_id),
+                            Some(&pt.planned_task_id),
+                            "task_loop",
+                            &loop_id,
+                            &format!("task-materialized-{}", loop_id),
+                            &format!(
+                                "PlannedTask {} materialized as Task {}",
+                                pt.client_ref, task_id
+                            ),
+                            "task_materialized",
+                            goal_id,
+                        )
+                        .await?;
                     }
                 }
                 Err(e) => {
@@ -1712,7 +1781,12 @@ async fn execute_planned_task_directly(
         resource_claims: vec![],
         dependencies: vec![],
         acceptance_checks: acceptance_criteria.to_vec(),
-        allowed_tools: vec!["bash".to_string(), "read".to_string(), "write".to_string(), "edit".to_string()],
+        allowed_tools: vec![
+            "bash".to_string(),
+            "read".to_string(),
+            "write".to_string(),
+            "edit".to_string(),
+        ],
         output_schema: r#"{"ok": true, "summary": "..."}"#.to_string(),
         budget: harness_core::contracts::task_envelope::TaskBudget {
             max_turns: 1,
@@ -1731,9 +1805,8 @@ async fn execute_planned_task_directly(
         fn send(
             &mut self,
             event: AgentEvent,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(), CoreError>> + Send + '_>,
-        > {
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CoreError>> + Send + '_>>
+        {
             Box::pin(async move {
                 if let AgentEvent::Result {
                     content, is_error, ..
