@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "i7-acceptance"
 path = "src/bin/i7_acceptance.rs"
 
+[[bin]]
+name = "system-release-acceptance"
+path = "src/bin/system_release_acceptance.rs"
+
 [lints]
 workspace = true
 
