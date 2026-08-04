@@ -1,0 +1,46 @@
+{
+  "code_head_binding_passed": true,
+  "verified_code_head": "0094034afe00abd79ceedfbccac7143041fcebdb",
+  "evidence_code_head_matches": true,
+  "runner_exit_code": 0,
+  "all_mandatory_phases_passed": true,
+  "certification_verdict": "PASS",
+  "blocking_findings": [],
+
+  "planner_invocations": 3,
+  "executor_invocations": 1,
+  "reviewer_invocations": 1,
+  "evaluator_invocations": 2,
+  "total_real_llm_invocations": 7,
+  "invocation_arithmetic_correct": true,
+  "invocation_budget_limit": 7,
+  "invocation_budget_passed": true,
+
+  "planned_task_count": 1,
+  "verification_passed": true,
+  "candidate_present": true,
+  "review_approved": true,
+  "controlled_commit_present": true,
+  "integration_succeeded": true,
+  "goal_observation_present": true,
+  "evaluator_assessment_present": true,
+  "completion_policy_succeeded": true,
+  "goal_succeeded": true,
+
+  "same_domain_takeover_passed": true,
+  "supervisor_b_token_greater": true,
+  "ab_token_values": "B=2, A=0",
+  "goal_observation_recovery_count": 1,
+  "old_owner_writes_rejected": true,
+
+  "independent_certification_passed": true,
+  "mandatory_criteria_count": 13,
+  "passed_criteria_count": 13,
+
+  "duplicate_counts_all_zero": true,
+  "cleanup_counts_all_zero": true,
+
+  "formal_acceptance_verdict": "PASS",
+  "evidence_bundle": "E:\\General-harness\\verification\\i7-accepted-0094034a-run-20260728-160433-final",
+  "reconciliation_timestamp": "2026-07-29T00:00:00Z"
+}
