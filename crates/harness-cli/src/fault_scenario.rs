@@ -269,31 +269,6 @@ impl FaultScenarioRunner {
                 }
             };
 
-        // ── Start Supervisor A ────────────────────────────────────────
-        let mut child_a =
-            match self.start_supervisor(&db_path, &test_repo, &worktree_root, &state_dir, true) {
-                Ok(c) => c,
-                Err(e) => {
-                    result.error = Some(format!("start A: {}", e));
-                    return result;
-                }
-            };
-
-        result.supervisor_a_pid = Some(child_a.id());
-
-        // Wait for Supervisor A ready
-        match self.wait_supervisor_ready(&db_path, &state_dir).await {
-            Ok(token) => {
-                result.supervisor_a_token = Some(token);
-            }
-            Err(e) => {
-                let _ = child_a.kill();
-                let _ = child_a.wait();
-                result.error = Some(format!("A ready: {}", e));
-                return result;
-            }
-        }
-
         // ── Pre-release earlier failpoints ────────────────────────────
         // Failpoints are sequential: F1 → F2 → ... → F10.
         // To reach the target failpoint, all earlier failpoints must be
@@ -302,7 +277,10 @@ impl FaultScenarioRunner {
         // goal loop will block there, and the runner can observe the hit.
         pre_release_earlier_failpoints(scenario.id);
 
-        // ── Create and start the goal ─────────────────────────────────
+        // ── Create the goal BEFORE Supervisor A ───────────────────────
+        // Goals must exist in the DB before the supervisor starts so that
+        // resume_pending_goals discovers and drives them. The goal creation
+        // happens via standalone CLI which writes directly to the DB.
         let actual_goal_id = match &scenario.goal_setup {
             GoalSetup::ViaIpc { goal_spec_json } => {
                 match self.create_goal_via_cli(
@@ -314,8 +292,6 @@ impl FaultScenarioRunner {
                 ) {
                     Ok(id) => id,
                     Err(e) => {
-                        let _ = child_a.kill();
-                        let _ = child_a.wait();
                         result.error = Some(format!("goal create: {}", e));
                         return result;
                     }
@@ -331,8 +307,6 @@ impl FaultScenarioRunner {
                 ) {
                     Ok(id) => id,
                     Err(e) => {
-                        let _ = child_a.kill();
-                        let _ = child_a.wait();
                         result.error = Some(format!("goal standalone: {}", e));
                         return result;
                     }
@@ -340,6 +314,36 @@ impl FaultScenarioRunner {
             }
             GoalSetup::PreExisting { goal_id } => goal_id.clone(),
         };
+
+        // ── The standalone CLI blocks at F1 (unless pre-released) ─────
+        // After goal creation, start Supervisor A. Then wait for the target
+        // failpoint. Supervisor A's resume_pending_goals discovers the goal
+        // and drives its loop, hitting later failpoints (F2-F10).
+
+        // ── Start Supervisor A ────────────────────────────────────────
+        let mut child_a =
+            match self.start_supervisor(&db_path, &test_repo, &worktree_root, &state_dir, true) {
+                Ok(c) => c,
+                Err(e) => {
+                    result.error = Some(format!("start A: {}", e));
+                    return result;
+                }
+            };
+
+        result.supervisor_a_pid = Some(child_a.id());
+
+        // Wait for Supervisor A ready (resume_pending_goals runs during startup)
+        match self.wait_supervisor_ready(&db_path, &state_dir).await {
+            Ok(token) => {
+                result.supervisor_a_token = Some(token);
+            }
+            Err(e) => {
+                let _ = child_a.kill();
+                let _ = child_a.wait();
+                result.error = Some(format!("A ready: {}", e));
+                return result;
+            }
+        }
 
         // ── Wait for failpoint hit ────────────────────────────────────
         match self.wait_for_failpoint(scenario.failpoint_name).await {
@@ -370,10 +374,10 @@ impl FaultScenarioRunner {
         // Wait for lease expiry
         tokio::time::sleep(Duration::from_secs(LEASE_DURATION_SECS + 5)).await;
 
-        // Release the failpoint so the blocked CLI/goal-driver process can complete.
+        // Release the failpoint so any blocked processes can complete.
         failpoint::release_failpoint(scenario.failpoint_name);
 
-        // Give the unblocked process time to finish (commit, exit) before B opens the DB.
+        // Give the unblocked process time to finish before B opens the DB.
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // ── Start Supervisor B ────────────────────────────────────────
