@@ -297,6 +297,12 @@ impl GoalLoopService {
             )
             .await?;
 
+        // F1: Goal durable commit complete, before Planner invocation.
+        // The goal row is persisted; planning work has NOT been claimed.
+        super::failpoint::F1_AFTER_GOAL_PERSISTED_BEFORE_PLANNING
+            .hit()
+            .await;
+
         Ok(goal)
     }
 
@@ -472,6 +478,12 @@ impl GoalLoopService {
                 .to_string(),
             )
             .await?;
+
+        // F2: PlanRevision durable commit complete, before PlannedTask dispatch.
+        // The plan and tasks are persisted; materialization has NOT started.
+        super::failpoint::F2_AFTER_PLAN_REVISION_COMMITTED_BEFORE_TASK_DISPATCH
+            .hit()
+            .await;
 
         Ok(plan)
     }
@@ -661,6 +673,20 @@ impl GoalLoopService {
 
         // INSERT OR IGNORE handles idempotency by unique index on source
         self.repo.insert_observation(&obs).await?;
+
+        // F8: IntegrationResult durably imported as GoalObservation.
+        // The observation is committed; Evaluator has NOT been invoked.
+        if source_type == "integration" {
+            super::failpoint::F8_AFTER_INTEGRATION_RESULT_COMMITTED_BEFORE_GOAL_OBSERVATION
+                .hit()
+                .await;
+        }
+
+        // F9: GoalObservation durably committed, before Evaluator.
+        super::failpoint::F9_AFTER_GOAL_OBSERVATION_COMMITTED_BEFORE_EVALUATOR
+            .hit()
+            .await;
+
         Ok(obs.observation_id)
     }
 
@@ -1153,6 +1179,11 @@ impl GoalLoopService {
             .update_planned_task_state(&pt.planned_task_id, PlannedTaskState::Running, None)
             .await?;
 
+        // F3: Task loop/state committed (Running), before Executor spawn.
+        super::failpoint::F3_AFTER_TASK_LOOP_COMMITTED_BEFORE_EXECUTOR_SPAWN
+            .hit()
+            .await;
+
         // EXECUTION PATH: When adapter is available, mark task as completed
         // and record executor role invocation. The Planner and Evaluator
         // provide real Claude invocations for acceptance verification.
@@ -1165,6 +1196,12 @@ impl GoalLoopService {
                     Some(&task_id),
                 )
                 .await?;
+
+            // F4: Executor result committed (task Completed), before Verification/Observation import.
+            super::failpoint::F4_AFTER_EXECUTOR_RESULT_COMMITTED_BEFORE_VERIFICATION
+                .hit()
+                .await;
+
             self.import_observation(
                 goal_id,
                 Some(plan_revision_id),
@@ -1629,6 +1666,11 @@ impl GoalLoopService {
             let result = self
                 .assess_progress(goal_id, evaluator_proposal.as_ref())
                 .await?;
+
+            // F10: Assessment committed, before CompletionPolicy transition.
+            super::failpoint::F10_AFTER_ASSESSMENT_COMMITTED_BEFORE_COMPLETION_POLICY
+                .hit()
+                .await;
 
             if result.can_complete {
                 self.transition_goal(goal_id, GoalState::Succeeded).await?;

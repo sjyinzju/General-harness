@@ -15,6 +15,10 @@ path = "src/bin/i7_acceptance.rs"
 name = "system-release-acceptance"
 path = "src/bin/system_release_acceptance.rs"
 
+[[bin]]
+name = "f1-diagnostic"
+path = "src/bin/f1_diagnostic.rs"
+
 [lints]
 workspace = true
 

@@ -185,7 +185,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Standalone dual-writer check ───────────────────────────
-    if standalone {
+    // Skip the conflict check when failpoints are enabled (fault injection E2E tests
+    // need the CLI to write while a supervisor is running for crash recovery testing).
+    if standalone && std::env::var("HARNESS_FAILPOINT_ENABLE").is_err() {
         let client = SupervisorClient::new(DEFAULT_ENDPOINT);
         if let Ok(true) = client.ping().await {
             eprintln!("error: StandaloneWriteConflict — a healthy Supervisor is running.");
@@ -707,8 +709,67 @@ async fn dispatch_direct(
             }
         }
         "goal" => {
-            eprintln!("error: goal commands require Supervisor IPC");
-            false
+            // Standalone goal operations: create, start, and drive goals directly
+            // through the graph's GoalLoopService. Used by fault injection tests
+            // that need the full goal lifecycle without an IPC Supervisor.
+            match args.get(2).map(|s| s.as_str()) {
+                Some("create") => {
+                    let spec_path = parse_flag(args, "--spec-file");
+                    match spec_path {
+                        Some(path) => {
+                            let spec_content = std::fs::read_to_string(path).unwrap_or_default();
+                            match serde_json::from_str::<harness_core::contracts::goal::GoalSpec>(
+                                &spec_content,
+                            ) {
+                                Ok(spec) => match graph.goal_loop_service.create_goal(spec).await {
+                                    Ok(g) => {
+                                        println!("Goal created: {}", g.goal_id);
+                                        true
+                                    }
+                                    Err(e) => {
+                                        eprintln!("error: create goal: {e}");
+                                        false
+                                    }
+                                },
+                                Err(e) => {
+                                    eprintln!("error: invalid goal spec: {e}");
+                                    false
+                                }
+                            }
+                        }
+                        None => {
+                            eprintln!("error: --spec-file required for goal create");
+                            false
+                        }
+                    }
+                }
+                Some("drive") => {
+                    let goal_id = match parse_flag(args, "--goal-id") {
+                        Some(id) => id,
+                        None => {
+                            eprintln!("error: --goal-id required");
+                            return false;
+                        }
+                    };
+                    // Drive the goal loop once — hits F2-F10 failpoints as the
+                    // goal progresses through Planning, task dispatch, observation,
+                    // and evaluation.
+                    match graph.goal_loop_service.drive_goal_loop(goal_id).await {
+                        Ok(()) => {
+                            println!("Goal loop driven: {}", goal_id);
+                            true
+                        }
+                        Err(e) => {
+                            eprintln!("error: drive goal: {e}");
+                            false
+                        }
+                    }
+                }
+                _ => {
+                    eprintln!("error: goal commands require Supervisor IPC");
+                    false
+                }
+            }
         }
         "supervisor" => {
             if args.len() < 3 {
