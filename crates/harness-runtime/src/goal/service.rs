@@ -1037,7 +1037,30 @@ impl GoalLoopService {
             // Need to plan first — invoke the Planner
             tracing::info!(goal_id = %goal_id, "goal needs planning — invoking Planner");
 
-            if let Some(ref planner) = self.goal_planner {
+            // Deterministic mode takes priority: never call real LLM
+            if self.deterministic_mode {
+                let proposal = make_deterministic_plan_proposal(&goal);
+                let planner_profile_id = "deterministic-planner";
+                let planner_invocation_id = format!("inv-det-{}", uuid::Uuid::new_v4());
+
+                let plan = self
+                    .activate_plan(
+                        goal_id,
+                        &proposal,
+                        planner_profile_id,
+                        &planner_invocation_id,
+                        &goal.initial_base_head,
+                        goal.revision,
+                    )
+                    .await?;
+
+                tracing::info!(
+                    goal_id = %goal_id,
+                    plan_revision_id = %plan.plan_revision_id,
+                    task_count = proposal.tasks.len(),
+                    "deterministic plan activated (deterministic_mode priority)"
+                );
+            } else if let Some(ref planner) = self.goal_planner {
                 let ctx = self.build_planning_context(&goal).await?;
                 let proposal = planner.propose_plan(&ctx).await.map_err(|e| {
                     tracing::error!(goal_id = %goal_id, error = %e, "planner failed");
@@ -1068,32 +1091,6 @@ impl GoalLoopService {
                     revision_number = plan.revision_number,
                     task_count = proposal.tasks.len(),
                     "plan activated"
-                );
-            } else if self.deterministic_mode {
-                // ── Deterministic Planning Fallback ────────────────────
-                // When deterministic_mode is on and no real Planner is
-                // available, create a synthetic PlanProposal so the goal
-                // can progress through Planning → Active → task dispatch.
-                let proposal = make_deterministic_plan_proposal(&goal);
-                let planner_profile_id = "deterministic-planner";
-                let planner_invocation_id = format!("inv-det-{}", uuid::Uuid::new_v4());
-
-                let plan = self
-                    .activate_plan(
-                        goal_id,
-                        &proposal,
-                        planner_profile_id,
-                        &planner_invocation_id,
-                        &goal.initial_base_head,
-                        goal.revision,
-                    )
-                    .await?;
-
-                tracing::info!(
-                    goal_id = %goal_id,
-                    plan_revision_id = %plan.plan_revision_id,
-                    task_count = proposal.tasks.len(),
-                    "deterministic plan activated (deterministic_mode)"
                 );
             } else {
                 tracing::warn!(goal_id = %goal_id, "no planner available — staying in Planning state");
