@@ -1640,6 +1640,32 @@ impl GoalLoopService {
                 )
                 .await?;
 
+                // Ensure FK rows exist before the production pipeline.
+                // The I4.5 path may have failed to create them, which would cause
+                // freeze_candidate (candidate_snapshots → tasks → projects) to fail.
+                let exec_id = format!("exec-{}", task_id);
+                let _ = sqlx::query(
+                    "INSERT OR IGNORE INTO projects (id, objective, lifecycle) VALUES (?, ?, 'active')",
+                )
+                .bind(goal_id)
+                .execute(&self.pool)
+                .await;
+                let _ = sqlx::query(
+                    "INSERT OR IGNORE INTO tasks (id, project_id, goal, lifecycle) VALUES (?, ?, ?, 'submitted')",
+                )
+                .bind(&task_id)
+                .bind(goal_id)
+                .bind(&pt.objective)
+                .execute(&self.pool)
+                .await;
+                let _ = sqlx::query(
+                    "INSERT OR IGNORE INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id) VALUES (?, ?, 1, 'completed', 'deterministic')",
+                )
+                .bind(&exec_id)
+                .bind(&task_id)
+                .execute(&self.pool)
+                .await;
+
                 // Run full production pipeline: Candidate → Review → Commit → Integration
                 if let (Some(ref review_svc), Some(ref commit_svc), Some(ref integration_svc)) = (
                     &self.review_service,
