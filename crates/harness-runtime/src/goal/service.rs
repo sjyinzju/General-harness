@@ -1280,16 +1280,25 @@ impl GoalLoopService {
                 goal_id, plan_revision_id, pt.planned_task_id
             );
 
-            // Ensure the task and project records exist (FK requirements)
-            let _ = sqlx::query(
+            // Ensure the task and project records exist (FK requirements).
+            // Use INSERT OR IGNORE but CHECK the result — if the insert silently
+            // fails (e.g., because of a constraint), the FK for
+            // task_engineering_loops will also fail and block the fallback.
+            let project_result = sqlx::query(
                 "INSERT OR IGNORE INTO projects (id, objective, lifecycle) VALUES (?, ?, 'active')",
             )
             .bind(goal_id)
             .execute(&self.pool)
             .await;
-            let _ = sqlx::query(
+            if let Err(e) = &project_result {
+                tracing::error!(goal_id = %goal_id, error = %e, "failed to ensure project record exists");
+            }
+            let task_result = sqlx::query(
                 "INSERT OR IGNORE INTO tasks (id, project_id, goal, lifecycle) VALUES (?, ?, ?, 'submitted')"
             ).bind(&task_id).bind(goal_id).bind(&pt.objective).execute(&self.pool).await;
+            if let Err(e) = &task_result {
+                tracing::error!(goal_id = %goal_id, task_id = %task_id, error = %e, "failed to ensure task record exists");
+            }
 
             // Create a TaskEngineeringLoop for this planned task
             let req = CreateLoopRequest {
@@ -1564,22 +1573,43 @@ impl GoalLoopService {
         // adapter completed the task, deterministically complete it so that
         // F4/F5/F6/F7 failpoints are hit through the production pipeline.
         // This is ONLY active when the GoalLoopService is configured for it.
+        // In deterministic mode, even "failed" tasks are re-completed so the
+        // production pipeline (F4-F8) and evaluation (F9-F10) are exercised.
         if self.deterministic_mode || super::failpoint::failpoints_enabled() {
-            // Check if the task is NOT already completed (avoid double-completion)
-            let already_completed: bool =
+            // Check if the task is truly completed (skip only completed/cancelled).
+            // FAILED tasks are re-completed in deterministic mode so the full
+            // production pipeline (verification→candidate→review→commit→integration)
+            // is exercised for fault injection testing.
+            let task_state: Option<String> =
                 sqlx::query_scalar("SELECT state FROM planned_tasks WHERE planned_task_id = ?")
                     .bind(&pt.planned_task_id)
                     .fetch_optional(&self.pool)
                     .await
                     .ok()
-                    .flatten()
-                    .map(|s: String| s == "completed" || s == "failed" || s == "cancelled")
-                    .unwrap_or(false);
+                    .flatten();
 
-            if !already_completed {
+            let skip_deterministic =
+                matches!(task_state.as_deref(), Some("completed") | Some("cancelled"));
+
+            if !skip_deterministic {
+                // Diagnostic: write a touch file to confirm deterministic fallback is entered.
+                // This is a CHECKPOINT marker — if it exists, the fallback IS reached.
+                if super::failpoint::failpoints_enabled() {
+                    let diag_dir = std::path::Path::new("target/harness-failpoints");
+                    let _ = std::fs::create_dir_all(diag_dir);
+                    let _ = std::fs::write(
+                        diag_dir.join("diag_det_fallback_entered.txt"),
+                        chrono::Utc::now().to_rfc3339(),
+                    );
+                }
+
+                // Use the materialized task_id if valid, otherwise create a fresh one.
+                // When the task was previously "failed" due to an I4.5 error,
+                // materialized_task_id contains the error string — discard it.
                 let task_id = pt
                     .materialized_task_id
                     .clone()
+                    .filter(|id| id.starts_with("goal-") || id.starts_with("tl-"))
                     .unwrap_or_else(|| format!("goal-{}-{}", goal_id, pt.client_ref));
 
                 // Mark as Completed (deterministic executor)
