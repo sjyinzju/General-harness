@@ -1695,13 +1695,12 @@ impl GoalLoopService {
                         .map(|c: i64| c > 0)
                         .unwrap_or(false);
                 if !task_exists || !exec_exists {
-                    tracing::error!(
-                        goal_id = %goal_id,
-                        task_id = %task_id,
-                        exec_id = %exec_id,
-                        task_exists = task_exists,
-                        exec_exists = exec_exists,
-                        "FK rows missing before deterministic pipeline — pipeline will fail"
+                    // Write diagnostic file since tracing may not be configured
+                    let diag_dir = std::path::Path::new("target/harness-failpoints");
+                    let _ = std::fs::create_dir_all(diag_dir);
+                    let _ = std::fs::write(
+                        diag_dir.join("diag_fk_missing.txt"),
+                        format!("task_exists={} exec_exists={}", task_exists, exec_exists),
                     );
                 }
 
@@ -1712,7 +1711,7 @@ impl GoalLoopService {
                     &self.integration_queue,
                 ) {
                     if let Some(ref repo_path) = self.work_dir {
-                        let _ = self
+                        let pipeline_result = self
                             .run_deterministic_production_pipeline(
                                 goal_id,
                                 plan_revision_id,
@@ -1724,6 +1723,14 @@ impl GoalLoopService {
                                 repo_path,
                             )
                             .await;
+                        if let Err(ref e) = pipeline_result {
+                            let diag_dir = std::path::Path::new("target/harness-failpoints");
+                            let _ = std::fs::create_dir_all(diag_dir);
+                            let _ = std::fs::write(
+                                diag_dir.join("diag_pipeline_error.txt"),
+                                format!("pipeline error: {}", e),
+                            );
+                        }
                     }
                 }
 
