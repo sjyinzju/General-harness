@@ -2955,27 +2955,42 @@ async fn run_full_fault_injection_matrix(
         id: fault_scenario::FaultScenarioId::F5,
         failpoint_name: fault_scenario::FaultScenarioId::F5.failpoint_name(),
         description: "Verification PASS committed, crash before Candidate",
-        failpoint_required: false, // F5 is in the verification pipeline (not always hit in standalone)
-        goal_setup: fault_scenario::GoalSetup::ViaStandalone {
+        failpoint_required: true,
+        goal_setup: fault_scenario::GoalSetup::ViaIpc {
             goal_spec_json: f5_spec.to_string(),
         },
-        pre_crash_assertions: vec![],
+        pre_crash_assertions: vec![fault_scenario::Assertion::FailpointHit {
+            name: fault_scenario::FaultScenarioId::F5.failpoint_name().into(),
+        }],
         recovery_expectations: vec![
             fault_scenario::Assertion::GoalRecovered {
                 goal_id: f5_id.clone(),
             },
+            fault_scenario::Assertion::GoalTerminalState {
+                goal_id: f5_id.clone(),
+                expected_state: "succeeded".into(),
+            },
             fault_scenario::Assertion::SupervisorBReady,
         ],
-        duplicate_constraints: vec![fault_scenario::DuplicateCheck::GoalCount {
-            goal_id: f5_id.clone(),
-            expected: 1,
-        }],
+        duplicate_constraints: vec![
+            fault_scenario::DuplicateCheck::GoalCount {
+                goal_id: f5_id.clone(),
+                expected: 1,
+            },
+            fault_scenario::DuplicateCheck::ObservationCount {
+                goal_id: f5_id.clone(),
+                expected: 1,
+            },
+        ],
         cleanup_constraints: vec![fault_scenario::CleanupCheck::OrphanProcesses { max: 0 }],
     };
 
     let f5_result = runner.run_scenario(&f5_scenario).await;
-    // F5 passes if goal was recovered and supervisor B took over
-    let f5_ok = f5_result.goal_recovered && f5_result.token_b_greater;
+    // F5 passes: failpoint hit, goal recovered and reached succeeded
+    let f5_ok = f5_result.failpoint_hit
+        && f5_result.goal_recovered
+        && f5_result.token_b_greater
+        && f5_result.goal_terminal_state.as_deref() == Some("succeeded");
     results.p8_f5_passed = f5_ok;
     if f5_ok {
         failpoints_passed += 1;
@@ -3001,26 +3016,41 @@ async fn run_full_fault_injection_matrix(
         id: fault_scenario::FaultScenarioId::F6,
         failpoint_name: fault_scenario::FaultScenarioId::F6.failpoint_name(),
         description: "Review Approved committed, crash before Controlled Commit",
-        failpoint_required: false,
-        goal_setup: fault_scenario::GoalSetup::ViaStandalone {
+        failpoint_required: true,
+        goal_setup: fault_scenario::GoalSetup::ViaIpc {
             goal_spec_json: f6_spec.to_string(),
         },
-        pre_crash_assertions: vec![],
+        pre_crash_assertions: vec![fault_scenario::Assertion::FailpointHit {
+            name: fault_scenario::FaultScenarioId::F6.failpoint_name().into(),
+        }],
         recovery_expectations: vec![
             fault_scenario::Assertion::GoalRecovered {
                 goal_id: f6_id.clone(),
             },
+            fault_scenario::Assertion::GoalTerminalState {
+                goal_id: f6_id.clone(),
+                expected_state: "succeeded".into(),
+            },
             fault_scenario::Assertion::SupervisorBReady,
         ],
-        duplicate_constraints: vec![fault_scenario::DuplicateCheck::GoalCount {
-            goal_id: f6_id.clone(),
-            expected: 1,
-        }],
+        duplicate_constraints: vec![
+            fault_scenario::DuplicateCheck::GoalCount {
+                goal_id: f6_id.clone(),
+                expected: 1,
+            },
+            fault_scenario::DuplicateCheck::CommitCount {
+                goal_id: f6_id.clone(),
+                max: 1,
+            },
+        ],
         cleanup_constraints: vec![fault_scenario::CleanupCheck::OrphanProcesses { max: 0 }],
     };
 
     let f6_result = runner.run_scenario(&f6_scenario).await;
-    let f6_ok = f6_result.goal_recovered && f6_result.token_b_greater;
+    let f6_ok = f6_result.failpoint_hit
+        && f6_result.goal_recovered
+        && f6_result.token_b_greater
+        && f6_result.goal_terminal_state.as_deref() == Some("succeeded");
     results.p8_f6_passed = f6_ok;
     if f6_ok {
         failpoints_passed += 1;
@@ -3046,14 +3076,20 @@ async fn run_full_fault_injection_matrix(
         id: fault_scenario::FaultScenarioId::F7,
         failpoint_name: fault_scenario::FaultScenarioId::F7.failpoint_name(),
         description: "Commit created, crash before Integration enqueue",
-        failpoint_required: false,
-        goal_setup: fault_scenario::GoalSetup::ViaStandalone {
+        failpoint_required: true,
+        goal_setup: fault_scenario::GoalSetup::ViaIpc {
             goal_spec_json: f7_spec.to_string(),
         },
-        pre_crash_assertions: vec![],
+        pre_crash_assertions: vec![fault_scenario::Assertion::FailpointHit {
+            name: fault_scenario::FaultScenarioId::F7.failpoint_name().into(),
+        }],
         recovery_expectations: vec![
             fault_scenario::Assertion::GoalRecovered {
                 goal_id: f7_id.clone(),
+            },
+            fault_scenario::Assertion::GoalTerminalState {
+                goal_id: f7_id.clone(),
+                expected_state: "succeeded".into(),
             },
             fault_scenario::Assertion::SupervisorBReady,
         ],
@@ -3066,12 +3102,19 @@ async fn run_full_fault_injection_matrix(
                 goal_id: f7_id.clone(),
                 max: 1,
             },
+            fault_scenario::DuplicateCheck::IntegrationCount {
+                goal_id: f7_id.clone(),
+                max: 1,
+            },
         ],
         cleanup_constraints: vec![fault_scenario::CleanupCheck::OrphanProcesses { max: 0 }],
     };
 
     let f7_result = runner.run_scenario(&f7_scenario).await;
-    let f7_ok = f7_result.goal_recovered && f7_result.token_b_greater;
+    let f7_ok = f7_result.failpoint_hit
+        && f7_result.goal_recovered
+        && f7_result.token_b_greater
+        && f7_result.goal_terminal_state.as_deref() == Some("succeeded");
     results.p8_f7_passed = f7_ok;
     if f7_ok {
         failpoints_passed += 1;

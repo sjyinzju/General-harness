@@ -576,6 +576,11 @@ impl FaultScenarioRunner {
             cmd.env("HARNESS_FAILPOINT_ENABLE", "1");
         }
 
+        // Always enable deterministic mode for fault scenarios so that tasks
+        // auto-complete without a real LLM adapter and the full production
+        // pipeline (verification→candidate→review→commit→integration) runs.
+        cmd.env("HARNESS_DETERMINISTIC_MODE", "1");
+
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -680,6 +685,7 @@ impl FaultScenarioRunner {
                 &_worktree_root.to_string_lossy(),
             ])
             .env("HARNESS_FAILPOINT_ENABLE", "1")
+            .env("HARNESS_DETERMINISTIC_MODE", "1")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()

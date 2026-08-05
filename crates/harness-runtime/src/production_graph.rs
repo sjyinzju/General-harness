@@ -314,6 +314,18 @@ impl ProductionGraph {
         }
         goal_loop_svc.work_dir = Some(repo_root.to_path_buf());
 
+        // ── Deterministic mode detection (system acceptance) ──────────
+        // When HARNESS_DETERMINISTIC_MODE=1, tasks auto-complete without
+        // a real LLM adapter, enabling the full production pipeline to run
+        // through verification→candidate→review→commit→integration for
+        // fault-injection testing.
+        if std::env::var("HARNESS_DETERMINISTIC_MODE").as_deref() == Ok("1") {
+            goal_loop_svc.deterministic_mode = true;
+            tracing::info!(
+                "deterministic mode enabled for goal loop (HARNESS_DETERMINISTIC_MODE=1)"
+            );
+        }
+
         let goal_loop_service = Arc::new(goal_loop_svc);
 
         // ── I6: Supervisor repository ──────────────────────────────

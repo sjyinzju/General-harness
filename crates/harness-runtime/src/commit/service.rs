@@ -311,6 +311,12 @@ impl ControlledCommitService {
 
         self.commit_repo.insert_candidate(&cc).await?;
 
+        // F7: Controlled Commit durably created and persisted, before Integration enqueue.
+        // The CommitCandidate is committed; Integration has NOT been enqueued yet.
+        crate::goal::failpoint::F7_AFTER_CONTROLLED_COMMIT_CREATED_BEFORE_INTEGRATION_ENQUEUE
+            .hit()
+            .await;
+
         // 10. Transition to Created
         self.commit_repo
             .transition_state(

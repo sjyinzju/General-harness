@@ -207,6 +207,12 @@ impl ReviewOrchestrationService {
         )
         .await;
 
+        // F5: Verification PASS committed, Candidate durably persisted.
+        // The CandidateSnapshot is committed; Review has NOT been created yet.
+        crate::goal::failpoint::F5_AFTER_VERIFICATION_PASS_COMMITTED_BEFORE_CANDIDATE
+            .hit()
+            .await;
+
         Ok(snapshot)
     }
 
@@ -783,6 +789,14 @@ impl ReviewOrchestrationService {
                     .transition_state(review_id, &req.state, &state)
                     .await;
             }
+        }
+
+        // F6: Review Approved decision durably committed, before Controlled Commit.
+        // The review is Approved; Controlled Commit has NOT been created yet.
+        if matches!(decision, ReviewDecision::Approved) {
+            crate::goal::failpoint::F6_AFTER_REVIEW_APPROVED_COMMITTED_BEFORE_CONTROLLED_COMMIT
+                .hit()
+                .await;
         }
 
         // Emit terminal event
