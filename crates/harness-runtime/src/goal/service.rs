@@ -1069,6 +1069,32 @@ impl GoalLoopService {
                     task_count = proposal.tasks.len(),
                     "plan activated"
                 );
+            } else if self.deterministic_mode {
+                // ── Deterministic Planning Fallback ────────────────────
+                // When deterministic_mode is on and no real Planner is
+                // available, create a synthetic PlanProposal so the goal
+                // can progress through Planning → Active → task dispatch.
+                let proposal = make_deterministic_plan_proposal(&goal);
+                let planner_profile_id = "deterministic-planner";
+                let planner_invocation_id = format!("inv-det-{}", uuid::Uuid::new_v4());
+
+                let plan = self
+                    .activate_plan(
+                        goal_id,
+                        &proposal,
+                        planner_profile_id,
+                        &planner_invocation_id,
+                        &goal.initial_base_head,
+                        goal.revision,
+                    )
+                    .await?;
+
+                tracing::info!(
+                    goal_id = %goal_id,
+                    plan_revision_id = %plan.plan_revision_id,
+                    task_count = proposal.tasks.len(),
+                    "deterministic plan activated (deterministic_mode)"
+                );
             } else {
                 tracing::warn!(goal_id = %goal_id, "no planner available — staying in Planning state");
                 self.transition_goal(goal_id, GoalState::Planning).await?;
@@ -2002,6 +2028,41 @@ impl GoalLoopService {
         Ok(())
     }
 
+    /// Discover and resume pending goals (non-terminal state).
+    /// Called at supervisor startup to recover goals left behind by a
+    /// crashed predecessor. Each goal gets its own background loop run.
+    pub async fn resume_pending_goals(&self) -> Result<usize, CoreError> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT goal_id, state FROM goals WHERE state NOT IN ('succeeded', 'failed', 'cancelled')",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| {
+            CoreError::new(
+                ErrorCode::PersistenceError,
+                format!("failed to query pending goals: {e}"),
+                ErrorSource::System,
+            )
+        })?;
+
+        let count = rows.len();
+        for (goal_id, state) in &rows {
+            tracing::info!(
+                goal_id = %goal_id,
+                state = %state,
+                "resuming pending goal at supervisor startup"
+            );
+            // Start a background loop for each pending goal
+            let _run_id = self.start_loop_run(goal_id).await?;
+        }
+
+        if count > 0 {
+            tracing::info!(count = count, "resumed pending goals");
+        }
+
+        Ok(count)
+    }
+
     /// Finish a loop run.
     pub async fn finish_loop_run(
         &self,
@@ -2053,6 +2114,47 @@ fn parse_goal_state_from_db(s: &str) -> Result<GoalState, CoreError> {
             format!("unknown goal state: {s}"),
             ErrorSource::Harness,
         )),
+    }
+}
+
+/// Build a deterministic PlanProposal for system acceptance mode.
+/// Creates a single-task plan that satisfies the goal's success criteria.
+/// NEVER used in production — only when deterministic_mode is set.
+fn make_deterministic_plan_proposal(goal: &GoalSpec) -> PlanProposal {
+    PlanProposal {
+        schema_version: "1.0".to_string(),
+        goal_summary: goal.objective.clone(),
+        assumptions: vec!["Deterministic mode — no real LLM required".to_string()],
+        milestones: vec![super::ProposedMilestone {
+            client_ref: "milestone-1".to_string(),
+            title: "Implementation Complete".to_string(),
+            objective: "All success criteria satisfied".to_string(),
+            success_criteria_refs: goal
+                .success_criteria
+                .iter()
+                .map(|c| c.criterion_id.clone())
+                .collect(),
+            dependencies: vec![],
+            priority: 0,
+        }],
+        tasks: vec![super::ProposedTask {
+            client_ref: "task-1".to_string(),
+            milestone_ref: "milestone-1".to_string(),
+            title: format!("Implement: {}", goal.title),
+            objective: goal.objective.clone(),
+            acceptance_criteria: goal
+                .success_criteria
+                .iter()
+                .map(|c| c.description.clone())
+                .collect(),
+            dependencies: vec![],
+            expected_evidence: vec!["task_completed".to_string()],
+            expected_resource_scope: vec![],
+            risk_level: "Low".to_string(),
+            requires_approval: false,
+        }],
+        risks: vec![],
+        completion_strategy: "Single deterministic task completes the goal".to_string(),
     }
 }
 

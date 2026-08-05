@@ -241,6 +241,20 @@ impl Supervisor {
             .await?;
         self.run_startup_recovery(instance).await?;
 
+        // ── Resume pending goals ─────────────────────────────────
+        // Discover and resume goals left in non-terminal states by a
+        // crashed predecessor. Each goal gets its own background loop.
+        match self.services.goal_loop_service.resume_pending_goals().await {
+            Ok(count) => {
+                if count > 0 {
+                    tracing::info!(count = count, "resumed pending goals after recovery");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to resume pending goals (non-fatal)");
+            }
+        }
+
         // Ready
         self.transition_to(SupervisorState::Ready, instance).await?;
 
