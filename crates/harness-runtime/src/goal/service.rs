@@ -1294,6 +1294,7 @@ impl GoalLoopService {
                 "INSERT OR IGNORE INTO projects (id, objective, lifecycle) VALUES (?, ?, 'active')",
             )
             .bind(goal_id)
+            .bind(goal_id)
             .execute(&self.pool)
             .await;
                 if let Err(e) = &project_result {
@@ -1652,10 +1653,12 @@ impl GoalLoopService {
                 // freeze_candidate (candidate_snapshots → tasks → projects) to fail.
                 // Use explicit INSERT OR IGNORE and verify success by re-reading.
                 let exec_id = format!("exec-{}", task_id);
-                // Insert project first (tasks FK depends on it)
+                // Insert project first (tasks FK depends on it).
+                // NOTE: two ? placeholders — bind both goal_id (id) and objective.
                 sqlx::query(
                     "INSERT OR IGNORE INTO projects (id, objective, lifecycle) VALUES (?, ?, 'active')",
                 )
+                .bind(goal_id)
                 .bind(goal_id)
                 .execute(&self.pool)
                 .await
