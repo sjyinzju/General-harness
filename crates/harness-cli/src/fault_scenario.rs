@@ -303,7 +303,7 @@ impl FaultScenarioRunner {
         pre_release_earlier_failpoints(scenario.id);
 
         // ── Create and start the goal ─────────────────────────────────
-        let _actual_goal_id = match &scenario.goal_setup {
+        let actual_goal_id = match &scenario.goal_setup {
             GoalSetup::ViaIpc { goal_spec_json } => {
                 match self.create_goal_via_cli(
                     &db_path,
@@ -359,7 +359,7 @@ impl FaultScenarioRunner {
         }
 
         // ── Pre-crash assertions ──────────────────────────────────────
-        self.run_pre_crash_assertions(&db_path, &goal_id, scenario, &mut result)
+        self.run_pre_crash_assertions(&db_path, &actual_goal_id, scenario, &mut result)
             .await;
 
         // ── Kill Supervisor A ─────────────────────────────────────────
@@ -405,14 +405,14 @@ impl FaultScenarioRunner {
         }
 
         // ── Wait for recovery and goal progress ───────────────────────
-        self.wait_for_goal_progress(&db_path, &goal_id).await;
+        self.wait_for_goal_progress(&db_path, &actual_goal_id).await;
 
         // ── Post-recovery assertions ──────────────────────────────────
-        self.run_recovery_assertions(&db_path, &goal_id, scenario, &mut result, &state_dir)
+        self.run_recovery_assertions(&db_path, &actual_goal_id, scenario, &mut result, &state_dir)
             .await;
 
         // ── Duplicate checks ──────────────────────────────────────────
-        self.run_duplicate_checks(&db_path, &goal_id, scenario, &mut result)
+        self.run_duplicate_checks(&db_path, &actual_goal_id, scenario, &mut result)
             .await;
 
         // ── Cleanup checks ────────────────────────────────────────────
