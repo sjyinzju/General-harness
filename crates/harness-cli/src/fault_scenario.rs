@@ -685,6 +685,7 @@ impl FaultScenarioRunner {
             .args([
                 "goal",
                 "create",
+                "--standalone",
                 "--spec-file",
                 &spec_path.to_string_lossy(),
                 "--db",
@@ -970,7 +971,7 @@ pub fn make_fault_goal_spec(scenario_id: &str, goal_id: &str) -> Value {
         "target_ref": "refs/heads/main",
         "initial_base_head": "abc123def456",
         "success_criteria": [{
-            "criterion_id": "c1",
+            "criterion_id": format!("c-{}-primary", scenario_id),
             "description": "Implementation compiles and tests pass",
             "evidence_policy": "task_terminal_result",
             "verification_policy": "existence_only",
