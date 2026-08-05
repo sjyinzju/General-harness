@@ -1053,6 +1053,21 @@ impl GoalLoopService {
                     task_count = proposal.tasks.len(),
                     "deterministic plan activated (deterministic_mode priority)"
                 );
+                // Transition goal through Draft→Planning→Active so that
+                // evaluate_and_complete's Active→Succeeded transition is valid.
+                let current_state = get_goal_state(&self.pool, goal_id)
+                    .await
+                    .unwrap_or(GoalState::Draft);
+                if current_state == GoalState::Draft {
+                    self.transition_goal(goal_id, GoalState::Planning).await?;
+                }
+                if get_goal_state(&self.pool, goal_id)
+                    .await
+                    .unwrap_or(GoalState::Draft)
+                    == GoalState::Planning
+                {
+                    self.transition_goal(goal_id, GoalState::Active).await?;
+                }
             } else if let Some(ref planner) = self.goal_planner {
                 let ctx = self.build_planning_context(&goal).await?;
                 let proposal = planner.propose_plan(&ctx).await.map_err(|e| {

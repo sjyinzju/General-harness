@@ -508,7 +508,7 @@ impl FaultScenarioRunner {
 
         // Setup isolated git repo
         std::fs::create_dir_all(&test_repo).map_err(|e| format!("mkdir repo: {}", e))?;
-        run_git(&["init", "."], &test_repo)?;
+        run_git(&["init", "-b", "main", "."], &test_repo)?;
         std::fs::create_dir_all(test_repo.join("src")).map_err(|e| format!("mkdir src: {}", e))?;
         std::fs::write(
             test_repo.join("src").join("lib.rs"),
