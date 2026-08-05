@@ -49,6 +49,59 @@ const MAX_REAL_PROVIDER_DURATION: Duration = Duration::from_secs(7200); // 2 hou
 const SOAK_GOAL_COUNT: usize = 30;
 const SOAK_MIN_DURATION: Duration = Duration::from_secs(3600); // 60 minutes
 
+// ── Frozen Acceptance Identity ──────────────────────────────────────────
+/// Immutable identity created once at runner start. All evidence,
+/// directory names, verdict files, and certification MUST use this identity.
+/// If the working tree changes during the run, the run is invalidated.
+#[derive(Debug, Clone)]
+struct FrozenAcceptanceIdentity {
+    full_code_head: String,
+    short_code_head: String,
+    run_id: String,
+    repo_root: PathBuf,
+    created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl FrozenAcceptanceIdentity {
+    fn create(repo_root: &Path) -> Result<Self, String> {
+        let full = get_current_head(repo_root).map_err(|e| format!("git rev-parse: {e}"))?;
+        if full.len() < 8 {
+            return Err(format!("HEAD too short: {full}"));
+        }
+        let short = full[..8].to_string();
+        let run_id = format!(
+            "system-accept-{}",
+            chrono::Utc::now().format("%Y%m%d-%H%M%S")
+        );
+        Ok(Self {
+            full_code_head: full,
+            short_code_head: short,
+            run_id,
+            repo_root: repo_root.to_path_buf(),
+            created_at: chrono::Utc::now(),
+        })
+    }
+
+    /// Verify working tree has NOT changed since identity was created.
+    /// Returns Ok(()) if HEAD matches, Err if source changed.
+    fn verify_source_unchanged(&self) -> Result<(), String> {
+        let current =
+            get_current_head(&self.repo_root).map_err(|e| format!("cannot verify source: {e}"))?;
+        if current != self.full_code_head {
+            return Err(format!(
+                "SOURCE CHANGED during run: frozen={} current={}",
+                self.short_code_head,
+                &current[..current.len().min(8)]
+            ));
+        }
+        Ok(())
+    }
+
+    fn evidence_dir_name(&self) -> String {
+        format!("system-accepted-{}-{}", self.short_code_head, self.run_id)
+    }
+}
+
 // ── Execution Mode ─────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -75,17 +128,27 @@ struct RealRuntimeApproval {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let start_time = Utc::now();
-    let run_id = format!("system-accept-{}", start_time.format("%Y%m%d-%H%M%S"));
     let repo_root = std::env::current_dir().expect("current dir");
-    let code_head = get_current_head(&repo_root)?;
-    let short_sha = &code_head[..code_head.len().min(8)];
+
+    // ── Create frozen identity ONCE ──────────────────────────────────
+    let frozen = match FrozenAcceptanceIdentity::create(&repo_root) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("FATAL: cannot create frozen identity: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let start_time = Utc::now();
+    let code_head = &frozen.full_code_head;
+    let short_sha = &frozen.short_code_head;
+    let run_id = &frozen.run_id;
 
     let args: Vec<String> = std::env::args().collect();
     let requested_real = args.iter().any(|a| a == "--execute-real-runtime");
 
     let mode = if requested_real {
-        match request_approval(&repo_root, &code_head, &run_id) {
+        match request_approval(&repo_root, code_head, run_id) {
             Ok(approval) => ExecutionMode::ApprovedRealRuntime(Box::new(approval)),
             Err(e) => {
                 eprintln!("\nApproval denied: {e}");
@@ -115,7 +178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let work_dir = repo_root
         .join("target")
         .join("system-release-acceptance")
-        .join(&run_id);
+        .join(run_id);
     std::fs::create_dir_all(&work_dir)?;
 
     let evidence_dir = work_dir.join("evidence");
@@ -123,8 +186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut results = SystemAcceptanceResults::new(code_head.clone(), run_id.clone());
 
-    // Write code-head immediately
-    std::fs::write(evidence_dir.join("release-code-head.txt"), &code_head)?;
+    // Write code-head immediately from frozen identity
+    std::fs::write(evidence_dir.join("release-code-head.txt"), code_head)?;
 
     // ── Phase 1: Quality Gates ───────────────────────────────────────
     println!("\n═══ Phase 1: Build and Quality Gates ═══");
@@ -397,10 +460,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
     }
 
+    // ── Source-change detection ──────────────────────────────────────
+    // If working tree changed during run, evidence is invalid
+    if let Err(e) = frozen.verify_source_unchanged() {
+        eprintln!("\nFATAL: {e}");
+        eprintln!("Evidence is INVALID — source changed during acceptance run.");
+        eprintln!("Re-run from a frozen code HEAD without modifications.");
+        std::process::exit(1);
+    }
+
     // ── Evidence ─────────────────────────────────────────────────────
-    let ver_dir = repo_root
-        .join("verification")
-        .join(format!("system-accepted-{}-{}", short_sha, run_id));
+    // Evidence directory uses FROZEN identity (not live git HEAD)
+    let evidence_dir_name = frozen.evidence_dir_name();
+    let ver_dir = repo_root.join("verification").join(&evidence_dir_name);
+
+    // Check for old evidence reuse
+    if ver_dir.exists() {
+        eprintln!(
+            "\nFATAL: Evidence directory already exists: {}",
+            ver_dir.display()
+        );
+        eprintln!("Old evidence must not be reused for a new run.");
+        eprintln!("Remove old evidence or use a new RUN_ID.");
+        std::process::exit(1);
+    }
     copy_dir_all(&evidence_dir, &ver_dir)?;
     println!("\nVerification evidence: {}", ver_dir.display());
     results.evidence_dir = Some(ver_dir.to_string_lossy().to_string());
