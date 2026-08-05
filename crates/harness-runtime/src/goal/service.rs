@@ -2147,7 +2147,7 @@ fn make_deterministic_plan_proposal(goal: &GoalSpec) -> PlanProposal {
             dependencies: vec![],
             expected_evidence: vec!["task_completed".to_string()],
             expected_resource_scope: vec![],
-            risk_level: "Low".to_string(),
+            risk_level: "low".to_string(),
             requires_approval: false,
         }],
         risks: vec![],

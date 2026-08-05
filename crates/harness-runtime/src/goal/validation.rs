@@ -188,7 +188,7 @@ pub fn validate_plan_proposal(
 
     // 11. Risk level validation
     for t in &proposal.tasks {
-        if !["low", "medium", "high", "critical"].contains(&t.risk_level.as_str()) {
+        if !["low", "medium", "high", "critical"].contains(&t.risk_level.to_lowercase().as_str()) {
             result.add_error(format!(
                 "task {} has invalid risk_level: {}",
                 t.client_ref, t.risk_level
