@@ -294,6 +294,14 @@ impl FaultScenarioRunner {
             }
         }
 
+        // ── Pre-release earlier failpoints ────────────────────────────
+        // Failpoints are sequential: F1 → F2 → ... → F10.
+        // To reach the target failpoint, all earlier failpoints must be
+        // released so the goal loop can progress through them without
+        // blocking. The target failpoint itself is NOT released — the
+        // goal loop will block there, and the runner can observe the hit.
+        pre_release_earlier_failpoints(scenario.id);
+
         // ── Create and start the goal ─────────────────────────────────
         let _actual_goal_id = match &scenario.goal_setup {
             GoalSetup::ViaIpc { goal_spec_json } => {
@@ -1016,6 +1024,31 @@ fn run_git(args: &[&str], cwd: &Path) -> Result<(), String> {
         return Err(format!("git error: {}", stderr));
     }
     Ok(())
+}
+
+/// Pre-release failpoints that come before the target in the F1→F10 sequence.
+/// This allows the goal loop to progress to the target failpoint without
+/// blocking at earlier checkpoints. The target failpoint itself is NOT released.
+fn pre_release_earlier_failpoints(target: FaultScenarioId) {
+    let ordered: &[FaultScenarioId] = &[
+        FaultScenarioId::F1,
+        FaultScenarioId::F2,
+        FaultScenarioId::F3,
+        FaultScenarioId::F4,
+        FaultScenarioId::F5,
+        FaultScenarioId::F6,
+        FaultScenarioId::F7,
+        FaultScenarioId::F8,
+        FaultScenarioId::F9,
+        FaultScenarioId::F10,
+    ];
+
+    for fp in ordered {
+        if *fp == target {
+            break; // Stop before releasing the target
+        }
+        failpoint::release_failpoint(fp.failpoint_name());
+    }
 }
 
 async fn check_supervisor_ready_internal(
