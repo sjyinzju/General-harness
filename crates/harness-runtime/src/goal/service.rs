@@ -681,18 +681,11 @@ impl GoalLoopService {
         // INSERT OR IGNORE handles idempotency by unique index on source
         self.repo.insert_observation(&obs).await?;
 
-        // F8: IntegrationResult durably imported as GoalObservation.
-        // The observation is committed; Evaluator has NOT been invoked.
-        if source_type == "integration" {
-            super::failpoint::F8_AFTER_INTEGRATION_RESULT_COMMITTED_BEFORE_GOAL_OBSERVATION
-                .hit()
-                .await;
-        }
-
-        // F9: GoalObservation durably committed, before Evaluator.
-        super::failpoint::F9_AFTER_GOAL_OBSERVATION_COMMITTED_BEFORE_EVALUATOR
-            .hit()
-            .await;
+        // NOTE: F8 and F9 failpoints were previously hit here in import_observation
+        // but that blocked the task materialization path before F4-F7 could be
+        // reached. F8 is now hit in run_deterministic_production_pipeline after
+        // integration enqueue. F9 is hit in evaluate_and_complete before the
+        // Evaluator is invoked.
 
         Ok(obs.observation_id)
     }
@@ -1810,6 +1803,12 @@ impl GoalLoopService {
             "Integration enqueued"
         );
 
+        // F8: IntegrationResult committed, before GoalObservation.
+        // The integration is enqueued; the GoalObservation has NOT been imported yet.
+        super::failpoint::F8_AFTER_INTEGRATION_RESULT_COMMITTED_BEFORE_GOAL_OBSERVATION
+            .hit()
+            .await;
+
         // Import integration observation
         self.import_observation(
             goal_id,
@@ -1949,6 +1948,13 @@ impl GoalLoopService {
                 .list_goal_observations(goal_id)
                 .await
                 .unwrap_or_default();
+
+            // F9: GoalObservation durably committed, before Evaluator invocation.
+            // Hit here (not in import_observation) so that F4-F7 can be reached
+            // without premature blocking during task materialization.
+            super::failpoint::F9_AFTER_GOAL_OBSERVATION_COMMITTED_BEFORE_EVALUATOR
+                .hit()
+                .await;
 
             // Call the Evaluator if available
             let evaluator_proposal: Option<ProgressAssessmentProposal> = if let Some(
