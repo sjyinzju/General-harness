@@ -1112,9 +1112,14 @@ impl GoalLoopService {
 
         let plan = active_plan.unwrap();
 
-        // Transition to Active if in Planning
+        // Transition goal to Active if not already there.
+        // In deterministic mode, the goal starts as Draft and needs
+        // Draft→Planning→Active before Active→Succeeded can succeed.
         let current_state = get_goal_state(&self.pool, goal_id).await?;
-        if current_state == GoalState::Planning {
+        if current_state == GoalState::Draft {
+            self.transition_goal(goal_id, GoalState::Planning).await?;
+        }
+        if get_goal_state(&self.pool, goal_id).await? == GoalState::Planning {
             self.transition_goal(goal_id, GoalState::Active).await?;
         }
 
