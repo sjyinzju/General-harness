@@ -965,7 +965,11 @@ impl GoalLoopService {
             let _ = std::fs::create_dir_all(diag_bt);
             let _ = std::fs::write(
                 diag_bt.join(format!("diag_bg_task_{}.txt", goal_id_owned)),
-                format!("started det={} time={}", deterministic_mode, chrono::Utc::now().to_rfc3339()),
+                format!(
+                    "started det={} time={}",
+                    deterministic_mode,
+                    chrono::Utc::now().to_rfc3339()
+                ),
             );
 
             let repo = GoalRepo::new(pool.clone());
@@ -1075,7 +1079,12 @@ impl GoalLoopService {
         let _ = std::fs::create_dir_all(diag);
         let _ = std::fs::write(
             diag.join(format!("diag_drive_{}.txt", goal_id)),
-            format!("entered det={} fp={} time={}", self.deterministic_mode, super::failpoint::failpoints_enabled(), chrono::Utc::now().to_rfc3339()),
+            format!(
+                "entered det={} fp={} time={}",
+                self.deterministic_mode,
+                super::failpoint::failpoints_enabled(),
+                chrono::Utc::now().to_rfc3339()
+            ),
         );
 
         let goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
@@ -2402,13 +2411,14 @@ impl GoalLoopService {
 
         if approved_review_id.is_none() {
             // Check if ANY review exists (may be in non-terminal state)
-            let any_review_row: Option<(String, String)> =
-                sqlx::query_as("SELECT review_id, state FROM review_requests WHERE candidate_id = ?")
-                    .bind(&candidate_id)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .ok()
-                    .flatten();
+            let any_review_row: Option<(String, String)> = sqlx::query_as(
+                "SELECT review_id, state FROM review_requests WHERE candidate_id = ?",
+            )
+            .bind(&candidate_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
 
             if let Some((existing_review_id, existing_state)) = any_review_row {
                 // Review exists but is not approved — finalize it
@@ -2872,7 +2882,12 @@ impl GoalLoopService {
         let _ = std::fs::create_dir_all(diag);
         let _ = std::fs::write(
             diag.join("diag_resume_goals.txt"),
-            format!("called det={} fp={} time={}", self.deterministic_mode, super::failpoint::failpoints_enabled(), chrono::Utc::now().to_rfc3339()),
+            format!(
+                "called det={} fp={} time={}",
+                self.deterministic_mode,
+                super::failpoint::failpoints_enabled(),
+                chrono::Utc::now().to_rfc3339()
+            ),
         );
 
         let rows: Vec<(String, String)> = sqlx::query_as(
@@ -2891,7 +2906,15 @@ impl GoalLoopService {
         let count = rows.len();
         let _ = std::fs::write(
             std::path::Path::new("target/harness-failpoints").join("diag_resume_goals.txt"),
-            format!("found {} pending goals: {:?} time={}", count, rows.iter().map(|(id,st)| format!("{}={}", id, st)).collect::<Vec<_>>().join(", "), chrono::Utc::now().to_rfc3339()),
+            format!(
+                "found {} pending goals: {:?} time={}",
+                count,
+                rows.iter()
+                    .map(|(id, st)| format!("{}={}", id, st))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                chrono::Utc::now().to_rfc3339()
+            ),
         );
 
         for (goal_id, state) in &rows {
@@ -2904,13 +2927,15 @@ impl GoalLoopService {
             match self.start_loop_run(goal_id).await {
                 Ok(run_id) => {
                     let _ = std::fs::write(
-                        std::path::Path::new("target/harness-failpoints").join(format!("diag_resume_started_{}.txt", goal_id)),
+                        std::path::Path::new("target/harness-failpoints")
+                            .join(format!("diag_resume_started_{}.txt", goal_id)),
                         format!("run_id={} time={}", run_id, chrono::Utc::now().to_rfc3339()),
                     );
                 }
                 Err(e) => {
                     let _ = std::fs::write(
-                        std::path::Path::new("target/harness-failpoints").join(format!("diag_resume_err_{}.txt", goal_id)),
+                        std::path::Path::new("target/harness-failpoints")
+                            .join(format!("diag_resume_err_{}.txt", goal_id)),
                         format!("error={} time={}", e, chrono::Utc::now().to_rfc3339()),
                     );
                     return Err(e);

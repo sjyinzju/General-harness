@@ -48,10 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         scenario_id.as_str(),
         &chrono::Utc::now().format("%Y%m%d-%H%M%S")
     );
-    let work_dir = repo_root
-        .join("target")
-        .join("fault-runs")
-        .join(&run_tag);
+    let work_dir = repo_root.join("target").join("fault-runs").join(&run_tag);
     std::fs::create_dir_all(&work_dir)?;
 
     eprintln!("=== Running {} ===", scenario_id.as_str());
@@ -121,7 +118,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref e) = result.error {
         eprintln!("error: {}", e);
     }
-    eprintln!("evidence: {}", serde_json::to_string_pretty(&result.evidence)?);
+    eprintln!(
+        "evidence: {}",
+        serde_json::to_string_pretty(&result.evidence)?
+    );
 
     if result.passed {
         println!("PASS");
