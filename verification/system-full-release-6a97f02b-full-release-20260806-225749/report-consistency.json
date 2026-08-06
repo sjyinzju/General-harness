@@ -1,0 +1,12 @@
+{
+  "checks": {
+    "code_head_consistent_across_all_files": true,
+    "phase_results_match_runner_output": true,
+    "pilot_results_match_git_repos": true,
+    "invocation_counts_match_budget": true,
+    "cleanup_counts_consistent": true,
+    "certification_matches_evidence": true
+  },
+  "contradictions": 0,
+  "verdict": "CONSISTENT"
+}

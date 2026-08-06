@@ -1,0 +1,23 @@
+{
+  "pilot": "C",
+  "repository": "C:\\Users\\shiju\\AppData\\Local\\Temp\\full-release-pilots\\pilot-c",
+  "commits": [
+    {"sha": "9afe63f", "type": "initial_fixture", "message": "initial: RetryPolicy with off-by-one and Permanent filter bugs"},
+    {"sha": "b83ef49", "type": "controlled_commit_attempt_1", "message": "fix(attempt-1): fix off-by-one in should_retry", "parent": "9afe63f", "verification": "FAIL"},
+    {"sha": "3c1e98b", "type": "controlled_commit_attempt_2", "message": "fix(attempt-2): filter Permanent and Unknown errors from retry", "parent": "b83ef49", "verification": "PASS"}
+  ],
+  "rework": {
+    "count": 1,
+    "attempt_1_verdict": "FAIL — test_no_retry_permanent",
+    "attempt_2_verdict": "PASS — all 7 tests pass"
+  },
+  "verification": {
+    "fixture_commit_exists": true,
+    "controlled_commits_are_real_git_objects": true,
+    "parents_correct": true,
+    "base_ref_updated_correctly": true,
+    "no_duplicate_commits": true,
+    "no_unrelated_file_modifications": true,
+    "no_push": true
+  }
+}

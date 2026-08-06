@@ -1,0 +1,13 @@
+{
+  "binding_type": "full-release-approval",
+  "code_head": "6a97f02b74001f80d6fa4dab04935a8fea4f2382",
+  "report_head": "41d0c56ab4f4ce81e146e96598ed863c5e69393b",
+  "run_id": "full-release-20260806-225749",
+  "runtime_profile": "claude-default-deepseek",
+  "real_invocation_budget": 32,
+  "approved_scope": "Full System Release Acceptance — all phases including real provider pilots A/B/C",
+  "binding_created_at": "2026-08-06T22:57:49+08:00",
+  "evidence_root": "E:\\General-harness\\verification\\system-full-release-6a97f02b-full-release-20260806-225749",
+  "source_code_unchanged": true,
+  "frozen_baseline": "6a97f02b74001f80d6fa4dab04935a8fea4f2382"
+}

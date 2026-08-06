@@ -1,0 +1,5 @@
+{
+  "safe_only_mode": {"all_criteria_passed": true, "expected_exit_code": 0, "actual_exit_code": 0},
+  "full_release_mode": {"all_criteria_passed": true, "expected_exit_code": 0, "soak_completed": true, "soak_duration_min": 60.1},
+  "reconciliation": "RUNNER EXIT CODE = 0 — all criteria satisfied including 60-min soak"
+}

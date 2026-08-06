@@ -1,0 +1,21 @@
+﻿
+{"ts":"2026-08-06T23:20:05.8478849+08:00","type":"soak_start","detail":"60-minute system soak starting"}
+{"ts":"2026-08-06T23:23:11.7615288+08:00","type":"soak_sample","detail":"3 min: 144 ok, 0 fail"}
+{"ts":"2026-08-06T23:26:24.4269868+08:00","type":"soak_sample","detail":"6.1 min: 291 ok, 0 fail"}
+{"ts":"2026-08-06T23:29:55.8342824+08:00","type":"soak_sample","detail":"9.6 min: 436 ok, 0 fail"}
+{"ts":"2026-08-06T23:33:09.2036972+08:00","type":"soak_sample","detail":"12.9 min: 582 ok, 0 fail"}
+{"ts":"2026-08-06T23:36:16.8703077+08:00","type":"soak_sample","detail":"16 min: 727 ok, 0 fail"}
+{"ts":"2026-08-06T23:39:29.3723960+08:00","type":"soak_sample","detail":"19.2 min: 874 ok, 0 fail"}
+{"ts":"2026-08-06T23:42:38.2106617+08:00","type":"soak_sample","detail":"22.3 min: 1019 ok, 0 fail"}
+{"ts":"2026-08-06T23:45:59.1049553+08:00","type":"soak_sample","detail":"25.7 min: 1165 ok, 0 fail"}
+{"ts":"2026-08-06T23:49:08.4790862+08:00","type":"soak_sample","detail":"28.8 min: 1311 ok, 0 fail"}
+{"ts":"2026-08-06T23:52:17.0634128+08:00","type":"soak_sample","detail":"32 min: 1456 ok, 0 fail"}
+{"ts":"2026-08-06T23:55:28.9493334+08:00","type":"soak_sample","detail":"35.2 min: 1602 ok, 0 fail"}
+{"ts":"2026-08-06T23:58:43.5375548+08:00","type":"soak_sample","detail":"38.4 min: 1748 ok, 0 fail"}
+{"ts":"2026-08-07T00:01:52.2150710+08:00","type":"soak_sample","detail":"41.6 min: 1893 ok, 0 fail"}
+{"ts":"2026-08-07T00:05:06.4300784+08:00","type":"soak_sample","detail":"44.8 min: 2040 ok, 0 fail"}
+{"ts":"2026-08-07T00:08:17.6914845+08:00","type":"soak_sample","detail":"48 min: 2185 ok, 0 fail"}
+{"ts":"2026-08-07T00:11:29.7129981+08:00","type":"soak_sample","detail":"51.2 min: 2331 ok, 0 fail"}
+{"ts":"2026-08-07T00:14:38.8479265+08:00","type":"soak_sample","detail":"54.4 min: 2476 ok, 0 fail"}
+{"ts":"2026-08-07T00:17:53.4472379+08:00","type":"soak_sample","detail":"57.5 min: 2623 ok, 0 fail"}
+{"ts":"2026-08-07T00:20:12.4925604+08:00","type":"soak_end","detail":"Soak complete: 2730 goals in 60.1 min"}

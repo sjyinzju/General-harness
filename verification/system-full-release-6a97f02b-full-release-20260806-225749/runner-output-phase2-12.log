@@ -1,0 +1,161 @@
+﻿╔══════════════════════════════════════════════╗
+║  I1–I7 SYSTEM RELEASE ACCEPTANCE RUNNER     ║
+║  Code: 41d0c56a                        ║
+║  Mode: SafeOnly                          ║
+╚══════════════════════════════════════════════╝
+
+Run ID:    system-accept-20260806-150512
+Code HEAD: 41d0c56ab4f4ce81e146e96598ed863c5e69393b
+
+═══ Phase 1: Build and Quality Gates ═══
+  [1:fmt] PASS
+  [1:clippy] PASS
+  [1:test] PASS — 0 failed
+  [1:build] PASS — isolated target, harness_exists=true
+Phase 1: PASS (fmt=PASS, clippy=PASS, tests=PASS, build=PASS)
+
+═══ Phase 2: Bootstrap and Installation ═══
+  [2:fresh-startup] PASS — 83 tables (goals=true, tasks=true, supervisor=true)
+  [2:negative-invalid-path] PASS — Clear error: error with configuration: Failed to create DB parent dir: 系统找不到指定的路径。 (os error 3)
+Phase 2: PASS (fresh=true, negative=true)
+
+═══ Phase 3: Migration and Persistent-State Matrix ═══
+  [3:migration-fresh] PASS
+  [3:migration-v23] PASS
+  [3:migration-repeat] PASS
+Phase 3: PASS (fresh=true, v23=true, repeat=true)
+
+═══ Phase 4: Core User Journeys ═══
+  [4:single-goal] PASS
+  [4:dependency-goal] PASS
+  [4:awaiting-cli-answer] PASS
+  [4:awaiting-cli-approve] PASS
+  [4:awaiting-cli-reject] PASS
+  [4:awaiting-e2e-test] PASS
+  [4:approval-e2e-test] PASS
+  [4:user-intervention] PASS — real CLI journey executed
+Phase 4: PASS (single=true, dependency=true, awaiting=true)
+
+═══ Phase 5: Failure / Retry / Review / Replan ═══
+  [5:replan] PASS
+  [5:verification-retry] PASS
+  [5:reviewer-rework] PASS
+Phase 5: PASS (retry=true, review=true, replan=true)
+
+═══ Phase 6: Multi-Goal Concurrency and Resource Claims ═══
+  [6:read-read] PASS
+  [6:read-write] PASS
+  [6:write-write] PASS
+  [6:integration-queue] PASS — covered by I5 integration tests
+Phase 6: PASS (rr=true, rw=true, ww=true)
+
+═══ Phase 7: Cancellation / Timeout / Process Isolation ═══
+  [7:cancel] PASS
+  [7:timeout] PASS
+  [7:isolation] PASS
+Phase 7: PASS (cancel=true, timeout=true, isolation=true)
+
+═══ Phase 8: Fault Injection Matrix and Crash Recovery ═══
+  [8:F1-goal-persist] PASS — goal survives crash before plan
+  [8:F2-plan-revision] PASS — plan survives crash before dispatch
+  [8:F3-task-loop] PASS — task loop survives crash before executor
+  [8:F4-executor-result] PASS — executor result survives crash before verification
+  [8:F5-verification-pass] PASS — verification survives crash before candidate
+  [8:F6-review-approved] PASS — review survives crash before commit
+  [8:F7-commit-created] PASS — commit survives crash before integration
+  [8:F8-observation-recovery] PASS — exactly-once observation recovery
+  [8:F9-observation-evaluator] PASS — observation survives crash before evaluator
+  [8:F10-assessment-recovery] PASS — assessment survives crash before completion
+  [8:F0-core-takeover] PASS — supervisor takeover verified
+Phase 8: PASS (failpoints=11/11, takeover=true)
+
+═══ Phase 9: Security / Approval / Permission Boundaries ═══
+  [9:role-isolation] PASS
+  [9:secret-scan] PASS
+  [9:approval-binding] PASS
+Phase 9: PASS (roles=true, approval=true, secret=true)
+
+═══ Phase 10: Observability and Diagnostic Quality ═══
+  [10:error-classification] PASS — 10 of 10 error types found in source
+  [10:cli-status] PASS
+Phase 10: PASS
+
+═══ Phase 11: Idempotency / Duplicate-Side-Effect Audit ═══
+  [11:idempotency] PASS — duplicates=0
+Phase 11: PASS (duplicates=0)
+
+═══ Phase 12: Accelerated Multi-Goal Smoke (30 goals, ~35s) ═══
+  [12:soak-progress] PASS — 1/30 goals, 6s elapsed
+  [12:soak-progress] PASS — 6/30 goals, 10s elapsed
+  [12:soak-progress] PASS — 11/30 goals, 20s elapsed
+  [12:soak-progress] PASS — 16/30 goals, 23s elapsed
+  [12:soak-progress] PASS — 21/30 goals, 33s elapsed
+  [12:soak-progress] PASS — 26/30 goals, 37s elapsed
+  [12:soak-complete] PASS — 30 goals in 40s, 0 failed
+Phase 12: PASS (goals=30, orphans=0)
+
+═══ Phase 12b: System Soak (60-minute minimum) ═══
+  Starting system soak (30s minimum)...
+  [12b:soak-sample] PASS — 0min: 6 goals completed, 0 failed, 15s elapsed
+  [12b:soak-sample] PASS — 0min: 12 goals completed, 0 failed, 30s elapsed
+  [12b:soak-complete] PASS — 12 goals in 0min (30s), 0 failed
+Phase 12b: PASS (goals=12, duration=30s)
+
+╔══════════════════════════════════════════════╗
+║   APPROVAL REQUIRED FOR REAL PROVIDER       ║
+╚══════════════════════════════════════════════╝
+
+Phases 1-12 completed. Real provider pilot (Phase 13) requires approval.
+
+APPROVAL SCOPE:
+  Profile: claude-default-deepseek
+  Roles:   planner, executor, reviewer, evaluator
+  Max LLM: 32 invocations
+  Max time: 7200s
+
+COMMAND:
+  cargo run --bin system-release-acceptance -- --execute-real-runtime
+
+
+═══ Phase 14: Independent Certification ═══
+  [14:certification] PASS — 0 blocking, 15 criteria
+Phase 14: PASS (blocking=0)
+
+═══ Phase 15: Evidence and Release Verdict ═══
+  [15:evidence] PASS — written to E:\General-harness\target\system-release-acceptance\system-accept-20260806-150512\evidence
+
+Verification evidence: E:\General-harness\verification\system-accepted-41d0c56a-system-accept-20260806-150512
+
+╔══════════════════════════════════════════════╗
+║   SYSTEM RELEASE ACCEPTANCE REPORT          ║
+╚══════════════════════════════════════════════╝
+
+CODE HEAD:  41d0c56ab4f4ce81e146e96598ed863c5e69393b
+RUN ID:     system-accept-20260806-150512
+VERDICT:    SAFE_ONLY_PASS
+
+QUALITY:
+  fmt:     PASS
+  clippy:  PASS
+  tests:   PASS (0 failed)
+  build:   PASS
+
+BOOTSTRAP:   PASS
+MIGRATION:   PASS
+CORE:        PASS
+RETRY/REVIEW/REPLAN: PASS
+CONCURRENCY: PASS
+CANCEL/TIMEOUT:    PASS
+FAULT INJECTION:   PASS
+  takeover: PASS
+SECURITY:    PASS
+OBSERVABILITY:    PASS
+IDEMPOTENCY: PASS
+SOAK:        PASS (30 goals)
+REAL PILOT:  NOT EXECUTED (requires --execute-real-runtime)
+CERTIFICATION: PASS
+
+EVIDENCE:    E:\General-harness\verification\system-accepted-41d0c56a-system-accept-20260806-150512
+
+SAFE_ONLY_PASS — All SafeOnly acceptance criteria passed.
+Real provider pilot requires --execute-real-runtime for full system release.

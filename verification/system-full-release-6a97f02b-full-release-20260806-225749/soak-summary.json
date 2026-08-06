@@ -1,0 +1,14 @@
+﻿{
+    "min_duration_met":  true,
+    "goals_completed":  2730,
+    "concurrency":  "Deterministic test execution workload",
+    "end_time":  "2026-08-07T00:20:12.4925604+08:00",
+    "total_goals":  2730,
+    "duration_secs":  3606.6,
+    "goals_cancelled":  0,
+    "goals_failed":  0,
+    "min_goals_met":  true,
+    "passed":  true,
+    "start_time":  "2026-08-06T23:20:05.8433084+08:00",
+    "duration_mins":  60.1
+}

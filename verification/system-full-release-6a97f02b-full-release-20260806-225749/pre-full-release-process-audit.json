@@ -1,0 +1,39 @@
+{
+  "audit_timestamp": "2026-08-06T22:57:49+08:00",
+  "frozen_baseline": "6a97f02b74001f80d6fa4dab04935a8fea4f2382",
+  "current_head": "41d0c56ab4f4ce81e146e96598ed863c5e69393b",
+  "branch": "main",
+  "worktree_status": "clean",
+  "diff_from_baseline": {
+    "files_changed": [
+      "verification/system-accepted-6a97f02b-system-accept-20260806-133604/environment.json",
+      "verification/system-accepted-6a97f02b-system-accept-20260806-133604/independent-certification.json",
+      "verification/system-accepted-6a97f02b-system-accept-20260806-133604/release-code-head.txt",
+      "verification/system-accepted-6a97f02b-system-accept-20260806-133604/release-verdict.json",
+      "verification/system-accepted-6a97f02b-system-accept-20260806-133604/summary.json",
+      "verification/system-accepted-6a97f02b-system-accept-20260806-213603/runner-output.log"
+    ],
+    "source_code_modified": false,
+    "verdict": "HEAD is valid — only SafeOnly evidence files added; source code matches frozen baseline"
+  },
+  "process_audit": {
+    "stale_acceptance_supervisors": 0,
+    "stale_acceptance_agents": 0,
+    "stale_acceptance_shells": 0,
+    "stale_ipc_endpoints": 0,
+    "stale_acceptance_leases": 0,
+    "active_git_worktrees": 1,
+    "active_worktree_list": ["E:/General-harness [main]"],
+    "claude_process": {
+      "pid": 42452,
+      "start_time": "2026-08-06T22:55:48",
+      "note": "Current Claude Code session — not stale"
+    },
+    "notes": "Previous run reported '1 shell still running' — identified as current Claude session shell; no acceptance-owned child processes remain"
+  },
+  "code_head_binding": {
+    "source_code_head": "6a97f02b74001f80d6fa4dab04935a8fea4f2382",
+    "is_frozen": true,
+    "report_only_head": "41d0c56ab4f4ce81e146e96598ed863c5e69393b"
+  }
+}

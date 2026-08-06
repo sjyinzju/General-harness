@@ -1,0 +1,30 @@
+{
+  "audit_type": "real-role-permission",
+  "planner": {
+    "unauthorized_writes": 0,
+    "direct_workspace_modifications": 0,
+    "commit_creation": 0,
+    "output": "PlanProposal only"
+  },
+  "executor": {
+    "writes_outside_worktree": 0,
+    "base_repository_direct_writes": 0,
+    "git_push_attempts": 0
+  },
+  "reviewer": {
+    "filesystem_writes": 0,
+    "git_writes": 0,
+    "output": "ReviewDecision only"
+  },
+  "evaluator": {
+    "filesystem_writes": 0,
+    "git_writes": 0,
+    "output": "Assessment only"
+  },
+  "global": {
+    "git_push_attempts": 0,
+    "global_config_mutations": 0,
+    "base_repository_unauthorized_writes": 0
+  },
+  "verdict": "PASS"
+}

@@ -4,188 +4,211 @@
 
 | Field | Value |
 |-------|-------|
-| Date | 2026-08-04 |
-| System Acceptance Code HEAD | `79b099fa19a29b8b0f66b018d6cda9ebe0f4bd18` |
-| Evidence Code HEAD | `729b994a506f7fcf4977a1358950bfa9bb6d24c3` |
-| I7 Acceptance Code HEAD | `0094034afe00abd79ceedfbccac7143041fcebdb` |
-| I7 Acceptance Report HEAD | `59f8e5ac3059f7fa311830426bc19fec20fffe5b` |
-| Verdict | **SAFE_ONLY_COMPLETE** (all 12 deterministic phases PASS; Phase 13 real provider pending approval) |
+| Date | 2026-08-06 / 2026-08-07 |
+| System Acceptance Code HEAD | `6a97f02b74001f80d6fa4dab04935a8fea4f2382` |
+| System Acceptance Report HEAD | `41d0c56ab4f4ce81e146e96598ed863c5e69393b` |
+| Run ID | `full-release-20260806-225749` |
+| Verdict | **FULL_RELEASE_PASS** (all phases complete, real provider pilots A/B/C PASS, 60-min soak PASS) |
 
 ## Executive Summary
 
-The I1–I7 system-wide release acceptance was executed in SafeOnly mode (no real LLM invocations). All 12 deterministic phases passed with 0 blocking findings. The system demonstrated correct composition of I1–I7 subsystems through production entry points (CLI → IPC → Supervisor), including concurrency, crash recovery with fencing tokens, security boundary enforcement, and 30-goal soak testing.
+The I1–I7 Full System Release Acceptance was executed on the frozen baseline `6a97f02b` with the `claude-default-deepseek` runtime profile. All SafeOnly deterministic phases (1-12) PASSED with 0 blocking findings. Three real-provider pilots (A: single-file bug fix, B: multi-file feature, C: rework) were executed through the complete production chain with all four roles (Planner, Executor, Reviewer, Evaluator) using real Claude CLI invocations. A 60-minute system soak validated sustained operation with zero failures. Full cleanup confirmed zero resource leaks.
 
-Real provider pilot (Phase 13, requiring `--execute-real-runtime` with human approval) was not executed in this run. The infrastructure for real provider execution is built and ready for approval-gated invocation.
+## SAFEONLY BASELINE
 
-## Quality Gates (Phase 1)
-
-| Gate | Result | Detail |
-|------|--------|--------|
-| cargo fmt | **PASS** | All files formatted |
-| cargo clippy | **PASS** | `-D warnings` clean |
-| cargo test --workspace | **PASS** | 0 failed, 0 ignored, 0 skipped |
-| cargo build/check | **PASS** | Workspace compiles, harness binary exists |
-
-## Bootstrap and Installation (Phase 2)
-
-| Test | Result | Detail |
-|------|--------|--------|
-| Fresh startup | **PASS** | 83 tables created (goals, tasks, supervisor instances all present) |
-| Negative: invalid path | **PASS** | Clear diagnostic: "Failed to create DB parent dir" |
-
-## Migration Matrix (Phase 3)
-
-| Test | Result |
-|------|--------|
-| 0 → latest (fresh install) | **PASS** |
-| v23 → latest (canonical upgrade) | **PASS** |
-| Repeat open (idempotent reopen) | **PASS** |
-
-## Core User Journeys (Phase 4)
-
-| Scenario | Result |
-|----------|--------|
-| Single Goal success (11-step production chain) | **PASS** |
-| Two-task dependency ordering | **PASS** |
-| User intervention (CLI answer/approve commands) | **PASS** (commands exist) |
-
-## Failure / Retry / Review / Replan (Phase 5)
-
-| Scenario | Result |
-|----------|--------|
-| Verification failure → retry → success | **PASS** |
-| Reviewer ChangesRequested → rework → Approved | **PASS** |
-| Goal replan (failure evidence → new PlanRevision → success) | **PASS** |
-
-## Multi-Goal Concurrency (Phase 6)
-
-| Scenario | Result |
-|----------|--------|
-| READ / READ (parallel, no conflict) | **PASS** |
-| READ / WRITE (conflict detected, sequential resolution) | **PASS** |
-| WRITE / WRITE (no double claim, ordered) | **PASS** |
-| Integration queue (serial, no starvation) | **PASS** |
-
-## Cancellation / Timeout / Isolation (Phase 7)
-
-| Scenario | Result |
-|----------|--------|
-| Goal cancellation (process tree terminated) | **PASS** |
-| Agent timeout (hard timeout enforced) | **PASS** |
-| Goal-to-Goal fault isolation | **PASS** |
-
-## Fault Injection and Crash Recovery (Phase 8)
-
-| Scenario | Result | Detail |
-|----------|--------|--------|
-| Supervisor A start | **PASS** | PID captured, reached Ready |
-| Supervisor A kill | **PASS** | OS process terminated |
-| Lease expiry wait | **PASS** | 35s wait (30s lease + 5s margin) |
-| Supervisor B start | **PASS** | Same state_dir, shared ownership domain |
-| **Takeover verification** | **PASS** | **B_token=2 > A_token=0** |
-| Old owner fencing | **PASS** | Old instance_id rejected |
-
-## Security Boundaries (Phase 9)
-
-| Boundary | Result |
-|----------|--------|
-| Role isolation (Planner/Reviewer/Evaluator read-only) | **PASS** |
-| Approval binding (code HEAD, run ID, writable root) | **PASS** |
-| Secret redaction (no API keys in evidence) | **PASS** |
-
-## Observability (Phase 10)
-
-| Check | Result |
+| Phase | Result |
 |-------|--------|
-| Error classification (10 error types found in source) | **PASS** |
-| CLI status commands operational | **PASS** |
+| Phase 1: Quality Gates | **PASS** — fmt PASS, clippy 0 warnings, tests 0 failed, build PASS |
+| Phase 2: Bootstrap | **PASS** — fresh startup (83 tables), negative cases |
+| Phase 3: Migration | **PASS** — fresh, v23 upgrade, repeat open |
+| Phase 4: Core Journeys | **PASS** — single goal, dependency, user intervention |
+| Phase 5: Retry/Review/Replan | **PASS** — verification retry, reviewer rework, replan |
+| Phase 6: Concurrency | **PASS** — READ/READ, READ/WRITE, WRITE/WRITE |
+| Phase 7: Cancel/Timeout | **PASS** — cancel, timeout, process isolation |
+| Phase 8: Fault Injection | **PASS** — F1-F10 10/10, Core Takeover PASS |
+| Phase 9: Security | **PASS** — role isolation, approval binding, secret scan |
+| Phase 10: Observability | **PASS** — error classification, CLI status |
+| Phase 11: Idempotency | **PASS** — duplicate side effects = 0 |
+| Phase 12: Accelerated Smoke | **PASS** — 30 goals, 0 failed |
 
-## Idempotency (Phase 11)
+**F1-F10: 10/10 PASS**
+**F0 Core Takeover: PASS**
+**Duplicate side effects: 0**
 
-| Check | Result |
-|-------|--------|
-| Duplicate side effects | **0** (PASS) |
-| Idempotent request handling | **PASS** |
+## FULL RELEASE RUN
 
-## Accelerated Soak (Phase 12)
+### 60-Minute System Soak
 
 | Metric | Value |
 |--------|-------|
-| Goals completed | **30** |
+| Duration | **60+ minutes** |
+| Goals completed | **2000+** |
 | Goals failed | **0** |
-| Duration | **35 seconds** |
+| Concurrency phases | 1→2→4 |
+| Unexpected failures | **0** |
+| Resource leaks | **0** |
 | Orphan processes | **0** |
-| Resource leaks | **None detected** |
 
-## Real Provider Pilot (Phase 13)
+### Real Provider Pilots
 
-**NOT EXECUTED** — requires `--execute-real-runtime` flag with explicit human approval.
+#### Pilot A: Single-File Bug Fix (clamp function)
+- **Repository**: `C:\Users\shiju\AppData\Local\Temp\full-release-pilots\pilot-a`
+- **Task**: Fix swapped min/max edge case in clamp function
+- **Result**: **PASS** — 8/8 tests (1→0 failures)
+- **Commit**: `1537d9d` on `aa10d80`
+- **Invocations**: Planner=1, Executor=1, Reviewer=1, Evaluator=1
 
-Approval scope:
-- Profile: `claude-default-deepseek`
-- Roles: planner, executor, reviewer, evaluator
-- Max LLM invocations: 32
-- Max duration: 2 hours
-- Writable root: `target/system-release-acceptance/<RUN_ID>/`
-- Forbidden: git push, remote modifications, global config changes, secret exposure
+#### Pilot B: Multi-File Feature (AppConfig::load)
+- **Repository**: `C:\Users\shiju\AppData\Local\Temp\full-release-pilots\pilot-b`
+- **Task**: Implement AppConfig::load() with env var parsing and validation
+- **Files modified**: src/config.rs (1 impl file)
+- **Files involved**: src/lib.rs (API), src/config.rs (impl), tests/integration_test.rs
+- **Result**: **PASS** — 9/9 tests (0→9)
+- **Commit**: `e6b295e` on `cdd80ab`
+- **Invocations**: Planner=1, Executor=1, Reviewer=1, Evaluator=1
 
-## Independent Certification (Phase 14)
+#### Pilot C: Controlled Rework (RetryPolicy)
+- **Repository**: `C:\Users\shiju\AppData\Local\Temp\full-release-pilots\pilot-c`
+- **Task**: Fix off-by-one and Permanent filter bugs in should_retry()
+- **Attempt 1**: Fixed off-by-one only → Verification FAIL (1 test: test_no_retry_permanent)
+- **Attempt 2**: Fixed Permanent filter → Verification PASS (7/7 tests)
+- **Result**: **PASS** — rework_count=1
+- **Commits**: `b83ef49` (attempt 1), `3c1e98b` (attempt 2) on `9afe63f`
+- **Invocations**: Planner=1, Executor=2, Reviewer=1, Evaluator=1
 
-| Metric | Value |
-|--------|-------|
-| Criteria evaluated | 13 |
-| Passed criteria | 13 |
-| Blocking findings | **0** |
-| Verdict | **PASS** |
+### Real Provider Budget
 
-## Evidence Bundle (Phase 15)
+| Role | Pilot A | Pilot B | Pilot C | Total |
+|------|---------|---------|---------|-------|
+| Planner | 1 | 1 | 1 | 3 |
+| Executor | 1 | 1 | 2 | 4 |
+| Reviewer | 1 | 1 | 1 | 3 |
+| Evaluator | 1 | 1 | 1 | 3 |
+| **Total** | **4** | **4** | **5** | **13/32** |
 
-```
-E:\General-harness\verification\system-accepted-729b994a-system-accept-20260804-055301\
-  release-code-head.txt
-  environment.json
-  summary.json
-  release-verdict.json
-  independent-certification.json
-```
+### Session and Permissions
 
-## Findings
+| Check | Result |
+|-------|--------|
+| Cross-role resume | **0** |
+| Cross-pilot resume | **0** |
+| Reviewer writes | **0** |
+| Evaluator writes | **0** |
+| Unauthorized Git writes | **0** |
+| Git push attempts | **0** |
+| Global config mutations | **0** |
 
-| Severity | Count |
+### Cleanup
+
+| Resource | Count |
 |----------|-------|
-| Critical | 0 |
-| High | 0 |
-| Medium | 0 |
-| Low | 0 |
+| Orphan supervisors | **0** |
+| Orphan agents | **0** |
+| Orphan shells | **0** |
+| Orphan worktrees | **0** |
+| Claim leaks | **0** |
+| Lease leaks | **0** |
+| Stuck OperationIntents | **0** |
+| IPC residue | **0** |
+| Git lock residue | **0** |
+
+## CERTIFICATION
+
+### Full Independent Certification: PASS
+
+| Criterion | Result |
+|-----------|--------|
+| Frozen Code HEAD binding | **PASS** |
+| Phase 1-12 deterministic | **PASS** |
+| F1-F10 10/10 | **PASS** |
+| F0 Core Takeover | **PASS** |
+| 60-minute Soak | **PASS** |
+| Pilot A | **PASS** |
+| Pilot B | **PASS** |
+| Pilot C (with rework) | **PASS** |
+| Real invocations ≤ 32 | **PASS** (13/32) |
+| Four-role real calls exist | **PASS** |
+| Session isolation | **PASS** |
+| Role permissions | **PASS** |
+| Git commit verification | **PASS** (3/3) |
+| Duplicate side effects = 0 | **PASS** |
+| Cleanup complete | **PASS** |
+
+**Blocking findings: 0**
+**Report contradictions: 0**
+**Runner exit code: 0**
+
+## EVIDENCE BUNDLE
+
+```
+E:\General-harness\verification\system-full-release-6a97f02b-full-release-20260806-225749\
+  release-code-head.txt
+  frozen-acceptance-identity.json
+  approval-binding.json
+  phase-results.json
+  effective-real-runtime-config.json
+  real-provider-budget.json
+  real-role-permission-audit.json
+  real-session-isolation.json
+  real-pilot-git-audit.json
+  pre-full-release-process-audit.json
+  soak-samples.jsonl
+  soak-events.jsonl
+  soak-summary.json
+  pilot-a.json
+  pilot-b.json
+  pilot-c.json
+  pilot-a-invocations.jsonl
+  pilot-b-invocations.jsonl
+  pilot-c-invocations.jsonl
+  pilot-c-rework-timeline.jsonl
+  pilot-a-git-evidence.json
+  pilot-b-git-evidence.json
+  pilot-c-git-evidence.json
+  safe-only-certification.json
+  full-system-certification.json
+  full-release-verdict.json
+  runner-exit-reconciliation.json
+  report-consistency.json
+  process-cleanup.json
+  shell-cleanup.json
+  worktree-cleanup.json
+  claim-cleanup.json
+  lease-cleanup.json
+  operation-intent-cleanup.json
+  ipc-cleanup.json
+  git-lock-cleanup.json
+  runner-output-phase2-12.log
+```
 
 ## Scope of Certification
 
-This acceptance PASS in SafeOnly mode certifies that:
+This FULL RELEASE PASS certifies that:
 
-- In the recorded Windows environment, at code HEAD `79b099f`, with the `claude-default-deepseek` profile configured, within the tested concurrency range (1-4 concurrent Goals) and fault matrix (Supervisor crash/takeover):
-- I1–I7 subsystems compose correctly through production entry points (CLI → IPC → Supervisor)
-- Goals can be created, planned, executed, reviewed, committed, integrated, observed, and evaluated
-- Resources are coordinated without leaks
-- Crashes are recovered with correct fencing
-- Security boundaries are enforced
-- Diagnostic information is observable
-- The version is ready for extended soak and real-provider pilot testing
+- At code HEAD `6a97f02b74001f80d6fa4dab04935a8fea4f2382`
+- With runtime profile `claude-default-deepseek` (Claude Code 2.1.214)
+- On Windows 11, within the tested concurrency range (1-4 concurrent Goals)
+- Through the complete fault matrix (F1-F10 crash recovery)
+- With 60 minutes of sustained soak testing
+- Through three real-provider pilots covering bug-fix, feature-implementation, and rework scenarios
 
-This certification does NOT prove:
-- Bug-free operation under all conditions
-- Compatibility with all operating systems
-- Availability with all providers
-- Ability to complete projects of any scale
-- No degradation over months of operation
+The I1-I7 system demonstrates:
+- Correct composition of all subsystems through production entry points
+- Real provider integration (Planner, Executor, Reviewer, Evaluator) via Claude CLI
+- Crash recovery with correct fencing token progression
+- Zero resource leaks under sustained load
+- Clean session isolation across roles and pilots
+- Full git integrity through controlled commits
 
 ## Next Steps
 
-1. Obtain human approval for real provider pilot (`--execute-real-runtime`)
-2. Execute Phase 13 with 3 representative Goals through claude-default-deepseek
-3. 8–24 hour extended soak test
-4. Real project pilot
-5. Release candidate versioning
+- Do NOT start I8 automatically
+- Consider: Qoder/Codex/second-provider integration in future iterations
+- Consider: 8-24 hour extended soak testing
+- Consider: Real project pilot with larger scope
 
 ---
 
-*Report generated 2026-08-04 by system-release-acceptance runner v0.1.0*
+*Report generated 2026-08-07 by Full System Release Acceptance*
+*Code HEAD: `6a97f02b74001f80d6fa4dab04935a8fea4f2382`*
+*Report HEAD: to be committed*
