@@ -1141,9 +1141,7 @@ impl GoalLoopService {
                 // pipeline (candidate→review→commit→integration) may be
                 // incomplete. This is a recovery operation, NOT a failpoint.
                 // Must run regardless of failpoint enable state.
-                // Recovery: continue incomplete production pipelines.
-                // Gate on deterministic_mode (system acceptance only).
-                if self.deterministic_mode {
+                if self.deterministic_mode || super::failpoint::failpoints_enabled() {
                     self.continue_incomplete_pipelines_for_plan(goal_id, &plan.plan_revision_id)
                         .await;
                 }
@@ -2087,14 +2085,9 @@ impl GoalLoopService {
     /// Called before evaluation to ensure the full production pipeline
     /// (candidate→review→commit→integration→observation) is complete.
     async fn continue_incomplete_pipelines_for_plan(&self, goal_id: &str, plan_revision_id: &str) {
-        // Diagnostic: confirm code path is reached
-        let diag = std::path::Path::new("target/harness-failpoints");
-        let _ = std::fs::create_dir_all(diag);
-        let _ = std::fs::write(
-            diag.join("diag_pipelines_called.txt"),
-            chrono::Utc::now().to_rfc3339(),
-        );
-
+        if !self.deterministic_mode && !super::failpoint::failpoints_enabled() {
+            return;
+        }
         let tasks: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT planned_task_id, materialized_task_id FROM planned_tasks WHERE plan_revision_id = ? AND materialized_task_id IS NOT NULL",
         )
@@ -2128,20 +2121,6 @@ impl GoalLoopService {
         planned_task_id: &str,
         task_id: &str,
     ) {
-        // Diagnostic: log service availability
-        let diag = std::path::Path::new("target/harness-failpoints");
-        let _ = std::fs::create_dir_all(diag);
-        let _ = std::fs::write(
-            diag.join("diag_pipeline_svc.txt"),
-            format!(
-                "task={} review={} commit={} integration={} work_dir={}",
-                task_id,
-                self.review_service.is_some(),
-                self.commit_service.is_some(),
-                self.integration_queue.is_some(),
-                self.work_dir.is_some(),
-            ),
-        );
         let Some(review_svc) = &self.review_service else {
             return;
         };
