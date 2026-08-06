@@ -963,7 +963,7 @@ impl FaultScenarioRunner {
                     }
                     DuplicateCheck::IntegrationCount { goal_id: gid, max } => {
                         let count: i64 = sqlx::query_scalar(
-                            "SELECT COUNT(*) FROM integration_requests WHERE goal_id = ?",
+                            "SELECT COUNT(*) FROM integration_requests WHERE repository_id = ?",
                         )
                         .bind(gid)
                         .fetch_one(&db.pool)
