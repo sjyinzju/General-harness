@@ -1140,8 +1140,22 @@ impl GoalLoopService {
                     self.continue_incomplete_pipelines_for_plan(goal_id, &plan.plan_revision_id)
                         .await;
                 }
+                // Diagnostic: log goal state before evaluation
+                let pre_eval_state = get_goal_state(&self.pool, goal_id).await.ok();
+                let diag = std::path::Path::new("target/harness-failpoints");
+                let _ = std::fs::create_dir_all(diag);
+                let _ = std::fs::write(
+                    diag.join("diag_pre_eval.txt"),
+                    format!("goal={} state={:?}", goal_id, pre_eval_state),
+                );
                 tracing::info!(goal_id = %goal_id, "all tasks completed — running evaluation");
-                return self.evaluate_and_complete(goal_id).await;
+                let eval_result = self.evaluate_and_complete(goal_id).await;
+                let post_eval_state = get_goal_state(&self.pool, goal_id).await.ok();
+                let _ = std::fs::write(
+                    diag.join("diag_post_eval.txt"),
+                    format!("goal={} state={:?} result={:?}", goal_id, post_eval_state, eval_result.is_ok()),
+                );
+                return eval_result;
             }
             tracing::info!(goal_id = %goal_id, "no ready tasks (dependencies unsatisfied)");
             return Ok(());
