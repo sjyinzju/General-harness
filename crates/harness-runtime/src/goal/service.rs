@@ -2206,7 +2206,15 @@ impl GoalLoopService {
                 .await
             {
                 Ok(c) => c.candidate_id,
-                Err(_) => return,
+                Err(e) => {
+                    let diag = std::path::Path::new("target/harness-failpoints");
+                    let _ = std::fs::create_dir_all(diag);
+                    let _ = std::fs::write(
+                        diag.join("diag_recovery_err.txt"),
+                        format!("freeze_candidate: {e}"),
+                    );
+                    return;
+                }
             }
         };
 
@@ -2251,7 +2259,7 @@ impl GoalLoopService {
                         summary: "Recovery review — finalizing existing".to_string(),
                         findings: vec![],
                     };
-                    let _ = review_svc
+                    if let Err(e) = review_svc
                         .finalize_decision(
                             &existing_review_id,
                             &harness_core::contracts::review::ReviewDecision::Approved,
@@ -2260,7 +2268,15 @@ impl GoalLoopService {
                             &reviewer_output,
                             "deterministic-recovery-reviewer",
                         )
-                        .await;
+                        .await
+                    {
+                        let diag = std::path::Path::new("target/harness-failpoints");
+                        let _ = std::fs::create_dir_all(diag);
+                        let _ = std::fs::write(
+                            diag.join("diag_recovery_err.txt"),
+                            format!("finalize_existing: {e}"),
+                        );
+                    }
                 }
             } else {
                 // No review — create and approve one
@@ -2286,7 +2302,7 @@ impl GoalLoopService {
                         summary: "Recovery review".to_string(),
                         findings: vec![],
                     };
-                    let _ = review_svc
+                    if let Err(e) = review_svc
                         .finalize_decision(
                             &review_req.review_id,
                             &harness_core::contracts::review::ReviewDecision::Approved,
@@ -2295,7 +2311,15 @@ impl GoalLoopService {
                             &reviewer_output,
                             "deterministic-recovery-reviewer",
                         )
-                        .await;
+                        .await
+                    {
+                        let diag = std::path::Path::new("target/harness-failpoints");
+                        let _ = std::fs::create_dir_all(diag);
+                        let _ = std::fs::write(
+                            diag.join("diag_recovery_err.txt"),
+                            format!("finalize_new: {e}"),
+                        );
+                    }
                 }
             }
         }
@@ -2328,7 +2352,7 @@ impl GoalLoopService {
                         name: "System Recovery".to_string(),
                         email: "recovery@harness.test".to_string(),
                     };
-                    let _ = commit_svc
+                    if let Err(e) = commit_svc
                         .create_commit(
                             &approved,
                             goal_id,
@@ -2338,7 +2362,15 @@ impl GoalLoopService {
                             &format!("chore: recovery commit for {}", task_id),
                             repo_path,
                         )
-                        .await;
+                        .await
+                    {
+                        let diag = std::path::Path::new("target/harness-failpoints");
+                        let _ = std::fs::create_dir_all(diag);
+                        let _ = std::fs::write(
+                            diag.join("diag_recovery_err.txt"),
+                            format!("create_commit: {e}"),
+                        );
+                    }
                 }
             }
         }
@@ -2384,7 +2416,7 @@ impl GoalLoopService {
 
                 if let (Some(ref rev_id), Some(ref oid)) = (rev_id, commit_oid) {
                     let int_id = format!("int-rec-{}", uuid::Uuid::new_v4());
-                    let _ = integration_svc
+                    if let Err(e) = integration_svc
                         .enqueue(
                             &int_id,
                             crid,
@@ -2395,7 +2427,15 @@ impl GoalLoopService {
                             oid,
                             0,
                         )
-                        .await;
+                        .await
+                    {
+                        let diag = std::path::Path::new("target/harness-failpoints");
+                        let _ = std::fs::create_dir_all(diag);
+                        let _ = std::fs::write(
+                            diag.join("diag_recovery_err.txt"),
+                            format!("enqueue: {e}"),
+                        );
+                    }
                 }
             }
 

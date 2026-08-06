@@ -376,8 +376,11 @@ impl FaultScenarioRunner {
         // Wait for lease expiry
         tokio::time::sleep(Duration::from_secs(LEASE_DURATION_SECS + 5)).await;
 
-        // Release the failpoint so any blocked processes can complete.
+        // Release the target failpoint AND all later failpoints.
+        // B's recovery must be able to run the full pipeline and evaluation
+        // without blocking at later failpoints (e.g., F9 during evaluate_and_complete).
         failpoint::release_failpoint(scenario.failpoint_name);
+        release_later_failpoints(scenario.id);
 
         // Give the unblocked process time to finish before B opens the DB.
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -1097,6 +1100,35 @@ fn pre_release_earlier_failpoints(target: FaultScenarioId) {
             break; // Stop before releasing the target
         }
         failpoint::release_failpoint(fp.failpoint_name());
+    }
+}
+
+/// Release failpoints that come AFTER the target in the F1→F10 sequence.
+/// This ensures Supervisor B's recovery (which runs the full pipeline and
+/// evaluation) doesn't block at later failpoints (e.g., F9 during evaluation).
+fn release_later_failpoints(target: FaultScenarioId) {
+    let ordered: &[FaultScenarioId] = &[
+        FaultScenarioId::F1,
+        FaultScenarioId::F2,
+        FaultScenarioId::F3,
+        FaultScenarioId::F4,
+        FaultScenarioId::F5,
+        FaultScenarioId::F6,
+        FaultScenarioId::F7,
+        FaultScenarioId::F8,
+        FaultScenarioId::F9,
+        FaultScenarioId::F10,
+    ];
+
+    let mut past_target = false;
+    for fp in ordered {
+        if *fp == target {
+            past_target = true;
+            continue; // Skip the target itself
+        }
+        if past_target {
+            failpoint::release_failpoint(fp.failpoint_name());
+        }
     }
 }
 
