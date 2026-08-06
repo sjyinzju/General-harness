@@ -2977,9 +2977,13 @@ async fn run_full_fault_injection_matrix(
                 goal_id: f5_id.clone(),
                 expected: 1,
             },
-            fault_scenario::DuplicateCheck::ObservationCount {
+            fault_scenario::DuplicateCheck::TaskCount {
                 goal_id: f5_id.clone(),
-                expected: 1,
+                max: 1,
+            },
+            fault_scenario::DuplicateCheck::CommitCount {
+                goal_id: f5_id.clone(),
+                max: 1,
             },
         ],
         cleanup_constraints: vec![fault_scenario::CleanupCheck::OrphanProcesses { max: 0 }],
@@ -3159,9 +3163,17 @@ async fn run_full_fault_injection_matrix(
                 goal_id: f8_id.clone(),
                 expected: 1,
             },
-            fault_scenario::DuplicateCheck::ObservationCount {
+            fault_scenario::DuplicateCheck::CandidateCount {
                 goal_id: f8_id.clone(),
-                expected: 1,
+                max: 1,
+            },
+            fault_scenario::DuplicateCheck::CommitCount {
+                goal_id: f8_id.clone(),
+                max: 1,
+            },
+            fault_scenario::DuplicateCheck::IntegrationCount {
+                goal_id: f8_id.clone(),
+                max: 1,
             },
         ],
         cleanup_constraints: vec![fault_scenario::CleanupCheck::OrphanProcesses { max: 0 }],

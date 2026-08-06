@@ -169,6 +169,16 @@ impl ReviewOrchestrationService {
         evidence_digest: &str,
     ) -> Result<CandidateSnapshot, CoreError> {
         let candidate_id = format!("cand-{}", Uuid::new_v4());
+
+        // F5: Verification PASS committed (durable), before Candidate is persisted.
+        // The caller has verified the task output; the CandidateSnapshot has NOT
+        // been written to the database yet. This is the correct recovery boundary:
+        // on takeover, Supervisor B detects Verification PASS → recovers by
+        // creating the Candidate exactly once.
+        crate::goal::failpoint::F5_AFTER_VERIFICATION_PASS_COMMITTED_BEFORE_CANDIDATE
+            .hit()
+            .await;
+
         let snapshot = CandidateSnapshot {
             candidate_id: candidate_id.clone(),
             task_id: task_id.into(),
@@ -206,12 +216,6 @@ impl ReviewOrchestrationService {
             .to_string(),
         )
         .await;
-
-        // F5: Verification PASS committed, Candidate durably persisted.
-        // The CandidateSnapshot is committed; Review has NOT been created yet.
-        crate::goal::failpoint::F5_AFTER_VERIFICATION_PASS_COMMITTED_BEFORE_CANDIDATE
-            .hit()
-            .await;
 
         Ok(snapshot)
     }
@@ -780,14 +784,42 @@ impl ReviewOrchestrationService {
             )
             .await;
 
-        // CAS transition to terminal state (attempt any non-terminal → terminal)
+        // CAS transition through all required intermediate states to reach
+        // the terminal decision. The Review FSM requires specific transitions
+        // (Requested→Preparing→Prechecking→Reviewing→Approved), so we walk
+        // forward one step at a time rather than jumping directly.
         let current = self.review_repo.get_request(review_id).await?;
         if let Some(req) = current {
-            if !req.state.is_terminal() && ReviewFsm::can_transition(&req.state, &state) {
-                let _ = self
-                    .review_repo
-                    .transition_state(review_id, &req.state, &state)
-                    .await;
+            if !req.state.is_terminal() {
+                let mut cursor = req.state.clone();
+                // Fast-forward through intermediate states to reach the target
+                let path: &[ReviewState] = match state {
+                    ReviewState::Approved | ReviewState::Rejected | ReviewState::Blocked => &[
+                        ReviewState::Preparing,
+                        ReviewState::Prechecking,
+                        ReviewState::Reviewing,
+                    ],
+                    _ => &[],
+                };
+                for intermediate in path {
+                    if cursor == *intermediate {
+                        continue; // already at this state
+                    }
+                    if ReviewFsm::can_transition(&cursor, intermediate) {
+                        let _ = self
+                            .review_repo
+                            .transition_state(review_id, &cursor, intermediate)
+                            .await;
+                        cursor = intermediate.clone();
+                    }
+                }
+                // Now attempt the final transition to terminal state
+                if ReviewFsm::can_transition(&cursor, &state) {
+                    let _ = self
+                        .review_repo
+                        .transition_state(review_id, &cursor, &state)
+                        .await;
+                }
             }
         }
 

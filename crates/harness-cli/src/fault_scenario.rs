@@ -154,11 +154,13 @@ pub enum DuplicateCheck {
     GoalCount { goal_id: String, expected: i64 },
     PlanCount { goal_id: String, expected: i64 },
     TaskCount { goal_id: String, max: i64 },
+    CandidateCount { goal_id: String, max: i64 },
     CommitCount { goal_id: String, max: i64 },
     IntegrationCount { goal_id: String, max: i64 },
     ObservationCount { goal_id: String, expected: i64 },
     AssessmentCount { goal_id: String, max: i64 },
     EvaluatorInvocations { goal_id: String, max: i64 },
+    ExecutionCount { goal_id: String, max: i64 },
 }
 
 #[derive(Debug, Clone)]
@@ -927,6 +929,46 @@ impl FaultScenarioRunner {
                     DuplicateCheck::TaskCount { goal_id: gid, max } => {
                         let count: i64 = sqlx::query_scalar(
                             "SELECT COUNT(*) FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ?",
+                        )
+                        .bind(gid)
+                        .fetch_one(&db.pool)
+                        .await
+                        .unwrap_or(999);
+                        count <= *max
+                    }
+                    DuplicateCheck::CandidateCount { goal_id: gid, max } => {
+                        let count: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM candidate_snapshots WHERE task_id IN (SELECT materialized_task_id FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ?)",
+                        )
+                        .bind(gid)
+                        .fetch_one(&db.pool)
+                        .await
+                        .unwrap_or(999);
+                        count <= *max
+                    }
+                    DuplicateCheck::CommitCount { goal_id: gid, max } => {
+                        let count: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM commit_candidates WHERE candidate_id IN (SELECT candidate_id FROM candidate_snapshots WHERE task_id IN (SELECT materialized_task_id FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ?))",
+                        )
+                        .bind(gid)
+                        .fetch_one(&db.pool)
+                        .await
+                        .unwrap_or(999);
+                        count <= *max
+                    }
+                    DuplicateCheck::IntegrationCount { goal_id: gid, max } => {
+                        let count: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM integration_requests WHERE goal_id = ?",
+                        )
+                        .bind(gid)
+                        .fetch_one(&db.pool)
+                        .await
+                        .unwrap_or(999);
+                        count <= *max
+                    }
+                    DuplicateCheck::ExecutionCount { goal_id: gid, max } => {
+                        let count: i64 = sqlx::query_scalar(
+                            "SELECT COUNT(*) FROM execution_attempts WHERE task_id IN (SELECT materialized_task_id FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ?)",
                         )
                         .bind(gid)
                         .fetch_one(&db.pool)

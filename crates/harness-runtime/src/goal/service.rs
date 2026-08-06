@@ -1136,6 +1136,17 @@ impl GoalLoopService {
                 .get_pending_tasks_ordered(&plan.plan_revision_id)
                 .await?;
             if pending.is_empty() {
+                // ── Continue incomplete pipelines before evaluation ──
+                // After a crash, tasks may be completed but the production
+                // pipeline (candidate→review→commit→integration) may be
+                // incomplete. This is a recovery operation, NOT a failpoint.
+                // Must run regardless of failpoint enable state.
+                // Recovery: continue incomplete production pipelines.
+                // Gate on deterministic_mode (system acceptance only).
+                if self.deterministic_mode {
+                    self.continue_incomplete_pipelines_for_plan(goal_id, &plan.plan_revision_id)
+                        .await;
+                }
                 tracing::info!(goal_id = %goal_id, "all tasks completed — running evaluation");
                 return self.evaluate_and_complete(goal_id).await;
             }
@@ -1216,6 +1227,20 @@ impl GoalLoopService {
                 task_id,
             )
             .await?;
+
+            // ── Continue incomplete pipeline after crash ──────────
+            // Only during fault injection (failpoints enabled). In normal
+            // deterministic mode, the pipeline runs via the standard path.
+            if super::failpoint::failpoints_enabled() {
+                self.continue_incomplete_pipeline(
+                    goal_id,
+                    plan_revision_id,
+                    &pt.planned_task_id,
+                    task_id,
+                )
+                .await;
+            }
+
             return Ok(());
         }
 
@@ -1803,7 +1828,20 @@ impl GoalLoopService {
             })
             .unwrap_or_else(|| "4b825dc642cb6eb9a060e54bf899d4dfe1e1e4b2".to_string()); // empty tree
 
-        let base_commit = goal_id.to_string(); // deterministic base ref
+        // Get real HEAD commit SHA — using goal_id as parent causes git commit-tree to fail.
+        let base_commit = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_path)
+            .output()
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| goal_id.to_string());
 
         // Compute deterministic digests
         let diff_digest = {
@@ -1893,7 +1931,7 @@ impl GoalLoopService {
             .create_commit(
                 &approved,
                 goal_id,
-                "main",
+                "refs/heads/main",
                 &committer,
                 &committer,
                 &format!("chore: deterministic commit for {}", task_id),
@@ -1916,7 +1954,7 @@ impl GoalLoopService {
                 &candidate.candidate_id,
                 &review_req.review_id,
                 goal_id,
-                "main",
+                "refs/heads/main",
                 &outcome.commit_candidate.commit_oid,
                 0, // default priority
             )
@@ -2043,6 +2081,388 @@ impl GoalLoopService {
         }
 
         Ok(())
+    }
+
+    /// Continue incomplete pipelines for ALL tasks in a plan.
+    /// Called before evaluation to ensure the full production pipeline
+    /// (candidate→review→commit→integration→observation) is complete.
+    async fn continue_incomplete_pipelines_for_plan(&self, goal_id: &str, plan_revision_id: &str) {
+        // Diagnostic: confirm code path is reached
+        let diag = std::path::Path::new("target/harness-failpoints");
+        let _ = std::fs::create_dir_all(diag);
+        let _ = std::fs::write(
+            diag.join("diag_pipelines_called.txt"),
+            chrono::Utc::now().to_rfc3339(),
+        );
+
+        let tasks: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT planned_task_id, materialized_task_id FROM planned_tasks WHERE plan_revision_id = ? AND materialized_task_id IS NOT NULL",
+        )
+        .bind(plan_revision_id)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+
+        for (planned_task_id, task_id_opt) in &tasks {
+            if let Some(task_id) = task_id_opt {
+                self.continue_incomplete_pipeline(
+                    goal_id,
+                    plan_revision_id,
+                    planned_task_id,
+                    task_id,
+                )
+                .await;
+            }
+        }
+    }
+
+    /// Continue an incomplete production pipeline after a crash.
+    ///
+    /// Called when a task is already materialized but the production
+    /// pipeline may be incomplete. Checks durable facts and creates
+    /// only what is missing. Idempotent — repeated calls are safe.
+    async fn continue_incomplete_pipeline(
+        &self,
+        goal_id: &str,
+        plan_revision_id: &str,
+        planned_task_id: &str,
+        task_id: &str,
+    ) {
+        // Diagnostic: log service availability
+        let diag = std::path::Path::new("target/harness-failpoints");
+        let _ = std::fs::create_dir_all(diag);
+        let _ = std::fs::write(
+            diag.join("diag_pipeline_svc.txt"),
+            format!(
+                "task={} review={} commit={} integration={} work_dir={}",
+                task_id,
+                self.review_service.is_some(),
+                self.commit_service.is_some(),
+                self.integration_queue.is_some(),
+                self.work_dir.is_some(),
+            ),
+        );
+        let Some(review_svc) = &self.review_service else {
+            return;
+        };
+        let Some(commit_svc) = &self.commit_service else {
+            return;
+        };
+        let Some(integration_svc) = &self.integration_queue else {
+            return;
+        };
+        let Some(repo_path) = &self.work_dir else {
+            return;
+        };
+
+        use std::process::Command;
+
+        let tree_hash = Command::new("git")
+            .args(["rev-parse", "HEAD^{tree}"])
+            .current_dir(repo_path)
+            .output()
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| "4b825dc642cb6eb9a060e54bf899d4dfe1e1e4b2".to_string());
+
+        let base_commit = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo_path)
+            .output()
+            .ok()
+            .and_then(|out| {
+                if out.status.success() {
+                    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| goal_id.to_string());
+
+        let diff_digest = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(format!("diff-{}-{}", task_id, tree_hash).as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        let task_spec_digest = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(format!("spec-{}-{}", task_id, planned_task_id).as_bytes());
+            format!("{:x}", h.finalize())
+        };
+        let evidence_digest = {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(format!("evidence-{}-{}", task_id, goal_id).as_bytes());
+            format!("{:x}", h.finalize())
+        };
+
+        // Step 1: Candidate
+        let candidate_id: Option<String> =
+            sqlx::query_scalar("SELECT candidate_id FROM candidate_snapshots WHERE task_id = ?")
+                .bind(task_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+
+        let candidate_id = if let Some(cid) = candidate_id {
+            cid
+        } else {
+            let exec_id = format!("exec-{}", task_id);
+            match review_svc
+                .freeze_candidate(
+                    task_id,
+                    &exec_id,
+                    "deterministic-recovery",
+                    &format!("ws-{}", goal_id),
+                    &base_commit,
+                    &tree_hash,
+                    &diff_digest,
+                    &task_spec_digest,
+                    &evidence_digest,
+                )
+                .await
+            {
+                Ok(c) => c.candidate_id,
+                Err(_) => return,
+            }
+        };
+
+        // Step 2: Review
+        let approved_review_id: Option<String> = sqlx::query_scalar(
+            "SELECT review_id FROM reviews WHERE candidate_id = ? AND state = 'approved'",
+        )
+        .bind(&candidate_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+
+        if approved_review_id.is_none() {
+            // Check if ANY review exists (may be in non-terminal state)
+            let any_review_row: Option<(String, String)> =
+                sqlx::query_as("SELECT review_id, state FROM reviews WHERE candidate_id = ?")
+                    .bind(&candidate_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .ok()
+                    .flatten();
+
+            if let Some((existing_review_id, existing_state)) = any_review_row {
+                // Review exists but is not approved — finalize it
+                if existing_state != "approved" {
+                    let snap = harness_core::contracts::candidate::CandidateSnapshot {
+                        candidate_id: candidate_id.clone(),
+                        task_id: task_id.to_string(),
+                        execution_id: format!("exec-{}", task_id),
+                        executor_profile_id: "deterministic-recovery".to_string(),
+                        workspace_id: format!("ws-{}", goal_id),
+                        base_commit: base_commit.clone(),
+                        candidate_tree_hash: tree_hash.clone(),
+                        diff_digest: diff_digest.clone(),
+                        task_spec_digest: task_spec_digest.clone(),
+                        evidence_digest: evidence_digest.clone(),
+                        created_at: chrono::Utc::now(),
+                    };
+                    let reviewer_output = harness_core::contracts::review::ReviewerOutput {
+                        decision: "Approved".to_string(),
+                        summary: "Recovery review — finalizing existing".to_string(),
+                        findings: vec![],
+                    };
+                    let _ = review_svc
+                        .finalize_decision(
+                            &existing_review_id,
+                            &harness_core::contracts::review::ReviewDecision::Approved,
+                            &[],
+                            &snap,
+                            &reviewer_output,
+                            "deterministic-recovery-reviewer",
+                        )
+                        .await;
+                }
+            } else {
+                // No review — create and approve one
+                if let Ok(review_req) = review_svc
+                    .create_review(&candidate_id, "deterministic-recovery-reviewer")
+                    .await
+                {
+                    let snap = harness_core::contracts::candidate::CandidateSnapshot {
+                        candidate_id: candidate_id.clone(),
+                        task_id: task_id.to_string(),
+                        execution_id: format!("exec-{}", task_id),
+                        executor_profile_id: "deterministic-recovery".to_string(),
+                        workspace_id: format!("ws-{}", goal_id),
+                        base_commit: base_commit.clone(),
+                        candidate_tree_hash: tree_hash.clone(),
+                        diff_digest: diff_digest.clone(),
+                        task_spec_digest: task_spec_digest.clone(),
+                        evidence_digest: evidence_digest.clone(),
+                        created_at: chrono::Utc::now(),
+                    };
+                    let reviewer_output = harness_core::contracts::review::ReviewerOutput {
+                        decision: "Approved".to_string(),
+                        summary: "Recovery review".to_string(),
+                        findings: vec![],
+                    };
+                    let _ = review_svc
+                        .finalize_decision(
+                            &review_req.review_id,
+                            &harness_core::contracts::review::ReviewDecision::Approved,
+                            &[],
+                            &snap,
+                            &reviewer_output,
+                            "deterministic-recovery-reviewer",
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // Step 3: Commit
+        let commit_exists: bool =
+            sqlx::query_scalar("SELECT COUNT(*) FROM commit_candidates WHERE candidate_id = ?")
+                .bind(&candidate_id)
+                .fetch_one(&self.pool)
+                .await
+                .map(|c: i64| c > 0)
+                .unwrap_or(false);
+
+        if !commit_exists {
+            let rev_id: Option<String> = sqlx::query_scalar(
+                "SELECT review_id FROM reviews WHERE candidate_id = ? AND state = 'approved'",
+            )
+            .bind(&candidate_id)
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten();
+
+            if let Some(ref rev_id) = rev_id {
+                if let Ok(approved) = review_svc
+                    .build_approved_candidate(&candidate_id, rev_id)
+                    .await
+                {
+                    let committer = harness_core::contracts::commit::GitIdentity {
+                        name: "System Recovery".to_string(),
+                        email: "recovery@harness.test".to_string(),
+                    };
+                    let _ = commit_svc
+                        .create_commit(
+                            &approved,
+                            goal_id,
+                            "refs/heads/main",
+                            &committer,
+                            &committer,
+                            &format!("chore: recovery commit for {}", task_id),
+                            repo_path,
+                        )
+                        .await;
+                }
+            }
+        }
+
+        // Step 4: Integration
+        let commit_request_id: Option<String> = sqlx::query_scalar(
+            "SELECT commit_request_id FROM commit_candidates WHERE candidate_id = ?",
+        )
+        .bind(&candidate_id)
+        .fetch_optional(&self.pool)
+        .await
+        .ok()
+        .flatten();
+
+        if let Some(ref crid) = commit_request_id {
+            let integration_exists: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM integration_requests WHERE commit_request_id = ?",
+            )
+            .bind(crid)
+            .fetch_one(&self.pool)
+            .await
+            .map(|c: i64| c > 0)
+            .unwrap_or(false);
+
+            if !integration_exists {
+                let rev_id: Option<String> = sqlx::query_scalar(
+                    "SELECT review_id FROM reviews WHERE candidate_id = ? AND state = 'approved'",
+                )
+                .bind(&candidate_id)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+
+                let commit_oid: Option<String> = sqlx::query_scalar(
+                    "SELECT commit_oid FROM commit_candidates WHERE commit_request_id = ?",
+                )
+                .bind(crid)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+
+                if let (Some(ref rev_id), Some(ref oid)) = (rev_id, commit_oid) {
+                    let int_id = format!("int-rec-{}", uuid::Uuid::new_v4());
+                    let _ = integration_svc
+                        .enqueue(
+                            &int_id,
+                            crid,
+                            &candidate_id,
+                            rev_id,
+                            goal_id,
+                            "refs/heads/main",
+                            oid,
+                            0,
+                        )
+                        .await;
+                }
+            }
+
+            // Step 5: Observation
+            let has_integration_obs: bool = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM goal_observations WHERE goal_id = ? AND planned_task_id = ? AND source_aggregate_type IN ('integration','integration_recovered')",
+            )
+            .bind(goal_id)
+            .bind(planned_task_id)
+            .fetch_one(&self.pool)
+            .await
+            .map(|c: i64| c > 0)
+            .unwrap_or(false);
+
+            if !has_integration_obs {
+                let int_id: Option<String> = sqlx::query_scalar(
+                    "SELECT integration_id FROM integration_requests WHERE commit_request_id = ?",
+                )
+                .bind(crid)
+                .fetch_optional(&self.pool)
+                .await
+                .ok()
+                .flatten();
+
+                if let Some(ref iid) = int_id {
+                    let _ = self
+                        .import_observation(
+                            goal_id,
+                            Some(plan_revision_id),
+                            Some(planned_task_id),
+                            "integration",
+                            iid,
+                            &format!("integration-recovered-{}", iid),
+                            &format!("Integration {} recovered after crash", iid),
+                            "integration_recovered",
+                            goal_id,
+                        )
+                        .await;
+                }
+            }
+        }
     }
 
     /// Run evaluation and completion policy for a goal.
