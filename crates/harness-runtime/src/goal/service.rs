@@ -2097,6 +2097,10 @@ impl GoalLoopService {
         if !self.deterministic_mode && !super::failpoint::failpoints_enabled() {
             return;
         }
+        // Confirm this function is reached
+        let diag = std::path::Path::new("target/harness-failpoints");
+        let _ = std::fs::create_dir_all(diag);
+        let _ = std::fs::write(diag.join(format!("diag_pipelines_{}.txt", goal_id)), "entered");
         let tasks: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT planned_task_id, materialized_task_id FROM planned_tasks WHERE plan_revision_id = ? AND materialized_task_id IS NOT NULL",
         )
