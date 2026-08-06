@@ -642,6 +642,12 @@ impl GoalLoopService {
 
     /// Import an observation from a source event (Task completion, Review decision,
     /// Commit OID, Integration result). Idempotent by source event.
+    ///
+    /// Returns `ObservationOutcome::Created(id)` if a new observation was inserted,
+    /// or `ObservationOutcome::AlreadyExists(id)` if the observation already existed
+    /// (idempotent duplicate). The UNIQUE index on
+    /// (source_aggregate_type, source_aggregate_id, source_event_id) enforces
+    /// exactly-once semantics at the database level.
     #[allow(clippy::too_many_arguments)]
     pub async fn import_observation(
         &self,
@@ -654,7 +660,7 @@ impl GoalLoopService {
         claim: &str,
         evidence_type: &str,
         repository_head: &str,
-    ) -> Result<String, CoreError> {
+    ) -> Result<ObservationOutcome, CoreError> {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(source_type.as_bytes());
@@ -678,8 +684,9 @@ impl GoalLoopService {
             created_at: Utc::now(),
         };
 
-        // INSERT OR IGNORE handles idempotency by unique index on source
-        self.repo.insert_observation(&obs).await?;
+        // INSERT OR IGNORE handles idempotency by unique index on source.
+        // Return Created or AlreadyExists based on whether rows were affected.
+        let created = self.repo.insert_observation(&obs).await?;
 
         // NOTE: F8 and F9 failpoints were previously hit here in import_observation
         // but that blocked the task materialization path before F4-F7 could be
@@ -687,7 +694,11 @@ impl GoalLoopService {
         // integration enqueue. F9 is hit in evaluate_and_complete before the
         // Evaluator is invoked.
 
-        Ok(obs.observation_id)
+        if created {
+            Ok(ObservationOutcome::Created(obs.observation_id))
+        } else {
+            Ok(ObservationOutcome::AlreadyExists(obs.observation_id))
+        }
     }
 
     // ── Progress Assessment ────────────────────────────────────────
@@ -923,12 +934,16 @@ impl GoalLoopService {
     /// Start a new goal loop iteration and drive it to completion.
     /// Creates a durable GoalLoopRun record and spawns a looping background
     /// task that continues until the goal reaches a terminal state.
+    ///
+    /// The background task's JoinHandle is observed so that panics and
+    /// early exits are logged rather than silently swallowed.
     pub async fn start_loop_run(&self, goal_id: &str) -> Result<String, CoreError> {
         let plan = self.repo.get_active_plan(goal_id).await?;
         let plan_id = plan.as_ref().map(|p| p.plan_revision_id.as_str());
         let run_id = self.repo.create_loop_run(goal_id, plan_id).await?;
 
         let goal_id_owned = goal_id.to_string();
+        let goal_id_for_handle = goal_id.to_string();
         let pool = self.pool.clone();
         let planner = self.goal_planner.clone();
         let evaluator = self.goal_evaluator.clone();
@@ -944,7 +959,7 @@ impl GoalLoopService {
         let work_dir = self.work_dir.clone();
         let deterministic_mode = self.deterministic_mode;
 
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let repo = GoalRepo::new(pool.clone());
             let svc = GoalLoopService {
                 pool,
@@ -1009,6 +1024,34 @@ impl GoalLoopService {
                 }
 
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+
+        // Observe the JoinHandle — log any panic or cancellation.
+        // This prevents silent task failures from hiding recovery bugs.
+        tokio::spawn(async move {
+            match handle.await {
+                Ok(()) => {
+                    tracing::info!(goal_id = %goal_id_for_handle, "goal loop background task completed normally");
+                }
+                Err(join_error) => {
+                    let panic_msg = if join_error.is_panic() {
+                        format!("goal loop panicked: {:?}", join_error)
+                    } else if join_error.is_cancelled() {
+                        format!("goal loop was cancelled: {:?}", join_error)
+                    } else {
+                        format!("goal loop join error: {:?}", join_error)
+                    };
+                    tracing::error!(goal_id = %goal_id_for_handle, error = %panic_msg, "goal loop background task exited abnormally");
+                    // Write diagnostic file so the test harness can detect panic
+                    if let Ok(diag_dir) = std::env::var("HARNESS_DIAG_DIR") {
+                        let _ = std::fs::create_dir_all(&diag_dir);
+                        let _ = std::fs::write(
+                            std::path::Path::new(&diag_dir).join("goal_loop_panic.txt"),
+                            &panic_msg,
+                        );
+                    }
+                }
             }
         });
 
@@ -1127,19 +1170,26 @@ impl GoalLoopService {
         self.import_pending_observations(goal_id, &plan.plan_revision_id)
             .await?;
 
+        // ── Recovery: reconcile incomplete pipelines FIRST ──────────
+        // Based on durable facts (not pending emptiness), continue any
+        // incomplete production pipeline for tasks that have a
+        // materialized_task_id. This ensures that Candidate/Review/Commit/
+        // Integration/Observation recovery happens regardless of whether
+        // the task appears in the pending list.
+        if self.deterministic_mode || super::failpoint::failpoints_enabled() {
+            self.continue_incomplete_pipelines_for_plan(goal_id, &plan.plan_revision_id)
+                .await;
+        }
+
         // Select ready tasks
         let ready_tasks = self.select_ready_tasks(goal_id, 4).await?;
         if ready_tasks.is_empty() {
-            // Check if all tasks are in terminal state
+            // Re-check pending AFTER pipeline reconciliation
             let pending = self
                 .repo
                 .get_pending_tasks_ordered(&plan.plan_revision_id)
                 .await?;
             if pending.is_empty() {
-                if self.deterministic_mode || super::failpoint::failpoints_enabled() {
-                    self.continue_incomplete_pipelines_for_plan(goal_id, &plan.plan_revision_id)
-                        .await;
-                }
                 // Diagnostic: log goal state before evaluation
                 let pre_eval_state = get_goal_state(&self.pool, goal_id).await.ok();
                 let diag = std::path::Path::new("target/harness-failpoints");
@@ -1304,7 +1354,7 @@ impl GoalLoopService {
                     &self.integration_queue,
                 ) {
                     if let Some(ref repo_path) = self.work_dir {
-                        let _ = self
+                        let pipeline_result = self
                             .run_deterministic_production_pipeline(
                                 goal_id,
                                 plan_revision_id,
@@ -1316,6 +1366,15 @@ impl GoalLoopService {
                                 repo_path,
                             )
                             .await;
+                        if let Err(ref e) = pipeline_result {
+                            tracing::error!(goal_id=%goal_id, task_id=%task_id, error=%e, "production pipeline failed (adapter-wired path)");
+                            let diag_dir = std::path::Path::new("target/harness-failpoints");
+                            let _ = std::fs::create_dir_all(diag_dir);
+                            let _ = std::fs::write(
+                                diag_dir.join("diag_pipeline_error_adapter.txt"),
+                                format!("goal={} task={} error={}", goal_id, task_id, e),
+                            );
+                        }
                     }
                 }
             }
@@ -1979,19 +2038,22 @@ impl GoalLoopService {
             .hit()
             .await;
 
-        // Import integration observation
+        // Import integration observation (F8 boundary: IntegrationResult committed)
+        // Use source_aggregate_type = 'integration_result' consistently so that
+        // both recovery paths (recover_goal_observations + continue_incomplete_pipeline)
+        // detect existing observations via the same UNIQUE index key.
         self.import_observation(
             goal_id,
             Some(plan_revision_id),
             Some(planned_task_id),
-            "integration",
+            "integration_result",
             &integration_id,
-            &format!("integration-queued-{}", integration_id),
+            &format!("integration-result-{}", integration_id),
             &format!(
                 "Integration {} enqueued for commit {}",
                 integration_id, outcome.commit_candidate.commit_oid
             ),
-            "integration_queued",
+            "integration_result",
             goal_id,
         )
         .await?;
@@ -2127,6 +2189,10 @@ impl GoalLoopService {
     /// Called when a task is already materialized but the production
     /// pipeline may be incomplete. Checks durable facts and creates
     /// only what is missing. Idempotent — repeated calls are safe.
+    ///
+    /// Every step logs: entered, input IDs, service availability,
+    /// service invocation result, and completion. Errors are NOT
+    /// silently swallowed — they are written to diagnostic files.
     async fn continue_incomplete_pipeline(
         &self,
         goal_id: &str,
@@ -2134,17 +2200,66 @@ impl GoalLoopService {
         planned_task_id: &str,
         task_id: &str,
     ) {
-        let Some(review_svc) = &self.review_service else {
-            return;
+        // ── Step 0: Diagnostics & service availability ────────────
+        let diag_dir = std::path::Path::new("target/harness-failpoints");
+        let _ = std::fs::create_dir_all(diag_dir);
+        let diag_base = format!("diag_recovery_{}_{}", goal_id, task_id);
+
+        let _ = std::fs::write(
+            diag_dir.join(format!("{}_entered.txt", diag_base)),
+            format!(
+                "goal={} plan={} planned_task={} task={} time={}",
+                goal_id,
+                plan_revision_id,
+                planned_task_id,
+                task_id,
+                chrono::Utc::now().to_rfc3339()
+            ),
+        );
+
+        let review_svc = match &self.review_service {
+            Some(svc) => svc,
+            None => {
+                let _ = std::fs::write(
+                    diag_dir.join(format!("{}_err.txt", diag_base)),
+                    "review_service unavailable",
+                );
+                tracing::error!(goal_id=%goal_id, task_id=%task_id, "continue_incomplete_pipeline: review_service unavailable");
+                return;
+            }
         };
-        let Some(commit_svc) = &self.commit_service else {
-            return;
+        let commit_svc = match &self.commit_service {
+            Some(svc) => svc,
+            None => {
+                let _ = std::fs::write(
+                    diag_dir.join(format!("{}_err.txt", diag_base)),
+                    "commit_service unavailable",
+                );
+                tracing::error!(goal_id=%goal_id, task_id=%task_id, "continue_incomplete_pipeline: commit_service unavailable");
+                return;
+            }
         };
-        let Some(integration_svc) = &self.integration_queue else {
-            return;
+        let integration_svc = match &self.integration_queue {
+            Some(svc) => svc,
+            None => {
+                let _ = std::fs::write(
+                    diag_dir.join(format!("{}_err.txt", diag_base)),
+                    "integration_queue unavailable",
+                );
+                tracing::error!(goal_id=%goal_id, task_id=%task_id, "continue_incomplete_pipeline: integration_queue unavailable");
+                return;
+            }
         };
-        let Some(repo_path) = &self.work_dir else {
-            return;
+        let repo_path = match &self.work_dir {
+            Some(p) => p,
+            None => {
+                let _ = std::fs::write(
+                    diag_dir.join(format!("{}_err.txt", diag_base)),
+                    "work_dir unavailable",
+                );
+                tracing::error!(goal_id=%goal_id, task_id=%task_id, "continue_incomplete_pipeline: work_dir unavailable");
+                return;
+            }
         };
 
         use std::process::Command;
@@ -2205,6 +2320,11 @@ impl GoalLoopService {
                 .ok()
                 .flatten();
 
+        let _ = std::fs::write(
+            diag_dir.join(format!("{}_step1_candidate.txt", diag_base)),
+            format!("candidate_exists={}", candidate_id.is_some()),
+        );
+
         let candidate_id = if let Some(cid) = candidate_id {
             cid
         } else {
@@ -2223,14 +2343,19 @@ impl GoalLoopService {
                 )
                 .await
             {
-                Ok(c) => c.candidate_id,
-                Err(e) => {
-                    let diag = std::path::Path::new("target/harness-failpoints");
-                    let _ = std::fs::create_dir_all(diag);
+                Ok(c) => {
                     let _ = std::fs::write(
-                        diag.join("diag_recovery_err.txt"),
+                        diag_dir.join(format!("{}_step1_candidate.txt", diag_base)),
+                        format!("candidate_created={}", c.candidate_id),
+                    );
+                    c.candidate_id
+                }
+                Err(e) => {
+                    let _ = std::fs::write(
+                        diag_dir.join(format!("{}_step1_candidate_err.txt", diag_base)),
                         format!("freeze_candidate: {e}"),
                     );
+                    tracing::error!(goal_id=%goal_id, task_id=%task_id, error=%e, "continue_incomplete_pipeline: freeze_candidate failed");
                     return;
                 }
             }
@@ -2246,6 +2371,11 @@ impl GoalLoopService {
         .ok()
         .flatten();
 
+        let _ = std::fs::write(
+            diag_dir.join(format!("{}_step2_review.txt", diag_base)),
+            format!("approved_review_exists={}", approved_review_id.is_some()),
+        );
+
         if approved_review_id.is_none() {
             // Check if ANY review exists (may be in non-terminal state)
             let any_review_row: Option<(String, String)> =
@@ -2259,6 +2389,10 @@ impl GoalLoopService {
             if let Some((existing_review_id, existing_state)) = any_review_row {
                 // Review exists but is not approved — finalize it
                 if existing_state != "approved" {
+                    let _ = std::fs::write(
+                        diag_dir.join(format!("{}_step2_review.txt", diag_base)),
+                        format!("finalizing_existing_review={} state={}", existing_review_id, existing_state),
+                    );
                     let snap = harness_core::contracts::candidate::CandidateSnapshot {
                         candidate_id: candidate_id.clone(),
                         task_id: task_id.to_string(),
@@ -2288,16 +2422,19 @@ impl GoalLoopService {
                         )
                         .await
                     {
-                        let diag = std::path::Path::new("target/harness-failpoints");
-                        let _ = std::fs::create_dir_all(diag);
                         let _ = std::fs::write(
-                            diag.join("diag_recovery_err.txt"),
+                            diag_dir.join(format!("{}_step2_review_err.txt", diag_base)),
                             format!("finalize_existing: {e}"),
                         );
+                        tracing::error!(goal_id=%goal_id, task_id=%task_id, review_id=%existing_review_id, error=%e, "continue_incomplete_pipeline: finalize_decision (existing) failed");
                     }
                 }
             } else {
                 // No review — create and approve one
+                let _ = std::fs::write(
+                    diag_dir.join(format!("{}_step2_review.txt", diag_base)),
+                    "creating_new_review",
+                );
                 if let Ok(review_req) = review_svc
                     .create_review(&candidate_id, "deterministic-recovery-reviewer")
                     .await
@@ -2331,13 +2468,17 @@ impl GoalLoopService {
                         )
                         .await
                     {
-                        let diag = std::path::Path::new("target/harness-failpoints");
-                        let _ = std::fs::create_dir_all(diag);
                         let _ = std::fs::write(
-                            diag.join("diag_recovery_err.txt"),
+                            diag_dir.join(format!("{}_step2_review_err.txt", diag_base)),
                             format!("finalize_new: {e}"),
                         );
+                        tracing::error!(goal_id=%goal_id, task_id=%task_id, review_id=%review_req.review_id, error=%e, "continue_incomplete_pipeline: finalize_decision (new) failed");
                     }
+                } else {
+                    let _ = std::fs::write(
+                        diag_dir.join(format!("{}_step2_review_err.txt", diag_base)),
+                        "create_review failed",
+                    );
                 }
             }
         }
@@ -2350,6 +2491,11 @@ impl GoalLoopService {
                 .await
                 .map(|c: i64| c > 0)
                 .unwrap_or(false);
+
+        let _ = std::fs::write(
+            diag_dir.join(format!("{}_step3_commit.txt", diag_base)),
+            format!("commit_exists={}", commit_exists),
+        );
 
         if !commit_exists {
             let rev_id: Option<String> = sqlx::query_scalar(
@@ -2370,7 +2516,7 @@ impl GoalLoopService {
                         name: "System Recovery".to_string(),
                         email: "recovery@harness.test".to_string(),
                     };
-                    if let Err(e) = commit_svc
+                    match commit_svc
                         .create_commit(
                             &approved,
                             goal_id,
@@ -2382,14 +2528,31 @@ impl GoalLoopService {
                         )
                         .await
                     {
-                        let diag = std::path::Path::new("target/harness-failpoints");
-                        let _ = std::fs::create_dir_all(diag);
-                        let _ = std::fs::write(
-                            diag.join("diag_recovery_err.txt"),
-                            format!("create_commit: {e}"),
-                        );
+                        Ok(outcome) => {
+                            let _ = std::fs::write(
+                                diag_dir.join(format!("{}_step3_commit.txt", diag_base)),
+                                format!("commit_created oid={} recovered={}", outcome.commit_candidate.commit_oid, outcome.recovered),
+                            );
+                        }
+                        Err(e) => {
+                            let _ = std::fs::write(
+                                diag_dir.join(format!("{}_step3_commit_err.txt", diag_base)),
+                                format!("create_commit: {e}"),
+                            );
+                            tracing::error!(goal_id=%goal_id, task_id=%task_id, error=%e, "continue_incomplete_pipeline: create_commit failed");
+                        }
                     }
+                } else {
+                    let _ = std::fs::write(
+                        diag_dir.join(format!("{}_step3_commit_err.txt", diag_base)),
+                        "build_approved_candidate failed",
+                    );
                 }
+            } else {
+                let _ = std::fs::write(
+                    diag_dir.join(format!("{}_step3_commit_err.txt", diag_base)),
+                    "no approved review for commit",
+                );
             }
         }
 
@@ -2413,6 +2576,11 @@ impl GoalLoopService {
             .map(|c: i64| c > 0)
             .unwrap_or(false);
 
+            let _ = std::fs::write(
+                diag_dir.join(format!("{}_step4_integration.txt", diag_base)),
+                format!("integration_exists={} commit_request_id={}", integration_exists, crid),
+            );
+
             if !integration_exists {
                 let rev_id: Option<String> = sqlx::query_scalar(
                     "SELECT review_id FROM reviews WHERE candidate_id = ? AND state = 'approved'",
@@ -2432,41 +2600,64 @@ impl GoalLoopService {
                 .ok()
                 .flatten();
 
-                if let (Some(ref rev_id), Some(ref oid)) = (rev_id, commit_oid) {
+                let has_rev = rev_id.is_some();
+                let has_oid = commit_oid.is_some();
+
+                if let (Some(ref rev_id_inner), Some(ref oid_inner)) = (&rev_id, &commit_oid) {
                     let int_id = format!("int-rec-{}", uuid::Uuid::new_v4());
-                    if let Err(e) = integration_svc
+                    match integration_svc
                         .enqueue(
                             &int_id,
                             crid,
                             &candidate_id,
-                            rev_id,
+                            rev_id_inner,
                             goal_id,
                             "refs/heads/main",
-                            oid,
+                            oid_inner,
                             0,
                         )
                         .await
                     {
-                        let diag = std::path::Path::new("target/harness-failpoints");
-                        let _ = std::fs::create_dir_all(diag);
-                        let _ = std::fs::write(
-                            diag.join("diag_recovery_err.txt"),
-                            format!("enqueue: {e}"),
-                        );
+                        Ok(_) => {
+                            let _ = std::fs::write(
+                                diag_dir.join(format!("{}_step4_integration.txt", diag_base)),
+                                format!("integration_enqueued id={}", int_id),
+                            );
+                        }
+                        Err(e) => {
+                            let _ = std::fs::write(
+                                diag_dir.join(format!("{}_step4_integration_err.txt", diag_base)),
+                                format!("enqueue: {e}"),
+                            );
+                            tracing::error!(goal_id=%goal_id, task_id=%task_id, error=%e, "continue_incomplete_pipeline: integration enqueue failed");
+                        }
                     }
+                } else {
+                    let _ = std::fs::write(
+                        diag_dir.join(format!("{}_step4_integration_err.txt", diag_base)),
+                        format!("missing rev_id or commit_oid rev={} oid={}", has_rev, has_oid),
+                    );
                 }
             }
 
-            // Step 5: Observation
+            // Step 5: Observation — use atomic idempotent import with
+            // source_aggregate_type = 'integration_result' consistently.
+            // The UNIQUE index on (source_aggregate_type, source_aggregate_id, source_event_id)
+            // guarantees exactly-one observation per integration result.
             let has_integration_obs: bool = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM goal_observations WHERE goal_id = ? AND planned_task_id = ? AND source_aggregate_type IN ('integration','integration_recovered')",
+                "SELECT COUNT(*) FROM goal_observations WHERE goal_id = ? AND source_aggregate_type = 'integration_result' AND source_aggregate_id IN (SELECT integration_id FROM integration_requests WHERE commit_request_id = ?)",
             )
             .bind(goal_id)
-            .bind(planned_task_id)
+            .bind(crid)
             .fetch_one(&self.pool)
             .await
             .map(|c: i64| c > 0)
             .unwrap_or(false);
+
+            let _ = std::fs::write(
+                diag_dir.join(format!("{}_step5_observation.txt", diag_base)),
+                format!("has_integration_obs={}", has_integration_obs),
+            );
 
             if !has_integration_obs {
                 let int_id: Option<String> = sqlx::query_scalar(
@@ -2479,21 +2670,46 @@ impl GoalLoopService {
                 .flatten();
 
                 if let Some(ref iid) = int_id {
-                    let _ = self
+                    match self
                         .import_observation(
                             goal_id,
                             Some(plan_revision_id),
                             Some(planned_task_id),
-                            "integration",
+                            "integration_result",
                             iid,
                             &format!("integration-recovered-{}", iid),
                             &format!("Integration {} recovered after crash", iid),
-                            "integration_recovered",
+                            "integration_result",
                             goal_id,
                         )
-                        .await;
+                        .await
+                    {
+                        Ok(obs_id) => {
+                            let _ = std::fs::write(
+                                diag_dir.join(format!("{}_step5_observation.txt", diag_base)),
+                                format!("observation_imported id={}", obs_id),
+                            );
+                        }
+                        Err(e) => {
+                            let _ = std::fs::write(
+                                diag_dir.join(format!("{}_step5_observation_err.txt", diag_base)),
+                                format!("import_observation: {e}"),
+                            );
+                            tracing::error!(goal_id=%goal_id, task_id=%task_id, integration_id=%iid, error=%e, "continue_incomplete_pipeline: import_observation failed");
+                        }
+                    }
+                } else {
+                    let _ = std::fs::write(
+                        diag_dir.join(format!("{}_step5_observation_err.txt", diag_base)),
+                        "no integration_id found",
+                    );
                 }
             }
+        } else {
+            let _ = std::fs::write(
+                diag_dir.join(format!("{}_step4_integration_err.txt", diag_base)),
+                "no commit_request_id for candidate",
+            );
         }
     }
 

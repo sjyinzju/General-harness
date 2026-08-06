@@ -563,8 +563,10 @@ impl GoalRepo {
 
     // ── Observations ────────────────────────────────────────────────
 
-    pub async fn insert_observation(&self, obs: &GoalObservation) -> Result<(), CoreError> {
-        sqlx::query(
+    /// Insert an observation. Returns `true` if created, `false` if already
+    /// exists (idempotent duplicate suppressed by UNIQUE index).
+    pub async fn insert_observation(&self, obs: &GoalObservation) -> Result<bool, CoreError> {
+        let result = sqlx::query(
             r#"INSERT OR IGNORE INTO goal_observations (observation_id, goal_id,
                plan_revision_id, planned_task_id, source_aggregate_type, source_aggregate_id,
                source_event_id, source_digest, repository_head, claim, evidence_type, created_at)
@@ -585,7 +587,7 @@ impl GoalRepo {
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     // ── Assessments ─────────────────────────────────────────────────

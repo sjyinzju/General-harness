@@ -433,6 +433,11 @@ impl RecoveryOrchestrator {
     /// This handles the crash scenario: Supervisor A integrates a task,
     /// crashes before persisting the GoalObservation, then Supervisor B
     /// takes over and must idempotently import the observation.
+    ///
+    /// Uses the same source_event_id format as the goal loop pipeline
+    /// (`integration-result-{integration_id}`) so that the UNIQUE index
+    /// on (source_aggregate_type, source_aggregate_id, source_event_id)
+    /// prevents duplicates from both recovery paths.
     async fn recover_goal_observations(
         &self,
         _instance_id: &SupervisorInstanceId,
@@ -440,6 +445,8 @@ impl RecoveryOrchestrator {
     ) -> Result<usize, String> {
         // Find integration results that are in 'integrated' state but
         // have no corresponding GoalObservation in the goal_observations table.
+        // Check by source_aggregate_id (integration_id), not event_id, to
+        // catch observations from both the pipeline and recovery paths.
         let missing: Vec<(String, String, String)> = sqlx::query_as(
             r#"SELECT ir.integration_id, ir.candidate_id, ir.result_json
                FROM integration_requests ir
@@ -461,7 +468,7 @@ impl RecoveryOrchestrator {
             let result: serde_json::Value = serde_json::from_str(result_json)
                 .unwrap_or(serde_json::json!({"error": "unparseable"}));
 
-            // Try to find the associated goal and task
+            // Try to find the associated goal and task via the candidate
             let goal_task: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
                 r#"SELECT
                    pt.planned_task_id,
@@ -477,25 +484,61 @@ impl RecoveryOrchestrator {
             .await
             .map_err(|e| format!("lookup goal for candidate: {e}"))?;
 
-            if let Some((_pt_id, Some(goal_id), plan_revision_id)) = goal_task {
+            // Also try via candidate_snapshots → task_id
+            let goal_task_via_candidate: Option<(String, Option<String>, Option<String>)> = if goal_task.is_none() {
+                sqlx::query_as(
+                    r#"SELECT
+                       pt.planned_task_id,
+                       pr.goal_id,
+                       pr.plan_revision_id
+                     FROM candidate_snapshots cs
+                     JOIN planned_tasks pt ON pt.materialized_task_id = cs.task_id
+                     JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id
+                     WHERE cs.candidate_id = ?
+                     LIMIT 1"#,
+                )
+                .bind(_candidate_id)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| format!("lookup goal via candidate_snapshots: {e}"))?
+            } else {
+                None
+            };
+
+            let effective_goal_task = goal_task.or(goal_task_via_candidate);
+
+            if let Some((_pt_id, Some(goal_id), plan_revision_id)) = effective_goal_task {
                 let goal_id_str: String = goal_id;
 
-                // Idempotently insert the observation
+                // Use consistent source_event_id format matching the
+                // goal loop pipeline: integration-result-{integration_id}
+                let event_id = format!("integration-result-{}", _integration_id);
+
+                // Compute source_digest matching import_observation
                 use sha2::{Digest, Sha256};
                 let mut hasher = Sha256::new();
                 hasher.update(b"integration_result");
                 hasher.update(_integration_id.as_bytes());
-                hasher.update(b"recovery");
+                hasher.update(event_id.as_bytes());
+                hasher.update(
+                    result
+                        .get("summary")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("recovered from integration")
+                        .as_bytes(),
+                );
                 let source_digest = format!("{:x}", hasher.finalize());
 
                 let obs_id = format!("obs-recovery-{}", uuid::Uuid::new_v4());
 
+                // INSERT OR IGNORE handles idempotency via the UNIQUE index
+                // on (source_aggregate_type, source_aggregate_id, source_event_id).
                 let insert_result = sqlx::query(
                     r#"INSERT OR IGNORE INTO goal_observations
                        (observation_id, goal_id, plan_revision_id, planned_task_id,
                         source_aggregate_type, source_aggregate_id, source_event_id,
                         source_digest, repository_head, claim, evidence_type, created_at)
-                       VALUES (?, ?, ?, ?, 'integration_result', ?, 'recovery_import',
+                       VALUES (?, ?, ?, ?, 'integration_result', ?, ?,
                                ?, 'recovery', ?, 'integration_result', datetime('now'))"#,
                 )
                 .bind(&obs_id)
@@ -503,6 +546,7 @@ impl RecoveryOrchestrator {
                 .bind(&plan_revision_id)
                 .bind(&_pt_id)
                 .bind(_integration_id)
+                .bind(&event_id)
                 .bind(&source_digest)
                 .bind(
                     result
@@ -520,9 +564,20 @@ impl RecoveryOrchestrator {
                         integration_id = %_integration_id,
                         goal_id = %goal_id_str,
                         observation_id = %obs_id,
-                        "recovered goal observation from integration result"
+                        "recovered goal observation from integration result (Created)"
+                    );
+                } else {
+                    tracing::info!(
+                        integration_id = %_integration_id,
+                        "goal observation already exists for integration result (AlreadyExists)"
                     );
                 }
+            } else {
+                tracing::debug!(
+                    integration_id = %_integration_id,
+                    candidate_id = %_candidate_id,
+                    "no goal/task mapping found for integration result — skipping observation recovery"
+                );
             }
         }
 

@@ -196,7 +196,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             names, expected,
-            "81 business tables expected (001\u{2013}028)"
+            "81 business tables expected (001\u{2013}030)"
         );
     }
 

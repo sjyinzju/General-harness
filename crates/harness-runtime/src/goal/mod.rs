@@ -141,6 +141,30 @@ pub struct GoalObservation {
     pub created_at: DateTime<Utc>,
 }
 
+/// Outcome of an `import_observation` call.
+///
+/// `Created(id)` — a new observation was inserted.
+/// `AlreadyExists(id)` — the observation already existed (idempotent duplicate,
+///   rejected by the UNIQUE index on source_aggregate_type/source_aggregate_id/
+///   source_event_id).
+#[derive(Debug, Clone)]
+pub enum ObservationOutcome {
+    Created(String),
+    AlreadyExists(String),
+}
+
+impl ObservationOutcome {
+    pub fn observation_id(&self) -> &str {
+        match self {
+            Self::Created(id) | Self::AlreadyExists(id) => id,
+        }
+    }
+
+    pub fn is_created(&self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+}
+
 // ── GoalLoopRun ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
