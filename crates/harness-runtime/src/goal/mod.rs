@@ -153,6 +153,15 @@ pub enum ObservationOutcome {
     AlreadyExists(String),
 }
 
+impl std::fmt::Display for ObservationOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Created(id) => write!(f, "created({id})"),
+            Self::AlreadyExists(id) => write!(f, "already_exists({id})"),
+        }
+    }
+}
+
 impl ObservationOutcome {
     pub fn observation_id(&self) -> &str {
         match self {

@@ -26,8 +26,9 @@ use super::repo::GoalRepo;
 use super::validation::{check_completion_gate, validate_plan_proposal};
 use super::{
     ApprovalRequest, ApprovalState, ApprovalType, CriterionStatus, GoalLoopRunState,
-    GoalObservation, GoalRuntimeConfig, PlanProposal, ProfileSeparationError,
-    ProgressAssessmentProposal, ReplanDecision, ReplanTrigger, RoleIsolationPolicy,
+    GoalObservation, GoalRuntimeConfig, ObservationOutcome, PlanProposal,
+    ProfileSeparationError, ProgressAssessmentProposal, ReplanDecision, ReplanTrigger,
+    RoleIsolationPolicy,
 };
 
 use crate::commit::service::ControlledCommitService;
@@ -2684,10 +2685,10 @@ impl GoalLoopService {
                         )
                         .await
                     {
-                        Ok(obs_id) => {
+                        Ok(outcome) => {
                             let _ = std::fs::write(
                                 diag_dir.join(format!("{}_step5_observation.txt", diag_base)),
-                                format!("observation_imported id={}", obs_id),
+                                format!("observation_imported id={} created={}", outcome.observation_id(), outcome.is_created()),
                             );
                         }
                         Err(e) => {
