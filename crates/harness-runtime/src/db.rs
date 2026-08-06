@@ -37,6 +37,16 @@ impl Database {
         // Run migrations
         sqlx::migrate!("./migrations").run(&pool).await?;
 
+        // ── Post-migration schema enhancements (idempotent) ──────
+        // F7: One commit_candidate per candidate_id. Applied here
+        // rather than as a numbered migration to maintain backward
+        // compatibility with databases created before the constraint.
+        let _ = sqlx::query(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_commit_candidate_one_per_candidate ON commit_candidates(candidate_id)",
+        )
+        .execute(&pool)
+        .await;
+
         Ok(Self { pool })
     }
 
@@ -196,7 +206,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             names, expected,
-            "81 business tables expected (001\u{2013}030)"
+            "81 business tables expected (001\u{2013}029)"
         );
     }
 
