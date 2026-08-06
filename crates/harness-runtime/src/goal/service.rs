@@ -960,6 +960,14 @@ impl GoalLoopService {
         let deterministic_mode = self.deterministic_mode;
 
         let handle = tokio::spawn(async move {
+            // Background task entry diagnostic
+            let diag_bt = std::path::Path::new("target/harness-failpoints");
+            let _ = std::fs::create_dir_all(diag_bt);
+            let _ = std::fs::write(
+                diag_bt.join(format!("diag_bg_task_{}.txt", goal_id_owned)),
+                format!("started det={} time={}", deterministic_mode, chrono::Utc::now().to_rfc3339()),
+            );
+
             let repo = GoalRepo::new(pool.clone());
             let svc = GoalLoopService {
                 pool,
@@ -1062,6 +1070,14 @@ impl GoalLoopService {
     /// This is the core orchestration method that coordinates
     /// Planner → Task selection → I4.5 → I4.6 → I5 → Observation → Evaluation.
     pub async fn drive_goal_loop(&self, goal_id: &str) -> Result<(), CoreError> {
+        // Entry diagnostic for crash recovery debugging
+        let diag = std::path::Path::new("target/harness-failpoints");
+        let _ = std::fs::create_dir_all(diag);
+        let _ = std::fs::write(
+            diag.join(format!("diag_drive_{}.txt", goal_id)),
+            format!("entered det={} fp={} time={}", self.deterministic_mode, super::failpoint::failpoints_enabled(), chrono::Utc::now().to_rfc3339()),
+        );
+
         let goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
             CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
         })?;
@@ -2371,7 +2387,7 @@ impl GoalLoopService {
 
         // Step 2: Review
         let approved_review_id: Option<String> = sqlx::query_scalar(
-            "SELECT review_id FROM reviews WHERE candidate_id = ? AND state = 'approved'",
+            "SELECT review_id FROM review_requests WHERE candidate_id = ? AND state = 'approved'",
         )
         .bind(&candidate_id)
         .fetch_optional(&self.pool)
@@ -2387,7 +2403,7 @@ impl GoalLoopService {
         if approved_review_id.is_none() {
             // Check if ANY review exists (may be in non-terminal state)
             let any_review_row: Option<(String, String)> =
-                sqlx::query_as("SELECT review_id, state FROM reviews WHERE candidate_id = ?")
+                sqlx::query_as("SELECT review_id, state FROM review_requests WHERE candidate_id = ?")
                     .bind(&candidate_id)
                     .fetch_optional(&self.pool)
                     .await
@@ -2510,7 +2526,7 @@ impl GoalLoopService {
 
         if !commit_exists {
             let rev_id: Option<String> = sqlx::query_scalar(
-                "SELECT review_id FROM reviews WHERE candidate_id = ? AND state = 'approved'",
+                "SELECT review_id FROM review_requests WHERE candidate_id = ? AND state = 'approved'",
             )
             .bind(&candidate_id)
             .fetch_optional(&self.pool)
@@ -2600,7 +2616,7 @@ impl GoalLoopService {
 
             if !integration_exists {
                 let rev_id: Option<String> = sqlx::query_scalar(
-                    "SELECT review_id FROM reviews WHERE candidate_id = ? AND state = 'approved'",
+                    "SELECT review_id FROM review_requests WHERE candidate_id = ? AND state = 'approved'",
                 )
                 .bind(&candidate_id)
                 .fetch_optional(&self.pool)
@@ -2852,6 +2868,13 @@ impl GoalLoopService {
     /// Called at supervisor startup to recover goals left behind by a
     /// crashed predecessor. Each goal gets its own background loop run.
     pub async fn resume_pending_goals(&self) -> Result<usize, CoreError> {
+        let diag = std::path::Path::new("target/harness-failpoints");
+        let _ = std::fs::create_dir_all(diag);
+        let _ = std::fs::write(
+            diag.join("diag_resume_goals.txt"),
+            format!("called det={} fp={} time={}", self.deterministic_mode, super::failpoint::failpoints_enabled(), chrono::Utc::now().to_rfc3339()),
+        );
+
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT goal_id, state FROM goals WHERE state NOT IN ('succeeded', 'failed', 'cancelled')",
         )
@@ -2866,6 +2889,11 @@ impl GoalLoopService {
         })?;
 
         let count = rows.len();
+        let _ = std::fs::write(
+            std::path::Path::new("target/harness-failpoints").join("diag_resume_goals.txt"),
+            format!("found {} pending goals: {:?} time={}", count, rows.iter().map(|(id,st)| format!("{}={}", id, st)).collect::<Vec<_>>().join(", "), chrono::Utc::now().to_rfc3339()),
+        );
+
         for (goal_id, state) in &rows {
             tracing::info!(
                 goal_id = %goal_id,
@@ -2873,7 +2901,21 @@ impl GoalLoopService {
                 "resuming pending goal at supervisor startup"
             );
             // Start a background loop for each pending goal
-            let _run_id = self.start_loop_run(goal_id).await?;
+            match self.start_loop_run(goal_id).await {
+                Ok(run_id) => {
+                    let _ = std::fs::write(
+                        std::path::Path::new("target/harness-failpoints").join(format!("diag_resume_started_{}.txt", goal_id)),
+                        format!("run_id={} time={}", run_id, chrono::Utc::now().to_rfc3339()),
+                    );
+                }
+                Err(e) => {
+                    let _ = std::fs::write(
+                        std::path::Path::new("target/harness-failpoints").join(format!("diag_resume_err_{}.txt", goal_id)),
+                        format!("error={} time={}", e, chrono::Utc::now().to_rfc3339()),
+                    );
+                    return Err(e);
+                }
+            }
         }
 
         if count > 0 {

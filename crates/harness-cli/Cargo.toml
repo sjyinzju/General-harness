@@ -43,6 +43,10 @@ crossterm = "0.28"
 name = "fk-test"
 path = "src/bin/fk_test.rs"
 
+[[bin]]
+name = "run-fault"
+path = "src/bin/run_fault.rs"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 serde_json = "1"

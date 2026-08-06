@@ -520,11 +520,28 @@ impl GoalRepo {
 
     // ── Goal Loop Runs ──────────────────────────────────────────────
 
+    /// Create or reuse a goal loop run. If an active run already exists
+    /// (from a crashed predecessor supervisor), returns its run_id instead
+    /// of creating a new one. This handles the partial UNIQUE index:
+    /// `idx_goal_loop_one_active_per_goal` WHERE state NOT IN terminal.
     pub async fn create_loop_run(
         &self,
         goal_id: &str,
         plan_revision_id: Option<&str>,
     ) -> Result<String, CoreError> {
+        // Check for existing active run (from a crashed predecessor)
+        let existing: Option<(String,)> = sqlx::query_as(
+            "SELECT run_id FROM goal_loop_runs WHERE goal_id = ? AND state NOT IN ('completed','failed','cancelled') LIMIT 1",
+        )
+        .bind(goal_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        if let Some((existing_run_id,)) = existing {
+            return Ok(existing_run_id);
+        }
+
         let run_id = format!("glr-{}", uuid::Uuid::new_v4());
         sqlx::query(
             r#"INSERT INTO goal_loop_runs (run_id, goal_id, plan_revision_id, state,
