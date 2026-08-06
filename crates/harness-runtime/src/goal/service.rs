@@ -1136,7 +1136,7 @@ impl GoalLoopService {
                 .get_pending_tasks_ordered(&plan.plan_revision_id)
                 .await?;
             if pending.is_empty() {
-                if super::failpoint::failpoints_enabled() {
+                if self.deterministic_mode || super::failpoint::failpoints_enabled() {
                     self.continue_incomplete_pipelines_for_plan(goal_id, &plan.plan_revision_id)
                         .await;
                 }
