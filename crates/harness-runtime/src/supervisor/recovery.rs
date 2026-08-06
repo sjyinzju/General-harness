@@ -485,9 +485,10 @@ impl RecoveryOrchestrator {
             .map_err(|e| format!("lookup goal for candidate: {e}"))?;
 
             // Also try via candidate_snapshots → task_id
-            let goal_task_via_candidate: Option<(String, Option<String>, Option<String>)> = if goal_task.is_none() {
-                sqlx::query_as(
-                    r#"SELECT
+            let goal_task_via_candidate: Option<(String, Option<String>, Option<String>)> =
+                if goal_task.is_none() {
+                    sqlx::query_as(
+                        r#"SELECT
                        pt.planned_task_id,
                        pr.goal_id,
                        pr.plan_revision_id
@@ -496,14 +497,14 @@ impl RecoveryOrchestrator {
                      JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id
                      WHERE cs.candidate_id = ?
                      LIMIT 1"#,
-                )
-                .bind(_candidate_id)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| format!("lookup goal via candidate_snapshots: {e}"))?
-            } else {
-                None
-            };
+                    )
+                    .bind(_candidate_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| format!("lookup goal via candidate_snapshots: {e}"))?
+                } else {
+                    None
+                };
 
             let effective_goal_task = goal_task.or(goal_task_via_candidate);
 

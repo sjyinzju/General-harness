@@ -26,9 +26,8 @@ use super::repo::GoalRepo;
 use super::validation::{check_completion_gate, validate_plan_proposal};
 use super::{
     ApprovalRequest, ApprovalState, ApprovalType, CriterionStatus, GoalLoopRunState,
-    GoalObservation, GoalRuntimeConfig, ObservationOutcome, PlanProposal,
-    ProfileSeparationError, ProgressAssessmentProposal, ReplanDecision, ReplanTrigger,
-    RoleIsolationPolicy,
+    GoalObservation, GoalRuntimeConfig, ObservationOutcome, PlanProposal, ProfileSeparationError,
+    ProgressAssessmentProposal, ReplanDecision, ReplanTrigger, RoleIsolationPolicy,
 };
 
 use crate::commit::service::ControlledCommitService;
@@ -1204,7 +1203,12 @@ impl GoalLoopService {
                 let post_eval_state = get_goal_state(&self.pool, goal_id).await.ok();
                 let _ = std::fs::write(
                     diag.join("diag_post_eval.txt"),
-                    format!("goal={} state={:?} result={:?}", goal_id, post_eval_state, eval_result.is_ok()),
+                    format!(
+                        "goal={} state={:?} result={:?}",
+                        goal_id,
+                        post_eval_state,
+                        eval_result.is_ok()
+                    ),
                 );
                 return eval_result;
             }
@@ -2163,7 +2167,10 @@ impl GoalLoopService {
         // Confirm this function is reached
         let diag = std::path::Path::new("target/harness-failpoints");
         let _ = std::fs::create_dir_all(diag);
-        let _ = std::fs::write(diag.join(format!("diag_pipelines_{}.txt", goal_id)), "entered");
+        let _ = std::fs::write(
+            diag.join(format!("diag_pipelines_{}.txt", goal_id)),
+            "entered",
+        );
         let tasks: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT planned_task_id, materialized_task_id FROM planned_tasks WHERE plan_revision_id = ? AND materialized_task_id IS NOT NULL",
         )
@@ -2392,7 +2399,10 @@ impl GoalLoopService {
                 if existing_state != "approved" {
                     let _ = std::fs::write(
                         diag_dir.join(format!("{}_step2_review.txt", diag_base)),
-                        format!("finalizing_existing_review={} state={}", existing_review_id, existing_state),
+                        format!(
+                            "finalizing_existing_review={} state={}",
+                            existing_review_id, existing_state
+                        ),
                     );
                     let snap = harness_core::contracts::candidate::CandidateSnapshot {
                         candidate_id: candidate_id.clone(),
@@ -2532,7 +2542,10 @@ impl GoalLoopService {
                         Ok(outcome) => {
                             let _ = std::fs::write(
                                 diag_dir.join(format!("{}_step3_commit.txt", diag_base)),
-                                format!("commit_created oid={} recovered={}", outcome.commit_candidate.commit_oid, outcome.recovered),
+                                format!(
+                                    "commit_created oid={} recovered={}",
+                                    outcome.commit_candidate.commit_oid, outcome.recovered
+                                ),
                             );
                         }
                         Err(e) => {
@@ -2579,7 +2592,10 @@ impl GoalLoopService {
 
             let _ = std::fs::write(
                 diag_dir.join(format!("{}_step4_integration.txt", diag_base)),
-                format!("integration_exists={} commit_request_id={}", integration_exists, crid),
+                format!(
+                    "integration_exists={} commit_request_id={}",
+                    integration_exists, crid
+                ),
             );
 
             if !integration_exists {
@@ -2636,7 +2652,10 @@ impl GoalLoopService {
                 } else {
                     let _ = std::fs::write(
                         diag_dir.join(format!("{}_step4_integration_err.txt", diag_base)),
-                        format!("missing rev_id or commit_oid rev={} oid={}", has_rev, has_oid),
+                        format!(
+                            "missing rev_id or commit_oid rev={} oid={}",
+                            has_rev, has_oid
+                        ),
                     );
                 }
             }
@@ -2688,7 +2707,11 @@ impl GoalLoopService {
                         Ok(outcome) => {
                             let _ = std::fs::write(
                                 diag_dir.join(format!("{}_step5_observation.txt", diag_base)),
-                                format!("observation_imported id={} created={}", outcome.observation_id(), outcome.is_created()),
+                                format!(
+                                    "observation_imported id={} created={}",
+                                    outcome.observation_id(),
+                                    outcome.is_created()
+                                ),
                             );
                         }
                         Err(e) => {
