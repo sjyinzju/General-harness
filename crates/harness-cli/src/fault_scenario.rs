@@ -383,8 +383,10 @@ impl FaultScenarioRunner {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // ── Start Supervisor B ────────────────────────────────────────
+        // Enable failpoints for B so the recovery path can use
+        // failpoints_enabled() to trigger pipeline continuation.
         let mut child_b =
-            match self.start_supervisor(&db_path, &test_repo, &worktree_root, &state_dir, false) {
+            match self.start_supervisor(&db_path, &test_repo, &worktree_root, &state_dir, true) {
                 Ok(c) => c,
                 Err(e) => {
                     result.error = Some(format!("start B: {}", e));

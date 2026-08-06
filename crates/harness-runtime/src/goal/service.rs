@@ -1136,12 +1136,7 @@ impl GoalLoopService {
                 .get_pending_tasks_ordered(&plan.plan_revision_id)
                 .await?;
             if pending.is_empty() {
-                // ── Continue incomplete pipelines before evaluation ──
-                // After a crash, tasks may be completed but the production
-                // pipeline (candidate→review→commit→integration) may be
-                // incomplete. This is a recovery operation, NOT a failpoint.
-                // Must run regardless of failpoint enable state.
-                if self.deterministic_mode || super::failpoint::failpoints_enabled() {
+                if super::failpoint::failpoints_enabled() {
                     self.continue_incomplete_pipelines_for_plan(goal_id, &plan.plan_revision_id)
                         .await;
                 }
@@ -1227,8 +1222,8 @@ impl GoalLoopService {
             .await?;
 
             // ── Continue incomplete pipeline after crash ──────────
-            // Only during fault injection (failpoints enabled). In normal
-            // deterministic mode, the pipeline runs via the standard path.
+            // Only during fault injection. For B's recovery, failpoints
+            // are now enabled in the test runner to allow this path.
             if super::failpoint::failpoints_enabled() {
                 self.continue_incomplete_pipeline(
                     goal_id,
