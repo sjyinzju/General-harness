@@ -2260,18 +2260,27 @@ async fn run_pilot_goal(
                 .bind(&goal_id).fetch_one(&db.pool).await.unwrap_or(0);
             let approved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM review_decisions WHERE decision = 'approved' AND review_id IN (SELECT review_id FROM review_requests WHERE candidate_id IN (SELECT candidate_id FROM candidate_snapshots WHERE task_id IN (SELECT materialized_task_id FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ?)))")
                 .bind(&goal_id).fetch_one(&db.pool).await.unwrap_or(0);
-            let commits: i64 =
-                sqlx::query_scalar("SELECT COUNT(*) FROM commit_candidates WHERE goal_id = ?")
-                    .bind(&goal_id)
-                    .fetch_one(&db.pool)
-                    .await
-                    .unwrap_or(0);
+            let commits: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM commit_candidates WHERE repository_id = ?",
+            )
+            .bind(&goal_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap_or(0);
+            let integ: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM integration_requests WHERE repository_id = ?",
+            )
+            .bind(&goal_id)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap_or(0);
             let pipeline_ok = plan_count > 0
                 && total > 0
                 && completed >= total
                 && cand > 0
                 && approved > 0
-                && commits > 0;
+                && commits > 0
+                && integ > 0;
             if pipeline_ok {
                 sqlx::query("UPDATE goals SET state = 'succeeded' WHERE goal_id = ?")
                     .bind(&goal_id)
