@@ -2301,7 +2301,7 @@ fn make_pilot_goal_spec(
         non_goals: vec![],
         budget: harness_core::contracts::goal::GoalBudget {
             max_plan_revisions: 3,
-            max_total_tasks: 2,
+            max_total_tasks: 1,
             max_active_tasks: 1,
             max_consecutive_failures: 5,
             max_no_progress_iterations: 20,

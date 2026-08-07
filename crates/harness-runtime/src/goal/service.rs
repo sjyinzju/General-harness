@@ -1467,6 +1467,20 @@ impl GoalLoopService {
                         )
                         .await?;
 
+                        // Create execution_attempts row so the production pipeline
+                        // (candidate_snapshots FK) can reference it. Without this row,
+                        // freeze_candidate fails with FK violation.
+                        let exec_id = format!("exec-{}", task_id);
+                        sqlx::query(
+                            "INSERT OR IGNORE INTO execution_attempts (id, task_id, attempt_number, lifecycle, profile_id) VALUES (?, ?, 1, 'completed', ?)",
+                        )
+                        .bind(&exec_id)
+                        .bind(&task_id)
+                        .bind(self.direct_profile.as_ref().map(|p| p.id.as_str()).unwrap_or("claude-default-deepseek"))
+                        .execute(&self.pool)
+                        .await
+                        .ok();
+
                         // ── PRODUCTION PIPELINE (real mode) ──────────
                         // Run the full production pipeline: Candidate → Review →
                         // Commit → Integration. This is the SAME pipeline used
