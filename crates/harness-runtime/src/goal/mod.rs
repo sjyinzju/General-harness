@@ -11,8 +11,12 @@ pub mod repo;
 pub mod service;
 pub mod validation;
 
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
+use harness_core::contracts::agent_adapter::AgentAdapter;
 use harness_core::contracts::goal::GoalId;
+use harness_core::contracts::runtime_profile::RuntimeProfile;
 use serde::{Deserialize, Serialize};
 
 /// Default schema version for structured LLM output when the LLM omits it.
@@ -564,4 +568,93 @@ pub struct RoleInvocation {
     pub completed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Terminal state: "completed", "failed", "timeout", "cancelled".
     pub terminal_state: Option<String>,
+}
+
+// ── RoleRuntimeRouter ───────────────────────────────────────────────────
+
+/// Typed runtime routing for the four production roles.
+///
+/// Each role routes through the production `AgentAdapter` abstraction.
+/// The ONLY difference between deterministic and real runtime is the
+/// Adapter implementation — there are NOT two separate business state
+/// machines or orchestration chains.
+///
+/// # Role routing
+///
+/// | Role     | Adapter       | Profile         | Session Mode |
+/// |----------|---------------|-----------------|--------------|
+/// | Planner  | AgentAdapter  | planner_profile | fresh        |
+/// | Executor | AgentAdapter  | executor_profile| fresh        |
+/// | Reviewer | AgentAdapter  | reviewer_profile| fresh        |
+/// | Evaluator| AgentAdapter  | evaluator_profile| fresh       |
+///
+/// All four roles use `session_mode = fresh` with `resume_requested = false`.
+#[derive(Clone)]
+pub struct RoleRuntimeRouter {
+    /// Adapter shared across all roles (fresh session per invocation).
+    pub adapter: Arc<dyn AgentAdapter>,
+    /// Profile for the Planner role.
+    pub planner_profile: RuntimeProfile,
+    /// Profile for the Executor role.
+    pub executor_profile: RuntimeProfile,
+    /// Profile for the Reviewer role.
+    pub reviewer_profile: RuntimeProfile,
+    /// Profile for the Evaluator role.
+    pub evaluator_profile: RuntimeProfile,
+}
+
+impl std::fmt::Debug for RoleRuntimeRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RoleRuntimeRouter")
+            .field("adapter_kind", &self.adapter.kind())
+            .field("planner_profile", &self.planner_profile.id)
+            .field("executor_profile", &self.executor_profile.id)
+            .field("reviewer_profile", &self.reviewer_profile.id)
+            .field("evaluator_profile", &self.evaluator_profile.id)
+            .finish()
+    }
+}
+
+impl RoleRuntimeRouter {
+    /// Create a new router with distinct profiles per role.
+    /// All four roles share the same adapter but use independent sessions.
+    pub fn new(
+        adapter: Arc<dyn AgentAdapter>,
+        planner_profile: RuntimeProfile,
+        executor_profile: RuntimeProfile,
+        reviewer_profile: RuntimeProfile,
+        evaluator_profile: RuntimeProfile,
+    ) -> Self {
+        Self {
+            adapter,
+            planner_profile,
+            executor_profile,
+            reviewer_profile,
+            evaluator_profile,
+        }
+    }
+
+    /// Create a single-profile router (all roles share one profile).
+    /// Sessions are still independent — this is the IsolatedSessions policy.
+    pub fn single_profile(adapter: Arc<dyn AgentAdapter>, profile: RuntimeProfile) -> Self {
+        Self {
+            adapter,
+            planner_profile: profile.clone(),
+            executor_profile: profile.clone(),
+            reviewer_profile: profile.clone(),
+            evaluator_profile: profile,
+        }
+    }
+
+    /// Check if this router satisfies StrictProfileDiversity (all four profiles distinct).
+    pub fn is_strictly_diverse(&self) -> bool {
+        let ids = [
+            &self.planner_profile.id,
+            &self.executor_profile.id,
+            &self.reviewer_profile.id,
+            &self.evaluator_profile.id,
+        ];
+        let set: std::collections::HashSet<_> = ids.iter().collect();
+        set.len() == ids.len()
+    }
 }

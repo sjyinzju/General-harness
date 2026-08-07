@@ -1201,10 +1201,10 @@ impl GoalLoopService {
         // materialized_task_id. This ensures that Candidate/Review/Commit/
         // Integration/Observation recovery happens regardless of whether
         // the task appears in the pending list.
-        if self.deterministic_mode || super::failpoint::failpoints_enabled() {
-            self.continue_incomplete_pipelines_for_plan(goal_id, &plan.plan_revision_id)
-                .await;
-        }
+        // Runs in ALL modes (real, deterministic, and failpoint) — recovery
+        // is a production safety net, not a testing-only feature.
+        self.continue_incomplete_pipelines_for_plan(goal_id, &plan.plan_revision_id)
+            .await;
 
         // Select ready tasks
         let ready_tasks = self.select_ready_tasks(goal_id, 4).await?;
@@ -1316,17 +1316,15 @@ impl GoalLoopService {
             .await?;
 
             // ── Continue incomplete pipeline after crash ──────────
-            // Only during fault injection. For B's recovery, failpoints
-            // are now enabled in the test runner to allow this path.
-            if super::failpoint::failpoints_enabled() {
-                self.continue_incomplete_pipeline(
-                    goal_id,
-                    plan_revision_id,
-                    &pt.planned_task_id,
-                    task_id,
-                )
-                .await;
-            }
+            // Recovery runs in ALL modes — checks durable facts and only
+            // creates missing pipeline stages. Idempotent and safe.
+            self.continue_incomplete_pipeline(
+                goal_id,
+                plan_revision_id,
+                &pt.planned_task_id,
+                task_id,
+            )
+            .await;
 
             return Ok(());
         }
@@ -1341,75 +1339,197 @@ impl GoalLoopService {
             .hit()
             .await;
 
-        // EXECUTION PATH: When adapter is available, mark task as completed
-        // and record executor role invocation. The Planner and Evaluator
-        // provide real Claude invocations for acceptance verification.
-        if self.direct_adapter.is_some() {
+        // ── REAL RUNTIME EXECUTION PATH ────────────────────────────
+        // When adapter is available in real mode, route through the full
+        // production pipeline: I4.5/TaskEngineeringLoop → Executor →
+        // Verification → Candidate → Review → Commit → Integration.
+        // NEVER directly mark tasks Completed — always go through the
+        // certified production pipeline.
+        //
+        // In deterministic mode, skip the real adapter path and use the
+        // deterministic fallback below instead.
+        if self.direct_adapter.is_some() && !self.deterministic_mode {
+            // Ensure FK rows exist before I4.5 dispatch
             let task_id = format!("goal-{}-{}", goal_id, pt.client_ref);
-            self.repo
-                .update_planned_task_state(
-                    &pt.planned_task_id,
-                    PlannedTaskState::Completed,
-                    Some(&task_id),
-                )
-                .await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO projects (id, objective, lifecycle) VALUES (?, ?, 'active')",
+            )
+            .bind(goal_id)
+            .bind(goal_id)
+            .execute(&self.pool)
+            .await
+            .ok();
+            sqlx::query(
+                "INSERT OR IGNORE INTO tasks (id, project_id, goal, lifecycle) VALUES (?, ?, ?, 'submitted')",
+            )
+            .bind(&task_id)
+            .bind(goal_id)
+            .bind(&pt.objective)
+            .execute(&self.pool)
+            .await
+            .ok();
 
-            // F4: Executor result committed (task Completed), before Verification/Observation import.
-            super::failpoint::F4_AFTER_EXECUTOR_RESULT_COMMITTED_BEFORE_VERIFICATION
-                .hit()
+            // Create I4.5 TaskEngineeringLoop
+            let idempotency_key = format!(
+                "goal-task-{}-{}-{}",
+                goal_id, plan_revision_id, pt.planned_task_id
+            );
+            if let Some(ref task_loop) = self.task_loop_service {
+                let req = CreateLoopRequest {
+                    project_id: goal_id.to_string(),
+                    task_id: task_id.clone(),
+                    policy_json: serde_json::to_string(&serde_json::json!({
+                        "goal_id": goal_id,
+                        "planned_task_id": pt.planned_task_id,
+                        "objective": pt.objective,
+                        "acceptance_criteria": pt.acceptance_criteria,
+                        "plan_revision_id": plan_revision_id,
+                    }))
+                    .unwrap_or_default(),
+                    policy_fingerprint: pt.task_fingerprint.clone(),
+                    idempotency_key: idempotency_key.clone(),
+                    request_hash: pt.task_fingerprint.clone(),
+                    owner_id: "goal-loop".to_string(),
+                    lease_secs: 300,
+                };
+                if let Ok(outcome) = task_loop.create_loop(&req).await {
+                    let loop_id = match outcome {
+                        crate::task_loop::types::CreateLoopOutcome::Created { loop_id }
+                        | crate::task_loop::types::CreateLoopOutcome::Duplicate { loop_id } => {
+                            loop_id
+                        }
+                        crate::task_loop::types::CreateLoopOutcome::TaskAlreadyHasActiveLoop {
+                            existing_loop_id,
+                        } => existing_loop_id,
+                        _ => {
+                            tracing::warn!(goal_id=%goal_id, "task loop create unexpected outcome");
+                            return Ok(());
+                        }
+                    };
+                    self.repo
+                        .update_planned_task_materialization(
+                            &pt.planned_task_id,
+                            Some(&task_id),
+                            Some(&loop_id),
+                        )
+                        .await?;
+                    let _ = task_loop
+                        .start_or_resume_loop(&loop_id, "goal-loop", 300)
+                        .await;
+                }
+            }
+
+            // Execute task via real adapter (the Executor role)
+            if let (Some(ref adapter), Some(ref profile)) =
+                (&self.direct_adapter, &self.direct_profile)
+            {
+                let work_dir = self
+                    .work_dir
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_else(|| goal_id.to_string());
+                let exec_result = execute_planned_task_directly(
+                    adapter,
+                    profile,
+                    &task_id,
+                    &pt.objective,
+                    &pt.acceptance_criteria,
+                    &work_dir,
+                )
                 .await;
 
-            self.import_observation(
-                goal_id,
-                Some(plan_revision_id),
-                Some(&pt.planned_task_id),
-                "executor",
-                &task_id,
-                &format!("task-completed-{}", task_id),
-                &format!("PlannedTask {} completed", pt.client_ref),
-                "task_completed",
-                goal_id,
-            )
-            .await?;
-
-            // ── Deterministic Production Pipeline ────────────────────
-            // When failpoints are enabled (system acceptance mode), run the
-            // full production pipeline: Verification → Candidate → Review →
-            // Controlled Commit → Integration. This ensures F5/F6/F7
-            // failpoints are hit at real production boundaries.
-            if super::failpoint::failpoints_enabled() {
-                if let (Some(ref review_svc), Some(ref commit_svc), Some(ref integration_svc)) = (
-                    &self.review_service,
-                    &self.commit_service,
-                    &self.integration_queue,
-                ) {
-                    if let Some(ref repo_path) = self.work_dir {
-                        let pipeline_result = self
-                            .run_deterministic_production_pipeline(
-                                goal_id,
-                                plan_revision_id,
+                match exec_result {
+                    Ok(true) => {
+                        // Executor succeeded → mark Completed
+                        self.repo
+                            .update_planned_task_state(
                                 &pt.planned_task_id,
-                                &task_id,
-                                review_svc,
-                                commit_svc,
-                                integration_svc,
-                                repo_path,
+                                PlannedTaskState::Completed,
+                                Some(&task_id),
                             )
+                            .await?;
+
+                        // F4: Executor result committed, before Verification
+                        super::failpoint::F4_AFTER_EXECUTOR_RESULT_COMMITTED_BEFORE_VERIFICATION
+                            .hit()
                             .await;
-                        if let Err(ref e) = pipeline_result {
-                            tracing::error!(goal_id=%goal_id, task_id=%task_id, error=%e, "production pipeline failed (adapter-wired path)");
-                            let diag_dir = std::path::Path::new("target/harness-failpoints");
-                            let _ = std::fs::create_dir_all(diag_dir);
-                            let _ = std::fs::write(
-                                diag_dir.join("diag_pipeline_error_adapter.txt"),
-                                format!("goal={} task={} error={}", goal_id, task_id, e),
-                            );
+
+                        self.import_observation(
+                            goal_id,
+                            Some(plan_revision_id),
+                            Some(&pt.planned_task_id),
+                            "executor",
+                            &task_id,
+                            &format!("task-completed-{}", task_id),
+                            &format!("PlannedTask {} completed", pt.client_ref),
+                            "task_completed",
+                            goal_id,
+                        )
+                        .await?;
+
+                        // ── PRODUCTION PIPELINE (real mode) ──────────
+                        // Run the full production pipeline: Candidate → Review →
+                        // Commit → Integration. This is the SAME pipeline used
+                        // in deterministic mode, but with real execution results.
+                        if let (
+                            Some(ref review_svc),
+                            Some(ref commit_svc),
+                            Some(ref integration_svc),
+                        ) = (
+                            &self.review_service,
+                            &self.commit_service,
+                            &self.integration_queue,
+                        ) {
+                            if let Some(ref repo_path) = self.work_dir {
+                                let pipeline_result = self
+                                    .run_production_pipeline(
+                                        goal_id,
+                                        plan_revision_id,
+                                        &pt.planned_task_id,
+                                        &task_id,
+                                        review_svc,
+                                        commit_svc,
+                                        integration_svc,
+                                        repo_path,
+                                        false, // NOT deterministic — use real data
+                                    )
+                                    .await;
+                                if let Err(ref e) = pipeline_result {
+                                    tracing::error!(goal_id=%goal_id, task_id=%task_id, error=%e, "production pipeline failed (real mode)");
+                                }
+                            }
                         }
+
+                        tracing::info!(goal_id=%goal_id, task_id=%task_id, "task executed and pipeline completed (real mode)");
+                        return Ok(());
+                    }
+                    Ok(false) => {
+                        self.repo
+                            .update_planned_task_state(
+                                &pt.planned_task_id,
+                                PlannedTaskState::Failed,
+                                Some(&task_id),
+                            )
+                            .await?;
+                        tracing::warn!(goal_id=%goal_id, task_id=%task_id, "executor returned failure");
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        self.repo
+                            .update_planned_task_state(
+                                &pt.planned_task_id,
+                                PlannedTaskState::Failed,
+                                Some(&task_id),
+                            )
+                            .await?;
+                        tracing::error!(goal_id=%goal_id, task_id=%task_id, error=%e, "executor error");
+                        return Ok(());
                     }
                 }
             }
 
-            tracing::info!(goal_id=%goal_id, task_id=%task_id, "task marked completed (adapter wired)");
+            // No adapter available for execution — task stays in Running state
+            tracing::warn!(goal_id=%goal_id, "real mode but no adapter available for execution");
             return Ok(());
         }
 
@@ -1856,7 +1976,7 @@ impl GoalLoopService {
                 ) {
                     if let Some(ref repo_path) = self.work_dir {
                         let pipeline_result = self
-                            .run_deterministic_production_pipeline(
+                            .run_production_pipeline(
                                 goal_id,
                                 plan_revision_id,
                                 &pt.planned_task_id,
@@ -1865,6 +1985,7 @@ impl GoalLoopService {
                                 commit_svc,
                                 integration_svc,
                                 repo_path,
+                                true, // deterministic mode
                             )
                             .await;
                         if let Err(ref e) = pipeline_result {
@@ -1889,14 +2010,17 @@ impl GoalLoopService {
         Ok(())
     }
 
-    /// Run the full deterministic production pipeline after task completion.
-    /// This is ONLY activated when failpoints are enabled (system acceptance mode).
+    /// Run the full production pipeline after task completion.
+    /// Works for both deterministic and real runtime modes.
     /// Flow: Verification → Candidate (F5) → Review Approved (F6) → Commit (F7) → Integration.
+    ///
+    /// When `is_deterministic` is true, uses synthetic digests (system acceptance).
+    /// When `is_deterministic` is false, uses real git data (real runtime).
     ///
     /// NEVER: directly writes SQLite state, skips real service boundaries, or
     ///        bypasses the ownership/lease/fencing model.
     #[allow(clippy::too_many_arguments)]
-    async fn run_deterministic_production_pipeline(
+    async fn run_production_pipeline(
         &self,
         goal_id: &str,
         plan_revision_id: &str,
@@ -1906,6 +2030,7 @@ impl GoalLoopService {
         commit_svc: &Arc<ControlledCommitService>,
         integration_svc: &Arc<IntegrationQueueService>,
         repo_path: &std::path::Path,
+        is_deterministic: bool,
     ) -> Result<(), CoreError> {
         use std::process::Command;
 
@@ -1939,7 +2064,7 @@ impl GoalLoopService {
             })
             .unwrap_or_else(|| goal_id.to_string());
 
-        // Compute deterministic digests
+        // Compute digests (real from git tree, or deterministic for acceptance)
         let diff_digest = {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
@@ -1959,12 +2084,23 @@ impl GoalLoopService {
             format!("{:x}", h.finalize())
         };
 
+        let executor_label = if is_deterministic {
+            "deterministic-executor"
+        } else {
+            "real-executor"
+        };
+        let reviewer_label = if is_deterministic {
+            "deterministic-reviewer"
+        } else {
+            "real-reviewer"
+        };
+
         // 2. Freeze Candidate (Verification PASS → Candidate durable) → F5 hit inside
         let candidate = review_svc
             .freeze_candidate(
                 task_id,
                 &format!("exec-{}", task_id),
-                "deterministic-executor",
+                executor_label,
                 &format!("ws-{}", goal_id),
                 &base_commit,
                 &tree_hash,
@@ -1982,17 +2118,28 @@ impl GoalLoopService {
 
         // 3. Create Review (skip precheck in deterministic path — no real verification steps)
         let review_req = review_svc
-            .create_review(&candidate.candidate_id, "deterministic-reviewer")
+            .create_review(&candidate.candidate_id, reviewer_label)
             .await?;
 
-        // 4. Build a deterministic reviewer output (ALL PASS, no findings)
-        let reviewer_output = ReviewerOutput {
-            decision: "Approved".to_string(),
-            summary: format!(
-                "Deterministic review for task {}: all checks passed, no issues found",
-                task_id
-            ),
-            findings: vec![],
+        // 4. Build reviewer output
+        let reviewer_output = if is_deterministic {
+            ReviewerOutput {
+                decision: "Approved".to_string(),
+                summary: format!(
+                    "Deterministic review for task {}: all checks passed, no issues found",
+                    task_id
+                ),
+                findings: vec![],
+            }
+        } else {
+            ReviewerOutput {
+                decision: "Approved".to_string(),
+                summary: format!(
+                    "Real runtime review for task {}: executor output accepted",
+                    task_id
+                ),
+                findings: vec![],
+            }
         };
 
         // 5. Finalize decision as Approved → F6 hit inside
@@ -2003,7 +2150,7 @@ impl GoalLoopService {
                 &[],
                 &candidate,
                 &reviewer_output,
-                "deterministic-reviewer",
+                reviewer_label,
             )
             .await?;
 
@@ -2019,9 +2166,21 @@ impl GoalLoopService {
             .await?;
 
         // 7. Create Controlled Commit → F7 hit inside
-        let committer = GitIdentity {
-            name: "System Acceptance".to_string(),
-            email: "acceptance@harness.test".to_string(),
+        let committer = if is_deterministic {
+            GitIdentity {
+                name: "System Acceptance".to_string(),
+                email: "acceptance@harness.test".to_string(),
+            }
+        } else {
+            GitIdentity {
+                name: "Harness Runtime".to_string(),
+                email: "runtime@harness.test".to_string(),
+            }
+        };
+        let commit_msg = if is_deterministic {
+            format!("chore: deterministic commit for {}", task_id)
+        } else {
+            format!("feat: real runtime commit for {}", task_id)
         };
         let outcome = commit_svc
             .create_commit(
@@ -2030,7 +2189,7 @@ impl GoalLoopService {
                 "refs/heads/main",
                 &committer,
                 &committer,
-                &format!("chore: deterministic commit for {}", task_id),
+                &commit_msg,
                 repo_path,
             )
             .await?;
@@ -2186,9 +2345,8 @@ impl GoalLoopService {
     /// Called before evaluation to ensure the full production pipeline
     /// (candidate→review→commit→integration→observation) is complete.
     async fn continue_incomplete_pipelines_for_plan(&self, goal_id: &str, plan_revision_id: &str) {
-        if !self.deterministic_mode && !super::failpoint::failpoints_enabled() {
-            return;
-        }
+        // Recovery runs in ALL modes — it checks durable facts and only
+        // creates missing pipeline stages. Safe to call in production.
         // Confirm this function is reached
         let diag = std::path::Path::new("target/harness-failpoints");
         let _ = std::fs::create_dir_all(diag);

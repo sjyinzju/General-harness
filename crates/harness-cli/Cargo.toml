@@ -38,6 +38,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ratatui = "0.28"
 crossterm = "0.28"
+sha2 = "0.10"
+tempfile = "3.27.0"
 
 [[bin]]
 name = "fk-test"
@@ -46,6 +48,10 @@ path = "src/bin/fk_test.rs"
 [[bin]]
 name = "run-fault"
 path = "src/bin/run_fault.rs"
+
+[[bin]]
+name = "real-smoke"
+path = "src/bin/real_smoke.rs"
 
 [dev-dependencies]
 tempfile = "3.27.0"
