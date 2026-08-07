@@ -614,8 +614,9 @@ fn run_phase1_quality_gates(repo_root: &Path, results: &mut SystemAcceptanceResu
     results.p1_clippy_passed = clippy_exit;
     results.log_phase("1", "clippy", clippy_exit, "");
 
-    // cargo test
-    let (_test_ok, test_out) = run_cargo_cmd(repo_root, &["test", "--workspace"]);
+    // cargo test (single-threaded to avoid parallel test race conditions)
+    let (_test_ok, test_out) =
+        run_cargo_cmd(repo_root, &["test", "--workspace", "--", "--test-threads=1"]);
     let mut total_failed = 0i32;
     for line in test_out.lines() {
         if line.contains("test result:") {
