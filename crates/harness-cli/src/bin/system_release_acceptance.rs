@@ -614,31 +614,22 @@ fn run_phase1_quality_gates(repo_root: &Path, results: &mut SystemAcceptanceResu
     results.p1_clippy_passed = clippy_exit;
     results.log_phase("1", "clippy", clippy_exit, "");
 
-    // cargo test (single-threaded to avoid parallel test race conditions)
-    let (_test_ok, test_out) = run_cargo_cmd(
+    // cargo test (single-threaded, relies on exit code not text parsing)
+    let (test_ok, _test_out) = run_cargo_cmd(
         repo_root,
         &["test", "--workspace", "--", "--test-threads=1"],
     );
-    let mut total_failed = 0i32;
-    for line in test_out.lines() {
-        if line.contains("test result:") {
-            for part in line.split(';') {
-                let part = part.trim();
-                if part.contains("failed") {
-                    if let Ok(n) = part.split_whitespace().next().unwrap_or("0").parse::<i32>() {
-                        total_failed += n;
-                    }
-                }
-            }
-        }
-    }
-    results.p1_tests_passed = total_failed == 0;
-    results.p1_tests_failed = total_failed;
+    results.p1_tests_passed = test_ok;
+    results.p1_tests_failed = if test_ok { 0 } else { 1 };
     results.log_phase(
         "1",
         "test",
-        total_failed == 0,
-        &format!("{} failed", total_failed),
+        test_ok,
+        if test_ok {
+            "all passed (exit 0)"
+        } else {
+            "exit non-zero"
+        },
     );
 
     // cargo build --workspace with isolated target dir to avoid binary lock
