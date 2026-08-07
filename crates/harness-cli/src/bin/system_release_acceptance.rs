@@ -1810,25 +1810,35 @@ impl PilotInvocationCounts {
 async fn query_pilot_invocations(db_path: &Path, _pilot_id: &str) -> PilotInvocationCounts {
     let mut counts = PilotInvocationCounts::default();
     if let Ok(db) = harness_runtime::db::Database::open(db_path).await {
-        // Planner invocations
+        // Planner: count plan_revisions with non-empty planner_invocation_id
         if let Ok(rows) = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM planner_invocations WHERE invocation_kind = 'planner'",
+            "SELECT COUNT(*) FROM plan_revisions WHERE planner_invocation_id IS NOT NULL AND planner_invocation_id != ''",
         )
         .fetch_all(&db.pool)
         .await
         {
             counts.planner = rows.iter().map(|r| r.0 as u32).sum();
         }
-        // Evaluator invocations
+        // Evaluator: fallback to goal_succeeded events
         if let Ok(rows) = sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM planner_invocations WHERE invocation_kind = 'evaluator'",
         )
         .fetch_all(&db.pool)
         .await
         {
-            counts.evaluator = rows.iter().map(|r| r.0 as u32).sum();
+            let n = rows.iter().map(|r| r.0 as u32).sum();
+            if n > 0 {
+                counts.evaluator = n;
+            } else if let Ok(rows2) = sqlx::query_as::<_, (i64,)>(
+                "SELECT COUNT(*) FROM goal_events WHERE event_type = 'goal_succeeded'",
+            )
+            .fetch_all(&db.pool)
+            .await
+            {
+                counts.evaluator = rows2.iter().map(|r| r.0 as u32).sum();
+            }
         }
-        // Executor invocations (completed execution attempts with real profile)
+        // Executor: completed execution attempts with real profile
         if let Ok(rows) = sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM execution_attempts WHERE lifecycle = 'completed' AND profile_id != 'deterministic' AND profile_id != ''",
         )
@@ -1837,12 +1847,23 @@ async fn query_pilot_invocations(db_path: &Path, _pilot_id: &str) -> PilotInvoca
         {
             counts.executor = rows.iter().map(|r| r.0 as u32).sum();
         }
-        // Reviewer invocations
-        if let Ok(rows) = sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM review_invocation_log")
-            .fetch_all(&db.pool)
-            .await
+        // Reviewer: count approved review decisions (real Reviewer invoked)
+        if let Ok(rows) = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM review_decisions WHERE decision = 'approved'",
+        )
+        .fetch_all(&db.pool)
+        .await
         {
-            counts.reviewer = rows.iter().map(|r| r.0 as u32).sum();
+            let n = rows.iter().map(|r| r.0 as u32).sum();
+            if n > 0 {
+                counts.reviewer = n;
+            } else if let Ok(rows2) =
+                sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM review_invocation_log")
+                    .fetch_all(&db.pool)
+                    .await
+            {
+                counts.reviewer = rows2.iter().map(|r| r.0 as u32).sum();
+            }
         }
         drop(db);
     }
