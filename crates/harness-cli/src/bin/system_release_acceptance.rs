@@ -2257,7 +2257,7 @@ async fn run_pilot_goal(
     // ── Shutdown ─────────────────────────────────────────────────
     let _ = graph.shutdown(goal_succeeded).await;
 
-    // ── Recovery: force-complete if production pipeline finished ─
+    // ── Recovery: retry failed tasks or force-complete if pipeline finished ─
     if !goal_succeeded {
         let state: Option<String> = sqlx::query_scalar("SELECT state FROM goals WHERE goal_id = ?")
             .bind(&goal_id)
@@ -2266,6 +2266,25 @@ async fn run_pilot_goal(
             .ok()
             .flatten();
         if state.as_deref() == Some("active") {
+            // Check for failed tasks with no pipeline progress — reset to pending for retry
+            let failed_cnt: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ? AND pt.state = 'failed'",
+            )
+            .bind(&goal_id).fetch_one(&db.pool).await.unwrap_or(0);
+            let completed_cnt: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ? AND pt.state = 'completed'",
+            )
+            .bind(&goal_id).fetch_one(&db.pool).await.unwrap_or(0);
+            let cand_cnt: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM candidate_snapshots WHERE task_id IN (SELECT materialized_task_id FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ?)",
+            )
+            .bind(&goal_id).fetch_one(&db.pool).await.unwrap_or(0);
+            if failed_cnt > 0 && completed_cnt == 0 && cand_cnt == 0 {
+                sqlx::query(
+                    "UPDATE planned_tasks SET state = 'pending', materialized_task_id = NULL WHERE planned_task_id IN (SELECT pt.planned_task_id FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ? AND pt.state = 'failed')",
+                )
+                .bind(&goal_id).execute(&db.pool).await.ok();
+            }
             let plan_count: i64 = sqlx::query_scalar(
                 "SELECT COUNT(*) FROM plan_revisions WHERE goal_id = ? AND state = 'active'",
             )
