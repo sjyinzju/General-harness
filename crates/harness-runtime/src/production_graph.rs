@@ -319,10 +319,25 @@ impl ProductionGraph {
         // a real LLM adapter, enabling the full production pipeline to run
         // through verification→candidate→review→commit→integration for
         // fault-injection testing.
-        if std::env::var("HARNESS_DETERMINISTIC_MODE").as_deref() == Ok("1") {
+        //
+        // SAFETY GATE: deterministic_mode is ONLY enabled when NO real adapter
+        // is provided. If a real adapter is wired, deterministic_mode stays
+        // false regardless of HARNESS_DETERMINISTIC_MODE env var. This prevents
+        // a stale env var from silently disabling real LLM invocations in
+        // production Phase 13 / Pilot runs.
+        let has_real_adapter = adapter_for_svc.is_some();
+        if !has_real_adapter && std::env::var("HARNESS_DETERMINISTIC_MODE").as_deref() == Ok("1") {
             goal_loop_svc.deterministic_mode = true;
             tracing::info!(
-                "deterministic mode enabled for goal loop (HARNESS_DETERMINISTIC_MODE=1)"
+                "deterministic mode enabled for goal loop (HARNESS_DETERMINISTIC_MODE=1, no real adapter)"
+            );
+        } else if has_real_adapter {
+            // Explicitly clear deterministic_mode when a real adapter is wired.
+            // This ensures Phase 13 real-runtime runs are never silently
+            // downgraded to deterministic mode.
+            goal_loop_svc.deterministic_mode = false;
+            tracing::info!(
+                "deterministic_mode force-cleared: real adapter wired, real-runtime routing active"
             );
         }
 

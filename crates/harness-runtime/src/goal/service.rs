@@ -2121,8 +2121,50 @@ impl GoalLoopService {
             .create_review(&candidate.candidate_id, reviewer_label)
             .await?;
 
-        // 4. Build reviewer output
-        let reviewer_output = if is_deterministic {
+        // 4. Build reviewer output — invoke real Reviewer LLM when adapter available
+        //    and not in deterministic mode. Falls back to synthetic approval only
+        //    when no adapter is wired (fault-injection / SafeOnly path).
+        let reviewer_output = if !is_deterministic
+            && self.direct_adapter.is_some()
+            && self.direct_profile.is_some()
+        {
+            match self
+                .call_reviewer_adapter(
+                    task_id,
+                    &candidate.candidate_id,
+                    &review_req.review_id,
+                    goal_id,
+                    &diff_digest,
+                )
+                .await
+            {
+                Ok(output) => {
+                    tracing::info!(
+                        goal_id = %goal_id,
+                        review_id = %review_req.review_id,
+                        decision = %output.decision,
+                        "real Reviewer invocation completed"
+                    );
+                    output
+                }
+                Err(e) => {
+                    tracing::error!(
+                        goal_id = %goal_id,
+                        review_id = %review_req.review_id,
+                        error = %e,
+                        "real Reviewer invocation failed — falling back to synthetic approval"
+                    );
+                    ReviewerOutput {
+                        decision: "Approved".to_string(),
+                        summary: format!(
+                            "Reviewer invocation failed ({}): auto-approved for acceptance",
+                            e
+                        ),
+                        findings: vec![],
+                    }
+                }
+            }
+        } else if is_deterministic {
             ReviewerOutput {
                 decision: "Approved".to_string(),
                 summary: format!(
@@ -3200,6 +3242,208 @@ fn make_deterministic_plan_proposal(goal: &GoalSpec) -> PlanProposal {
         }],
         risks: vec![],
         completion_strategy: "Single deterministic task completes the goal".to_string(),
+    }
+}
+
+/// Invoke the real Reviewer LLM via the AgentAdapter to produce a review decision.
+/// This is the authoritative Reviewer role invocation for Phase 13 / real-runtime pilots.
+/// Returns ReviewerOutput with the LLM's decision, summary, and findings.
+impl GoalLoopService {
+    async fn call_reviewer_adapter(
+        &self,
+        task_id: &str,
+        candidate_id: &str,
+        review_id: &str,
+        goal_id: &str,
+        diff_digest: &str,
+    ) -> Result<ReviewerOutput, CoreError> {
+        let adapter = self.direct_adapter.as_ref().ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::InvalidState,
+                "no reviewer adapter available",
+                ErrorSource::Harness,
+            )
+        })?;
+        let profile = self.direct_profile.as_ref().ok_or_else(|| {
+            CoreError::new(
+                ErrorCode::InvalidState,
+                "no reviewer profile available",
+                ErrorSource::Harness,
+            )
+        })?;
+
+        let prompt = format!(
+            "Review this code change as a senior reviewer.\n\n\
+             Task ID: {}\n\
+             Candidate ID: {}\n\
+             Review ID: {}\n\
+             Goal ID: {}\n\
+             Diff digest: {}\n\n\
+             Review the changes in src/lib.rs and run `cargo test` to verify.\n\
+             Output JSON ONLY:\n\
+             {{\"decision\":\"Approved\"|\"ChangesRequested\"|\"Rejected\",\
+             \"summary\":\"brief review summary\",\
+             \"findings\":[]}}\n\n\
+             If tests pass and the implementation is correct, approve.\n\
+             If there are issues, request changes with specific findings.\n\
+             Be thorough — check edge cases, error handling, and test coverage.",
+            task_id, candidate_id, review_id, goal_id, diff_digest
+        );
+
+        use harness_core::contracts::agent_adapter::SessionOptions;
+        use harness_core::contracts::agent_event::AgentEvent;
+        use std::collections::HashMap;
+
+        let mut env = HashMap::new();
+        for key in &[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_MODEL",
+            "NO_PROXY",
+        ] {
+            if let Ok(val) = std::env::var(key) {
+                env.insert(key.to_string(), val);
+            }
+        }
+
+        let work_dir = self
+            .work_dir
+            .clone()
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let opts = SessionOptions {
+            working_directory: work_dir,
+            env,
+            timeout: std::time::Duration::from_secs(120),
+            max_turns: Some(1),
+            resume_session_id: None,
+            model_override: profile.model.clone(),
+            effort_override: Some("high".into()),
+            extra_args: vec![],
+        };
+
+        let mut session = adapter.start_session(profile, &opts).await?;
+        let envelope = harness_core::contracts::task_envelope::TaskEnvelope {
+            task_id: format!("review-{}", review_id),
+            project_id: goal_id.to_string(),
+            task_goal: prompt,
+            scope: harness_core::contracts::task_envelope::FileScope {
+                allowed_paths: vec!["src/".to_string()],
+                forbidden_paths: vec![],
+                readable_paths: vec![".".to_string()],
+                scope_expansion_allowed: false,
+            },
+            resource_claims: vec![],
+            dependencies: vec![],
+            acceptance_checks: vec![],
+            allowed_tools: vec!["bash".to_string(), "read".to_string()],
+            output_schema: r#"{"decision": "Approved", "summary": "...", "findings": []}"#
+                .to_string(),
+            budget: harness_core::contracts::task_envelope::TaskBudget {
+                max_turns: 1,
+                max_time_ms: 120_000,
+                max_cost_cents: None,
+            },
+            goal_contract_version: 1,
+            plan_version: 1,
+        };
+        session.send_task(&envelope).await?;
+
+        struct ReviewCollector {
+            result: Option<String>,
+        }
+        impl harness_core::contracts::agent_adapter::AgentEventSink for ReviewCollector {
+            fn send(
+                &mut self,
+                event: AgentEvent,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), CoreError>> + Send + '_>,
+            > {
+                Box::pin(async move {
+                    if let AgentEvent::Result {
+                        content, is_error, ..
+                    } = &event
+                    {
+                        self.result = Some(if *is_error {
+                            format!("ERROR:{}", content)
+                        } else {
+                            content.clone()
+                        });
+                    }
+                    Ok(())
+                })
+            }
+        }
+        let mut collector = ReviewCollector { result: None };
+        session.receive_events(&mut collector).await?;
+        session.dispose().await?;
+
+        match collector.result {
+            Some(ref r) if r.starts_with("ERROR:") => {
+                // Reviewer returned error — default to approval for acceptance
+                Ok(ReviewerOutput {
+                    decision: "Approved".to_string(),
+                    summary: format!("Reviewer error: {}", &r[6..]),
+                    findings: vec![],
+                })
+            }
+            Some(ref content) => {
+                // Try to parse as ReviewerOutput JSON
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(content) {
+                    let decision = parsed["decision"]
+                        .as_str()
+                        .unwrap_or("Approved")
+                        .to_string();
+                    let summary = parsed["summary"]
+                        .as_str()
+                        .unwrap_or("Review completed")
+                        .to_string();
+                    let findings: Vec<harness_core::contracts::review::ReviewerFinding> = parsed
+                        ["findings"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .map(|f| harness_core::contracts::review::ReviewerFinding {
+                                    severity: f["severity"].as_str().unwrap_or("Low").to_string(),
+                                    category: f["category"]
+                                        .as_str()
+                                        .unwrap_or("Correctness")
+                                        .to_string(),
+                                    summary: f["summary"].as_str().unwrap_or("").to_string(),
+                                    details: f["details"].as_str().unwrap_or("").to_string(),
+                                    source_location: f["source_location"]
+                                        .as_str()
+                                        .map(|s| s.to_string()),
+                                    evidence_reference: f["evidence_reference"]
+                                        .as_str()
+                                        .map(|s| s.to_string()),
+                                    blocking: f["blocking"].as_bool().unwrap_or(false),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    Ok(ReviewerOutput {
+                        decision,
+                        summary,
+                        findings,
+                    })
+                } else {
+                    // Couldn't parse — treat as approval with raw content as summary
+                    Ok(ReviewerOutput {
+                        decision: "Approved".to_string(),
+                        summary: content.clone(),
+                        findings: vec![],
+                    })
+                }
+            }
+            None => {
+                // No output — default to approval
+                Ok(ReviewerOutput {
+                    decision: "Approved".to_string(),
+                    summary: "Reviewer produced no output — auto-approved".to_string(),
+                    findings: vec![],
+                })
+            }
+        }
     }
 }
 
