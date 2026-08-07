@@ -2308,6 +2308,11 @@ async fn run_pilot_goal(
                     .execute(&db.pool)
                     .await
                     .ok();
+                sqlx::query("INSERT INTO goal_events (goal_id, event_type, payload_json) VALUES (?, 'goal_succeeded', '{\"source\":\"force-complete\"}')")
+                    .bind(&goal_id)
+                    .execute(&db.pool)
+                    .await
+                    .ok();
                 goal_succeeded = true;
             }
         }
