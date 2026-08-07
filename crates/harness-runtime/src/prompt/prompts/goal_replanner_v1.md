@@ -30,9 +30,10 @@ You will receive:
 
 ## OUTPUT
 
-You MUST output ONLY valid JSON matching this schema:
+Your ENTIRE response must be a single JSON object. Do NOT wrap it in markdown fences (no ```json). Do NOT add any text before or after the JSON. Output ONLY the JSON object on its own.
 
-```json
+The JSON must match this schema (shown without fences so you output it the same way):
+
 {
   "schema_version": "1.0",
   "goal_summary": "<updated summary>",
@@ -68,6 +69,5 @@ You MUST output ONLY valid JSON matching this schema:
   "preserved_completed_tasks": ["<client_ref of completed tasks>"],
   "superseded_pending_tasks": ["<client_ref of tasks to supersede>"]
 }
-```
 
-Output ONLY the JSON. No markdown fences, no commentary.
+CRITICAL: Do NOT use markdown fences. Start your response with { and end with }. No other text.

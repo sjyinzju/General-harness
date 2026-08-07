@@ -304,12 +304,29 @@ impl harness_core::contracts::agent_adapter::AgentEventSink for PlannerEventColl
                     if *is_error {
                         self.final_result = Some(Err(content.clone()));
                     } else {
-                        // Try to parse as JSON
-                        let json: serde_json::Value =
-                            serde_json::from_str(content).unwrap_or(serde_json::json!({
-                                "raw": content
-                            }));
-                        self.final_result = Some(Ok(json));
+                        // Robust JSON extraction — handles markdown fences,
+                        // leading/trailing whitespace, and provider noise.
+                        match crate::prompt::try_extract_json(content) {
+                            Ok(json_str) => {
+                                match serde_json::from_str::<serde_json::Value>(&json_str) {
+                                    Ok(json) => {
+                                        self.final_result = Some(Ok(json));
+                                    }
+                                    Err(e) => {
+                                        self.final_result = Some(Err(format!(
+                                            "JSON parse error after extraction: {e} — raw: {}",
+                                            &json_str[..json_str.len().min(300)]
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.final_result = Some(Err(format!(
+                                    "JSON extraction failed: {e} — raw: {}",
+                                    &content[..content.len().min(300)]
+                                )));
+                            }
+                        }
                     }
                 }
                 AgentEvent::Error { message, .. } => {

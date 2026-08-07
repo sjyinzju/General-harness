@@ -27,16 +27,17 @@ You will receive:
 
 ## OUTPUT
 
-You MUST output ONLY valid JSON:
+Your ENTIRE response must be a single JSON object. Do NOT wrap it in markdown fences (no ```json). Do NOT add any text before or after the JSON. Output ONLY the JSON object on its own.
 
-```json
+The JSON must match this schema (shown without fences so you output it the same way):
+
 {
   "schema_version": "1.0",
   "overall_assessment": "<summary of overall progress>",
   "criteria_assessments": [
     {
       "criterion_id": "<id>",
-      "status": "satisfied|partially_satisfied|unsatisfied|unknown|blocked",
+      "status": "satisfied",
       "evidence_refs": ["obs-<id>"],
       "reason": "<why this status>",
       "confidence": 0.95,
@@ -46,10 +47,9 @@ You MUST output ONLY valid JSON:
   "plan_sufficient": true,
   "replan_recommended": false,
   "completion_recommended": false,
-  "blockers": ["<blocker description>"],
-  "recommendation": "continue|replan|wait_for_approval|recommend_completion|block",
+  "blockers": [],
+  "recommendation": "continue",
   "summary": "<one-paragraph summary>"
 }
-```
 
-Output ONLY the JSON. No markdown fences, no commentary.
+CRITICAL: Do NOT use markdown fences. Start your response with { and end with }. No other text.

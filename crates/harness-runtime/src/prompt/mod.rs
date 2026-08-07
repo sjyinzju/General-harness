@@ -235,6 +235,162 @@ impl Default for PromptRegistry {
     }
 }
 
+// ── JSON Extraction ───────────────────────────────────────────────────
+
+/// Errors that can occur when extracting structured JSON from LLM output.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonExtractError {
+    /// Output was empty or only whitespace.
+    EmptyOutput,
+    /// Output contained text but no valid JSON object could be found.
+    NoJsonFound { preview: String },
+    /// JSON was found but failed to parse.
+    JsonParseError {
+        parse_error: String,
+        json_candidate: String,
+    },
+    /// JSON parsed but schema validation failed.
+    SchemaValidationError {
+        parse_error: String,
+        json_text: String,
+    },
+    /// Output was truncated (incomplete JSON).
+    TruncatedOutput { preview: String },
+}
+
+impl std::fmt::Display for JsonExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyOutput => write!(f, "EmptyOutput: no content received from provider"),
+            Self::NoJsonFound { preview } => {
+                write!(
+                    f,
+                    "NoJsonFound: no JSON object in output (preview: {preview})"
+                )
+            }
+            Self::JsonParseError {
+                parse_error,
+                json_candidate,
+            } => {
+                write!(
+                    f,
+                    "JsonParseError: {parse_error} (candidate: {json_candidate})"
+                )
+            }
+            Self::SchemaValidationError {
+                parse_error,
+                json_text,
+            } => {
+                write!(
+                    f,
+                    "SchemaValidationError: {parse_error} (text: {json_text})"
+                )
+            }
+            Self::TruncatedOutput { preview } => {
+                write!(f, "TruncatedOutput: incomplete JSON (preview: {preview})")
+            }
+        }
+    }
+}
+
+/// Try to extract a JSON object from LLM output text.
+///
+/// Handles:
+/// - Leading/trailing whitespace
+/// - Markdown fences (```json ... ``` or ``` ... ```)
+/// - Provider noise (text before/after the JSON block)
+/// - Nested braces (finds the outermost `{...}`)
+///
+/// Returns the extracted JSON string (trimmed) or an error.
+pub fn try_extract_json(raw: &str) -> Result<String, JsonExtractError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(JsonExtractError::EmptyOutput);
+    }
+
+    // Strategy 1: Try direct parse of trimmed content
+    if let Ok(_val) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        return Ok(trimmed.to_string());
+    }
+
+    // Strategy 2: Strip markdown fences
+    // Look for ```json ... ``` or ``` ... ```
+    let fence_patterns = ["```json\n", "```json\r\n", "```\n", "```\r\n"];
+    for pattern in &fence_patterns {
+        if let Some(start) = trimmed.find(pattern) {
+            let after_open = &trimmed[start + pattern.len()..];
+            if let Some(close) = after_open.find("\n```") {
+                let inner = after_open[..close].trim();
+                if let Ok(_val) = serde_json::from_str::<serde_json::Value>(inner) {
+                    return Ok(inner.to_string());
+                }
+            } else if after_open.trim_end().ends_with("```") {
+                let inner = after_open[..after_open.len() - 3].trim();
+                if let Ok(_val) = serde_json::from_str::<serde_json::Value>(inner) {
+                    return Ok(inner.to_string());
+                }
+            }
+        }
+    }
+
+    // Strategy 3: Find outermost braces (handles provider noise)
+    if let Some(first_brace) = trimmed.find('{') {
+        // Find matching close brace by counting depth
+        let mut depth = 0;
+        let mut last_close = None;
+        for (i, ch) in trimmed[first_brace..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        last_close = Some(first_brace + i + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(close) = last_close {
+            let candidate = trimmed[first_brace..close].trim().to_string();
+            if let Ok(_val) = serde_json::from_str::<serde_json::Value>(&candidate) {
+                return Ok(candidate);
+            }
+            // Parse failed on candidate
+            let preview = if candidate.len() > 200 {
+                format!("{}...", &candidate[..200])
+            } else {
+                candidate.clone()
+            };
+            return Err(JsonExtractError::JsonParseError {
+                parse_error: "failed to parse extracted JSON object".to_string(),
+                json_candidate: preview,
+            });
+        }
+    }
+
+    // Nothing found
+    let preview = if trimmed.len() > 200 {
+        format!("{}...", &trimmed[..200])
+    } else {
+        trimmed.to_string()
+    };
+    Err(JsonExtractError::NoJsonFound { preview })
+}
+
+/// Convenience: extract and parse JSON in one step.
+pub fn extract_and_parse(raw: &str) -> Result<serde_json::Value, JsonExtractError> {
+    let json_str = try_extract_json(raw)?;
+    serde_json::from_str(&json_str).map_err(|e| JsonExtractError::JsonParseError {
+        parse_error: e.to_string(),
+        json_candidate: if json_str.len() > 200 {
+            format!("{}...", &json_str[..200])
+        } else {
+            json_str.clone()
+        },
+    })
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -302,6 +458,149 @@ mod tests {
         let r1 = t.render("same input", "same-digest");
         let r2 = t.render("same input", "same-digest");
         assert_eq!(r1.rendered_digest, r2.rendered_digest);
+    }
+
+    // ── JSON Extraction Tests ─────────────────────────────────────
+
+    #[test]
+    fn test_extract_plain_json() {
+        let input = r#"{"key": "value"}"#;
+        let result = try_extract_json(input).unwrap();
+        assert_eq!(result, r#"{"key": "value"}"#);
+    }
+
+    #[test]
+    fn test_extract_json_with_whitespace() {
+        let input = r#"  {"key": "value"}  "#;
+        let result = try_extract_json(input).unwrap();
+        assert!(result.contains("\"key\""));
+    }
+
+    #[test]
+    fn test_extract_json_with_markdown_fence() {
+        let input = "```json\n{\"key\": \"value\"}\n```";
+        let result = try_extract_json(input).unwrap();
+        assert!(result.contains("\"key\""));
+    }
+
+    #[test]
+    fn test_extract_json_with_plain_fence() {
+        let input = "```\n{\"key\": \"value\"}\n```";
+        let result = try_extract_json(input).unwrap();
+        assert!(result.contains("\"key\""));
+    }
+
+    #[test]
+    fn test_extract_json_with_provider_noise_before() {
+        let input = "Here is the plan:\n{\"key\": \"value\"}";
+        let result = try_extract_json(input).unwrap();
+        assert!(result.contains("\"key\""));
+    }
+
+    #[test]
+    fn test_extract_json_with_provider_noise_after() {
+        let input = "{\"key\": \"value\"}\nThis plan looks good.";
+        let result = try_extract_json(input).unwrap();
+        assert!(result.contains("\"key\""));
+    }
+
+    #[test]
+    fn test_extract_json_nested_braces() {
+        let input = r#"{"outer": {"inner": [1, 2, 3]}}"#;
+        let result = try_extract_json(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["outer"]["inner"][0], 1);
+    }
+
+    #[test]
+    fn test_extract_json_empty_input() {
+        let input = "";
+        assert!(matches!(
+            try_extract_json(input),
+            Err(JsonExtractError::EmptyOutput)
+        ));
+    }
+
+    #[test]
+    fn test_extract_json_no_braces() {
+        let input = "This is just text with no JSON.";
+        assert!(matches!(
+            try_extract_json(input),
+            Err(JsonExtractError::NoJsonFound { .. })
+        ));
+    }
+
+    #[test]
+    fn test_extract_json_malformed() {
+        let input = r#"{"key": value}"#; // missing quotes
+        assert!(matches!(
+            try_extract_json(input),
+            Err(JsonExtractError::JsonParseError { .. })
+        ));
+    }
+
+    #[test]
+    fn test_extract_and_parse_valid() {
+        let input = r#"{"key": "value"}"#;
+        let val = extract_and_parse(input).unwrap();
+        assert_eq!(val["key"], "value");
+    }
+
+    #[test]
+    fn test_extract_and_parse_with_fence() {
+        let input = "```json\n{\"schema_version\": \"1.0\", \"goal_summary\": \"test\"}\n```";
+        let val = extract_and_parse(input).unwrap();
+        assert_eq!(val["schema_version"], "1.0");
+    }
+
+    #[test]
+    fn test_extract_json_leading_whitespace_only() {
+        let input = "   \n  {\"key\": \"value\"}";
+        let result = try_extract_json(input).unwrap();
+        assert!(result.contains("\"key\""));
+    }
+
+    #[test]
+    fn test_extract_json_plan_proposal_shape() {
+        let input = r#"```json
+{
+  "schema_version": "1.0",
+  "goal_summary": "test plan",
+  "assumptions": ["assumption 1"],
+  "milestones": [
+    {
+      "client_ref": "M1",
+      "title": "milestone 1",
+      "objective": "obj"
+    }
+  ],
+  "tasks": [
+    {
+      "client_ref": "T1",
+      "milestone_ref": "M1",
+      "title": "task 1",
+      "objective": "obj",
+      "acceptance_criteria": ["ac1"],
+      "expected_evidence": ["ev1"],
+      "risk_level": "low"
+    }
+  ],
+  "risks": [],
+  "completion_strategy": "strategy"
+}
+```"#;
+        let result = try_extract_json(input).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        assert_eq!(parsed["schema_version"], "1.0");
+        assert_eq!(parsed["milestones"].as_array().unwrap().len(), 1);
+        assert_eq!(parsed["tasks"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_extract_json_crlf_fence() {
+        let input = "```json\r\n{\"key\": \"value\"}\r\n```";
+        let result = try_extract_json(input).unwrap();
+        assert!(result.contains("\"key\""));
     }
 
     #[test]

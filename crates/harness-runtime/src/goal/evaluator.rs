@@ -152,18 +152,55 @@ impl ProductionGoalEvaluator {
         session.receive_events(&mut collector).await?;
         session.dispose().await?;
 
-        let result = collector.final_result.ok_or_else(|| {
-            CoreError::new(
-                ErrorCode::Internal,
-                "Evaluator produced no final result",
-                ErrorSource::Harness,
-            )
+        let (result, stderr_digest, stdout_digest, exit_code, timed_out) = (
+            collector.final_result,
+            collector.stderr_preview,
+            collector.stdout_preview,
+            collector.exit_code,
+            collector.timed_out,
+        );
+
+        let result = result.ok_or_else(|| {
+            let context = format!(
+                "stderr_digest={} stdout_digest={} exit_code={} timed_out={}",
+                stderr_digest.as_deref().unwrap_or("none"),
+                stdout_digest.as_deref().unwrap_or("none"),
+                exit_code.unwrap_or(-1),
+                timed_out
+            );
+            if timed_out {
+                CoreError::new(
+                    ErrorCode::ProcessTimeout {
+                        duration_ms: 120_000,
+                    },
+                    format!("Evaluator process timeout after 120s — {context}"),
+                    ErrorSource::Harness,
+                )
+            } else if exit_code.is_some() && exit_code != Some(0) {
+                CoreError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "Evaluator exited with code {} without producing final result — {context}",
+                        exit_code.unwrap()
+                    ),
+                    ErrorSource::Harness,
+                )
+            } else {
+                CoreError::new(
+                    ErrorCode::Internal,
+                    format!("Evaluator produced no final result — {context}"),
+                    ErrorSource::Harness,
+                )
+            }
         })?;
 
         let output = result.map_err(|msg| {
             CoreError::new(
                 ErrorCode::Internal,
-                format!("Evaluator result was an error: {msg}"),
+                format!(
+                    "Evaluator result was an error: {msg} — stderr={}",
+                    stderr_digest.as_deref().unwrap_or("none")
+                ),
                 ErrorSource::Harness,
             )
         })?;
@@ -219,11 +256,21 @@ impl ProductionGoalEvaluator {
 
 struct EvaluatorEventCollector {
     final_result: Option<Result<serde_json::Value, String>>,
+    stdout_preview: Option<String>,
+    stderr_preview: Option<String>,
+    exit_code: Option<i32>,
+    timed_out: bool,
 }
 
 impl EvaluatorEventCollector {
     fn new() -> Self {
-        Self { final_result: None }
+        Self {
+            final_result: None,
+            stdout_preview: None,
+            stderr_preview: None,
+            exit_code: None,
+            timed_out: false,
+        }
     }
 }
 
@@ -239,15 +286,49 @@ impl AgentEventSink for EvaluatorEventCollector {
                     if *is_error {
                         self.final_result = Some(Err(content.clone()));
                     } else {
-                        let json: serde_json::Value =
-                            serde_json::from_str(content).unwrap_or(serde_json::json!({
-                                "raw": content
-                            }));
-                        self.final_result = Some(Ok(json));
+                        // Robust JSON extraction — handles markdown fences,
+                        // leading/trailing whitespace, and provider noise.
+                        match crate::prompt::try_extract_json(content) {
+                            Ok(json_str) => {
+                                match serde_json::from_str::<serde_json::Value>(&json_str) {
+                                    Ok(json) => {
+                                        self.final_result = Some(Ok(json));
+                                    }
+                                    Err(e) => {
+                                        self.final_result = Some(Err(format!(
+                                            "JSON parse error after extraction: {e} — raw: {}",
+                                            &json_str[..json_str.len().min(300)]
+                                        )));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                self.final_result = Some(Err(format!(
+                                    "JSON extraction failed: {e} — raw: {}",
+                                    &content[..content.len().min(300)]
+                                )));
+                            }
+                        }
                     }
                 }
                 AgentEvent::Error { message, .. } => {
+                    if self.stderr_preview.is_none() {
+                        self.stderr_preview = Some(message.clone());
+                    }
                     self.final_result = Some(Err(message.clone()));
+                }
+                AgentEvent::ProcessExited { exit_code, .. } => {
+                    self.exit_code = Some(*exit_code);
+                }
+                AgentEvent::SessionEnded {
+                    termination_reason, ..
+                } => {
+                    if matches!(
+                        termination_reason,
+                        harness_core::contracts::agent_event::TerminationReason::Timeout
+                    ) {
+                        self.timed_out = true;
+                    }
                 }
                 _ => {}
             }
