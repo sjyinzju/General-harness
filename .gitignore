@@ -11,3 +11,10 @@ harness.db
 harness.db-shm
 harness.db-wal
 harness.db-journal
+
+# Harness scratch directories (never commit)
+.scratch/
+target/scratch/
+
+# Verification auto-generated acceptance directories (committed intentionally)
+# verification/system-accepted-*/ are committed via release process
