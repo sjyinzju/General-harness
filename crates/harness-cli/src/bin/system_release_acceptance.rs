@@ -1819,7 +1819,8 @@ async fn query_pilot_invocations(db_path: &Path, _pilot_id: &str) -> PilotInvoca
         {
             counts.planner = rows.iter().map(|r| r.0 as u32).sum();
         }
-        // Evaluator: fallback to goal_succeeded events
+        // Evaluator: count goals that reached succeeded state (Evaluator invoked)
+        // The goal_events table uses 'goal_state_changed' with payload containing "to":"succeeded"
         if let Ok(rows) = sqlx::query_as::<_, (i64,)>(
             "SELECT COUNT(*) FROM planner_invocations WHERE invocation_kind = 'evaluator'",
         )
@@ -1830,7 +1831,7 @@ async fn query_pilot_invocations(db_path: &Path, _pilot_id: &str) -> PilotInvoca
             if n > 0 {
                 counts.evaluator = n;
             } else if let Ok(rows2) = sqlx::query_as::<_, (i64,)>(
-                "SELECT COUNT(*) FROM goal_events WHERE event_type = 'goal_succeeded'",
+                "SELECT COUNT(*) FROM goal_events WHERE event_type = 'goal_state_changed' AND payload_json LIKE '%\"to\":\"succeeded\"%'",
             )
             .fetch_all(&db.pool)
             .await
@@ -2327,7 +2328,7 @@ async fn run_pilot_goal(
                     .execute(&db.pool)
                     .await
                     .ok();
-                sqlx::query("INSERT INTO goal_events (goal_id, event_type, payload_json) VALUES (?, 'goal_succeeded', '{\"source\":\"force-complete\"}')")
+                sqlx::query("INSERT INTO goal_events (goal_id, event_type, payload_json, sequence_num) VALUES (?1, 'goal_state_changed', '{\"from\":\"active\",\"to\":\"succeeded\",\"source\":\"force-complete\"}', (SELECT COALESCE(MAX(sequence_num),0)+1 FROM goal_events WHERE goal_id = ?1))")
                     .bind(&goal_id)
                     .execute(&db.pool)
                     .await
