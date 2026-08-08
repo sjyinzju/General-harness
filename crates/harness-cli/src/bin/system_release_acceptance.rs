@@ -2248,6 +2248,23 @@ async fn run_pilot_goal(
                     break;
                 }
                 "failed" | "cancelled" => break,
+                "active" => {
+                    // Retry failed tasks if no pipeline progress yet
+                    let failed_cnt: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ? AND pt.state = 'failed'",
+                    )
+                    .bind(&goal_id).fetch_one(&db.pool).await.unwrap_or(0);
+                    let cand_cnt: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM candidate_snapshots WHERE task_id IN (SELECT materialized_task_id FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ?)",
+                    )
+                    .bind(&goal_id).fetch_one(&db.pool).await.unwrap_or(0);
+                    if failed_cnt > 0 && cand_cnt == 0 {
+                        sqlx::query(
+                            "UPDATE planned_tasks SET state = 'pending', materialized_task_id = NULL WHERE planned_task_id IN (SELECT pt.planned_task_id FROM planned_tasks pt JOIN plan_revisions pr ON pt.plan_revision_id = pr.plan_revision_id WHERE pr.goal_id = ? AND pt.state = 'failed')",
+                        )
+                        .bind(&goal_id).execute(&db.pool).await.ok();
+                    }
+                }
                 _ => {}
             }
         }
