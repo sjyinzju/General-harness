@@ -1,0 +1,23 @@
+{
+  "generated_at": "2026-08-08T15:40:00+08:00",
+  "final_evaluator_fix_head": "348854a69c0ce9d8846036203ee98fd82ac7aa8f",
+  "atomicity_mechanism": "Single conditional INSERT...SELECT...WHERE statement — SQLite executes the entire statement atomically as one implicit transaction. The subquery COUNT and INSERT are indivisible.",
+  "sql_pattern": "INSERT INTO planner_invocations (...) SELECT ... WHERE (SELECT COUNT(*) FROM planner_invocations WHERE goal_id = ? AND invocation_kind = 'evaluator') < ?",
+  "before_fix": "TOCTOU race: count_durable_evaluator_invocations() (plain SELECT) then later call_adapter() INSERT. UNIQUE(invocation_id) cannot prevent two different UUIDs from both passing the count check.",
+  "after_fix": "reserve_evaluator_slot() uses a single atomic INSERT...SELECT...WHERE. If rows_affected() == 0, budget is exhausted. No separate SELECT needed.",
+  "concurrency_test": {
+    "iterations": 50,
+    "limit": 2,
+    "pre_existing_slots": 1,
+    "concurrent_contenders_per_iteration": 10,
+    "expected_reserved_per_iteration": 1,
+    "expected_exhausted_per_iteration": 9,
+    "expected_final_count": 2,
+    "actual_result": "ALL 50 ITERATIONS PASSED",
+    "overshoot_count": 0
+  },
+  "restart_safety": "PASS — durable rows survive, atomic reservation correctly reads existing count",
+  "per_goal_isolation": "PASS — goal A exhaustion does not affect goal B",
+  "sequential_3_attempts_limit_2": "PASS — third attempt correctly returns BudgetExhausted",
+  "no_explicit_transaction_needed": "SQLite guarantees atomicity of single top-level INSERT...SELECT statements"
+}

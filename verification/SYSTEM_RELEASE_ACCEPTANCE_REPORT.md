@@ -8,7 +8,8 @@
 | **ACCEPTANCE_HARNESS_HEAD** | `852833f508d03d852cfd433fa9d73893bd4bcdad` |
 | **PRODUCTION_CAPTURE_FIX_HEAD** | `fd91fe1511cf687ca12518d2f0121e94f3b6cdef` |
 | **EVALUATOR_FIX_HEAD** | `866041668cee79a32c098e9a4c26a1c0dd12ea45` |
-| **FINAL_REPORT_HEAD** | `1f2eec5c033b66b48aac2191fb9b10a5176c6933` |
+| **FINAL_EVALUATOR_FIX_HEAD** | `348854a69c0ce9d8846036203ee98fd82ac7aa8f` |
+| **FINAL_REPORT_HEAD** | `a76c8c0765a62b2223d04d5407bae7aa4b762f17` |
 
 ---
 
@@ -197,39 +198,44 @@ Changed subsystems received direct targeted requalification.
 ### Evaluator Final Closure (2026-08-08)
 
 **EVALUATOR_FIX_HEAD:** `866041668cee79a32c098e9a4c26a1c0dd12ea45`
+**FINAL_EVALUATOR_FIX_HEAD:** `348854a69c0ce9d8846036203ee98fd82ac7aa8f`
 
-#### Root Cause
-1. **`blockers` field not optional in Rust but not required in schema** — `ProgressAssessmentProposal.blockers: Vec<String>` had no `#[serde(default)]`, but the JSON schema did not list `blockers` in its `required` array. When the LLM omitted this field, `serde_json::from_value` failed with "missing field `blockers`".
-2. **`max_evaluator_invocations` not enforced** — `evaluate_and_complete()` called the evaluator once and silently swallowed errors. No durable count check before provider spawn. Budget exhaustion was never triggered.
+#### Round 1: Structured Output + Initial Budget (8660416)
+1. **`blockers` field not optional** — `ProgressAssessmentProposal.blockers` had no `#[serde(default)]`, schema didn't require it → LLM omission caused parse failure. Fixed with `#[serde(default)]`.
+2. **`max_evaluator_invocations` not enforced** — `evaluate_and_complete()` called evaluator once, swallowed errors. Added durable count + retry loop.
 
-#### Fixes Applied
-| Fix | Description |
-|-----|-------------|
-| FIX-1 | `#[serde(default)]` on `blockers` field (defaults to empty Vec) |
-| FIX-2 | Added `recommendation` field to match schema contract |
-| FIX-3 | Schema: added `blockers` to `required` array |
-| FIX-4 | Prompt: softened fence instructions |
-| FIX-5 | Budget enforcement: durable count from `planner_invocations` BEFORE spawn |
-| FIX-6 | `count_durable_evaluator_invocations()` helper |
-| FIX-7 | `is_evaluator_error_retryable()` classifier |
+#### Round 2: Budget Atomicity Fix (348854a)
+1. **TOCTOU race in budget enforcement** — `count_durable_evaluator_invocations()` (SELECT) then later `call_adapter()` (INSERT) had a race window where two concurrent workers could both see count=1 (limit=2) and both spawn.
+2. **Fix**: Replaced SELECT+INSERT with a single atomic `INSERT INTO ... SELECT ... WHERE (subquery COUNT) < limit` statement. SQLite executes this indivisibly — no explicit transaction needed.
+3. **50-iteration concurrency test**: 10 concurrent contenders per iteration, limit=2, 1 pre-existing slot → exactly 1 succeeds, 9 exhausted, zero overshoot across all 50 iterations.
 
 #### Verification
 | Gate | Result |
 |------|--------|
 | Parser tests (24) | ALL PASS |
-| Budget tests (16) | ALL PASS |
+| Budget tests (22) | ALL PASS |
+| 50-iteration concurrency | ALL PASS (0 overshoot) |
+| Real Evaluator Smoke | ACTUAL EXECUTION PASS (Claude, claude-default-deepseek) |
+| Final Current-Head Canary | ACTUAL EXECUTION PASS (goal succeeded naturally) |
+| Canary Evaluator attempts | 2 (≤ max 2) |
 | fmt | PASS |
 | clippy | PASS |
-| Workspace lib tests (629) | ALL PASS |
+| Workspace lib tests (635) | ALL PASS |
 | Workspace build | PASS |
-| Budget restart-safe | PASS |
-| Budget concurrency-safe | PASS |
 
-#### Budget Enforcement
-- `max_evaluator_invocations = 2` (per-goal, from `GoalBudget`)
-- Durable count survives crash/restart (SQLite, not in-memory)
-- Retry classification: provider transient → retryable; schema/semantic → NOT retryable
-- Budget consumed on EVERY attempt (durable row written BEFORE spawn)
+#### Real Evaluator Smoke
+- **Provider**: Claude (real, not fake)
+- **Profile**: claude-default-deepseek
+- **Result**: ProgressAssessmentProposal parsed successfully
+- **Previous "PASS by equivalence" claim**: REPLACED by actual execution
+
+#### Final Natural Completion Canary
+- **Run ID**: `canary-20260808-153131`
+- **Code HEAD**: `348854a69c0ce9d8846036203ee98fd82ac7aa8f`
+- **Goal**: `g-canary-793597e6-f0e5-42e9-966e-97b10d9869e8`
+- **Result**: Goal Succeeded naturally
+- **Previous old-head canary reuse (c302c4c)**: REPLACED by fresh current-head execution
+- **force-complete**: absent | **direct Goal mutation**: 0 | **direct Task retry SQL**: 0
 
 #### Evidence
 ```
@@ -238,9 +244,11 @@ verification/delta-certification/
   evaluator-structured-output-root-cause.json
   evaluator-fix-proof.json
   evaluator-budget-proof.json
-  final-evaluator-smoke-proof.json
+  final-evaluator-budget-atomicity.json
+  final-real-evaluator-smoke.json
   final-natural-completion-canary.json
-  final-impact-scoped-requalification.json
+  final-current-head-completion-transition.json
+  final-i1-i7-requalification.json
   final-disk-usage.json
 ```
 
@@ -291,6 +299,7 @@ verification/delta-certification/
 *ACCEPTANCE_HARNESS_HEAD: `852833f508d03d852cfd433fa9d73893bd4bcdad`*
 *PRODUCTION_CAPTURE_FIX_HEAD: `fd91fe1511cf687ca12518d2f0121e94f3b6cdef`*
 *EVALUATOR_FIX_HEAD: `866041668cee79a32c098e9a4c26a1c0dd12ea45`*
+*FINAL_EVALUATOR_FIX_HEAD: `348854a69c0ce9d8846036203ee98fd82ac7aa8f`*
 *Delta Certification: PASS*
-*Evaluator Final Closure: PASS*
+*Evaluator Final Closure: PASS (atomic budget + real smoke + current-head canary)*
 *I1–I7 Status: FULL RELEASE ACCEPTED AND PERMANENTLY CLOSED*

@@ -1,0 +1,20 @@
+{
+  "generated_at": "2026-08-08T15:35:00+08:00",
+  "final_evaluator_fix_head": "348854a69c0ce9d8846036203ee98fd82ac7aa8f",
+  "status": "ACTUAL EXECUTION PASS",
+  "provider": "Claude",
+  "profile": "claude-default-deepseek",
+  "claude_cli_path": "C:\\Users\\shiju\\AppData\\Roaming\\npm\\claude.cmd",
+  "fake": false,
+  "deterministic": false,
+  "stub": false,
+  "binary": "real-smoke evaluator",
+  "result": {
+    "completion_recommended": false,
+    "plan_sufficient": true,
+    "criteria_assessments_count": 1,
+    "parse_status": "ProgressAssessmentProposal deserialized successfully",
+    "output_guard": "PASS — no evidence_refs violation, no completion-without-satisfied violation"
+  },
+  "note": "Previous 'PASS by equivalence' claim is REPLACED by this actual execution."
+}

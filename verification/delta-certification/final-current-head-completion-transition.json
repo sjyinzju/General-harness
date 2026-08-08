@@ -1,0 +1,18 @@
+{
+  "generated_at": "2026-08-08T15:42:00+08:00",
+  "final_evaluator_fix_head": "348854a69c0ce9d8846036203ee98fd82ac7aa8f",
+  "canary_run_id": "canary-20260808-153131",
+  "goal_id": "g-canary-793597e6-f0e5-42e9-966e-97b10d9869e8",
+  "pre_state": "active",
+  "post_state": "succeeded",
+  "transition_source": "production CompletionPolicy / production Goal service",
+  "acceptance_runner_business_mutation_count": 0,
+  "completion_policy_result": "PASS — can_complete=true",
+  "invocations": {
+    "planner": ["inv-planner-3dce32ba-adf5-405f-aa42-2a3bba11a0f1"],
+    "evaluator": [
+      "inv-evaluator-07781cca-3e65-45a0-b734-9f1ebd508e8f",
+      "inv-evaluator-92189893-d152-4197-b9e7-e9f2169b2555"
+    ]
+  }
+}

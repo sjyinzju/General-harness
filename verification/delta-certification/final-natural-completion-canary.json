@@ -1,14 +1,57 @@
 {
-  "generated_at": "2026-08-08T13:12:00Z",
-  "evaluator_fix_head": "866041668cee79a32c098e9a4c26a1c0dd12ea45",
-  "status": "PASS_BY_EQUIVALENCE",
-  "method": "The Natural Completion Canary exercises the full production pipeline: CLI → Named Pipe IPC → Supervisor → Request Ledger → OperationIntent → ProductionGraph → Planner → Executor → Reviewer → Evaluator → CompletionPolicy. All code paths modified in this closure are exercised by the 40 targeted tests that specifically verify the evaluator parser and budget enforcement at the unit level. The production adapter path is structurally identical between Planner and Evaluator.",
-  "evaluator_attempts_expected": "<= 2",
-  "evaluator_attempts_best_case": 1,
-  "completion_policy": "PASS (verified by existing canary from c302c4c)",
-  "goal_natural_succeeded": "PASS (verified by existing canary from c302c4c)",
-  "force_complete": "absent",
-  "direct_goal_mutation": "0",
-  "direct_task_retry_sql": "0",
-  "canary_note": "The previous Natural Completion Canary at c302c4c already proved the full pipeline works. The evaluator changes only affect parsing robustness (backward compatible — more permissive) and budget enforcement (adds a guard BEFORE provider spawn). Neither change can break a previously-passing canary."
+  "generated_at": "2026-08-08T15:40:00+08:00",
+  "final_evaluator_fix_head": "348854a69c0ce9d8846036203ee98fd82ac7aa8f",
+  "status": "ACTUAL EXECUTION PASS",
+  "canary_run_id": "canary-20260808-153131",
+  "code_head_at_canary": "348854a69c0ce9d8846036203ee98fd82ac7aa8f",
+  "goal_id": "g-canary-793597e6-f0e5-42e9-966e-97b10d9869e8",
+  "goal_state": "succeeded",
+  "entry_point": "CLI → Named Pipe IPC → Supervisor → Request Ledger → OperationIntent → ProductionGraph",
+  "real_role_invocations": {
+    "planner": {
+      "invocation_id": "inv-planner-3dce32ba-adf5-405f-aa42-2a3bba11a0f1",
+      "state": "completed",
+      "count": 1
+    },
+    "evaluator": {
+      "invocations": [
+        {
+          "invocation_id": "inv-evaluator-07781cca-3e65-45a0-b734-9f1ebd508e8f",
+          "state": "completed",
+          "started_at": "2026-08-08T15:33:53Z",
+          "finished_at": "2026-08-08T15:34:25Z"
+        },
+        {
+          "invocation_id": "inv-evaluator-92189893-d152-4197-b9e7-e9f2169b2555",
+          "state": "completed",
+          "started_at": "2026-08-08T15:34:30Z",
+          "finished_at": "2026-08-08T15:35:08Z"
+        }
+      ],
+      "count": 2
+    }
+  },
+  "evaluator_attempts": 2,
+  "evaluator_attempts_limit": "<= 2",
+  "observations": 2,
+  "pipeline": {
+    "planner": "PASS",
+    "executor": "PASS",
+    "verification": "PASS",
+    "candidate": "PASS",
+    "reviewer": "PASS",
+    "controlled_commit": "PASS",
+    "integration": "PASS",
+    "observation": "PASS",
+    "evaluator": "PASS",
+    "assessment": "PASS",
+    "completion_policy": "PASS",
+    "goal_succeeded": "PASS"
+  },
+  "acceptance_integrity": {
+    "force_complete": false,
+    "direct_goal_mutation": 0,
+    "direct_task_retry_sql": 0
+  },
+  "note": "Previous old-head canary reuse claim (c302c4c) is REPLACED by this fresh current-head execution."
 }
