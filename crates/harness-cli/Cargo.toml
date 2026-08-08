@@ -53,6 +53,14 @@ path = "src/bin/run_fault.rs"
 name = "real-smoke"
 path = "src/bin/real_smoke.rs"
 
+[[bin]]
+name = "natural-completion-canary"
+path = "src/bin/natural_completion_canary.rs"
+
+[[bin]]
+name = "role-smoke"
+path = "src/bin/role_smoke.rs"
+
 [dev-dependencies]
 tempfile = "3.27.0"
 serde_json = "1"

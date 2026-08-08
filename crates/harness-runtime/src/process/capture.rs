@@ -209,6 +209,44 @@ async fn run_sink(
         }
     }
 
+    // ── EOF: flush any remaining in-memory buffer to spool ─────────
+    // When output is under the spool-after threshold, the data lives in
+    // mem_buf and no spool file was ever opened. Without this flush,
+    // small outputs (common for CLI tools) are silently lost.
+    // The caller (ClaudeCliAdapter::receive_events) depends on spool_ref
+    // to read the full captured stream.
+    if !mem_buf.is_empty() {
+        if spool_file.is_none() {
+            // Open spool file for the first time at EOF.
+            if let Some(dir) = &cfg.spool_dir {
+                let path = dir.join(format!("{}.spool", cfg.stream_name));
+                match tokio::fs::File::create(&path).await {
+                    Ok(mut f) => {
+                        if f.write_all(&mem_buf).await.is_ok() {
+                            spool_file = Some(f);
+                            spool_path = Some(path);
+                            // stored already accounts for these bytes from
+                            // the mem_buf.extend_from_slice path above.
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            execution_id = %cfg.execution_id,
+                            stream = cfg.stream_name,
+                            error = %e,
+                            "spool_file_create_at_eof_failed"
+                        );
+                    }
+                }
+            }
+        } else if let Some(f) = spool_file.as_mut() {
+            // Flush residual mem_buf (should be rare: threshold was hit
+            // mid-chunk, but a few bytes stayed in mem_buf before the
+            // spill opened the file).
+            let _ = f.write_all(&mem_buf).await;
+        }
+    }
+
     if let Some(f) = spool_file.as_mut() {
         let _ = f.flush().await;
     }

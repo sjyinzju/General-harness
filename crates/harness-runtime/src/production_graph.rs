@@ -255,11 +255,13 @@ impl ProductionGraph {
                     Arc::clone(&adapter),
                     profile.clone(),
                     prompt_registry.clone(),
+                    pool.clone(),
                 ));
                 let evaluator = Arc::new(ProductionGoalEvaluator::new(
                     Arc::clone(&adapter),
                     profile.clone(),
                     prompt_registry.clone(),
+                    pool.clone(),
                 ));
                 tracing::info!(
                     profile_id = %profile.id,

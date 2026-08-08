@@ -14,6 +14,7 @@ use harness_core::contracts::runtime_profile::RuntimeProfile;
 use harness_core::contracts::task_envelope::{FileScope, TaskBudget, TaskEnvelope};
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
 
 use crate::prompt::{PromptRegistry, RenderedPrompt};
 
@@ -25,6 +26,7 @@ pub struct ProductionGoalEvaluator {
     adapter: Arc<dyn AgentAdapter>,
     profile: RuntimeProfile,
     prompt_registry: Arc<PromptRegistry>,
+    pool: SqlitePool,
     /// Invocation records for session provenance tracking.
     invocations: Arc<std::sync::Mutex<Vec<super::RoleInvocation>>>,
 }
@@ -34,11 +36,13 @@ impl ProductionGoalEvaluator {
         adapter: Arc<dyn AgentAdapter>,
         profile: RuntimeProfile,
         prompt_registry: Arc<PromptRegistry>,
+        pool: SqlitePool,
     ) -> Self {
         Self {
             adapter,
             profile,
             prompt_registry,
+            pool,
             invocations: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -121,6 +125,22 @@ impl ProductionGoalEvaluator {
         let harness_session_id = format!("hs-evaluator-{}", uuid::Uuid::new_v4());
         let started_at = chrono::Utc::now();
 
+        // ── Durable invocation record — written BEFORE spawn ───────
+        let goal_id_fragment = &envelope.task_goal[..envelope.task_goal.len().min(64)];
+        let idempotency_key = format!("evaluator-{}", &invocation_id);
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO planner_invocations (invocation_id, goal_id, plan_revision_id, invocation_kind, profile_id, idempotency_key, input_digest, state, started_at, created_at) VALUES (?, ?, NULL, 'evaluator', ?, ?, ?, 'running', ?, ?)"
+        )
+        .bind(&invocation_id)
+        .bind(goal_id_fragment)
+        .bind(&self.profile.id)
+        .bind(&idempotency_key)
+        .bind("") // input_digest computed at call site but not available here
+        .bind(started_at.to_rfc3339())
+        .bind(started_at.to_rfc3339())
+        .execute(&self.pool)
+        .await;
+
         let opts = SessionOptions {
             working_directory: std::env::temp_dir(),
             env: {
@@ -149,7 +169,7 @@ impl ProductionGoalEvaluator {
         session.send_task(envelope).await?;
 
         let mut collector = EvaluatorEventCollector::new();
-        session.receive_events(&mut collector).await?;
+        let receive_result = session.receive_events(&mut collector).await;
         session.dispose().await?;
 
         let (result, stderr_digest, stdout_digest, exit_code, timed_out) = (
@@ -160,50 +180,82 @@ impl ProductionGoalEvaluator {
             collector.timed_out,
         );
 
-        let result = result.ok_or_else(|| {
-            let context = format!(
-                "stderr_digest={} stdout_digest={} exit_code={} timed_out={}",
-                stderr_digest.as_deref().unwrap_or("none"),
-                stdout_digest.as_deref().unwrap_or("none"),
-                exit_code.unwrap_or(-1),
-                timed_out
-            );
-            if timed_out {
-                CoreError::new(
-                    ErrorCode::ProcessTimeout {
-                        duration_ms: 120_000,
-                    },
-                    format!("Evaluator process timeout after 120s — {context}"),
-                    ErrorSource::Harness,
-                )
-            } else if exit_code.is_some() && exit_code != Some(0) {
-                CoreError::new(
-                    ErrorCode::Internal,
-                    format!(
-                        "Evaluator exited with code {} without producing final result — {context}",
-                        exit_code.unwrap()
-                    ),
-                    ErrorSource::Harness,
-                )
-            } else {
-                CoreError::new(
-                    ErrorCode::Internal,
-                    format!("Evaluator produced no final result — {context}"),
-                    ErrorSource::Harness,
-                )
-            }
-        })?;
-
-        let output = result.map_err(|msg| {
-            CoreError::new(
+        // ── Plan evaluator outcome ─────────────────────────────────
+        let eval_outcome: Result<serde_json::Value, CoreError> = match result {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(msg)) => Err(CoreError::new(
                 ErrorCode::Internal,
                 format!(
                     "Evaluator result was an error: {msg} — stderr={}",
                     stderr_digest.as_deref().unwrap_or("none")
                 ),
                 ErrorSource::Harness,
-            )
-        })?;
+            )),
+            None => {
+                let context = format!(
+                    "stderr_digest={} stdout_digest={} exit_code={} timed_out={}",
+                    stderr_digest.as_deref().unwrap_or("none"),
+                    stdout_digest.as_deref().unwrap_or("none"),
+                    exit_code.unwrap_or(-1),
+                    timed_out
+                );
+                let err = if timed_out {
+                    CoreError::new(
+                        ErrorCode::ProcessTimeout {
+                            duration_ms: 120_000,
+                        },
+                        format!("Evaluator process timeout after 120s — {context}"),
+                        ErrorSource::Harness,
+                    )
+                } else if exit_code.is_some() && exit_code != Some(0) {
+                    CoreError::new(
+                        ErrorCode::Internal,
+                        format!("Evaluator exited with code {} without producing final result — {context}", exit_code.unwrap()),
+                        ErrorSource::Harness,
+                    )
+                } else {
+                    CoreError::new(
+                        ErrorCode::Internal,
+                        format!("Evaluator produced no final result — {context}"),
+                        ErrorSource::Harness,
+                    )
+                };
+                Err(err)
+            }
+        };
+
+        // ── Update durable invocation record ───────────────────────
+        let completed_at = chrono::Utc::now();
+        let terminal_state = if eval_outcome.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        };
+        let output_digest = eval_outcome.as_ref().ok().map(|output| {
+            let mut h = Sha256::new();
+            h.update(serde_json::to_string(output).unwrap_or_default().as_bytes());
+            format!("{:x}", h.finalize())
+        });
+
+        if let Err(ref e) = receive_result {
+            tracing::warn!(
+                invocation_id = %invocation_id,
+                error = %e,
+                "Evaluator receive_events returned error"
+            );
+        }
+
+        let _ = sqlx::query(
+            "UPDATE planner_invocations SET state = ?, output_digest = ?, completed_at = ? WHERE invocation_id = ?"
+        )
+        .bind(terminal_state)
+        .bind(output_digest.as_deref().unwrap_or(""))
+        .bind(completed_at.to_rfc3339())
+        .bind(&invocation_id)
+        .execute(&self.pool)
+        .await;
+
+        let output = eval_outcome?;
 
         // ── Record invocation provenance ──────────────────────────
         let completed_at = chrono::Utc::now();

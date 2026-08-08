@@ -14,6 +14,7 @@ use harness_core::contracts::runtime_profile::RuntimeProfile;
 use harness_core::contracts::task_envelope::{FileScope, TaskBudget, TaskEnvelope};
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sha2::{Digest, Sha256};
+use sqlx::SqlitePool;
 
 use crate::prompt::{PromptRegistry, RenderedPrompt};
 
@@ -25,6 +26,7 @@ pub struct ProductionGoalPlanner {
     adapter: Arc<dyn AgentAdapter>,
     profile: RuntimeProfile,
     prompt_registry: Arc<PromptRegistry>,
+    pool: SqlitePool,
     /// Invocation records for session provenance tracking.
     invocations: Arc<std::sync::Mutex<Vec<super::RoleInvocation>>>,
 }
@@ -34,11 +36,13 @@ impl ProductionGoalPlanner {
         adapter: Arc<dyn AgentAdapter>,
         profile: RuntimeProfile,
         prompt_registry: Arc<PromptRegistry>,
+        pool: SqlitePool,
     ) -> Self {
         Self {
             adapter,
             profile,
             prompt_registry,
+            pool,
             invocations: Arc::new(std::sync::Mutex::new(Vec::new())),
         }
     }
@@ -118,7 +122,7 @@ impl ProductionGoalPlanner {
     }
 
     /// Call the Agent Adapter and extract the final JSON result.
-    /// Records invocation provenance for acceptance tracking (RC-C).
+    /// Records invocation provenance as durable DB record AND in-memory.
     async fn call_adapter(
         &self,
         envelope: &TaskEnvelope,
@@ -128,12 +132,24 @@ impl ProductionGoalPlanner {
         let harness_session_id = format!("hs-planner-{}", uuid::Uuid::new_v4());
         let started_at = chrono::Utc::now();
 
+        // ── Durable invocation record — written BEFORE spawn ───────
+        let goal_id = &envelope.task_goal[..envelope.task_goal.len().min(64)];
+        let idempotency_key = format!("planner-{}", &invocation_id);
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO planner_invocations (invocation_id, goal_id, plan_revision_id, invocation_kind, profile_id, idempotency_key, input_digest, state, started_at, created_at) VALUES (?, ?, NULL, 'planner', ?, ?, ?, 'running', ?, ?)"
+        )
+        .bind(&invocation_id)
+        .bind(goal_id)
+        .bind(&self.profile.id)
+        .bind(&idempotency_key)
+        .bind(&rendered.input_digest)
+        .bind(started_at.to_rfc3339())
+        .bind(started_at.to_rfc3339())
+        .execute(&self.pool)
+        .await;
+
         let opts = SessionOptions {
             working_directory: std::env::temp_dir(),
-            // Inherit ANTHROPIC env vars from parent process.
-            // Values are read once at session creation and passed to the child
-            // via env_overrides (required because ProcessManager filters sensitive
-            // env var names from the default inherited environment).
             env: {
                 let mut m = HashMap::new();
                 for key in &[
@@ -164,10 +180,10 @@ impl ProductionGoalPlanner {
 
         // Collect events
         let mut collector = PlannerEventCollector::new();
-        session.receive_events(&mut collector).await?;
+        let receive_result = session.receive_events(&mut collector).await;
         session.dispose().await?;
 
-        // Extract the result with detailed error classification
+        // ── Extract the result with detailed error classification ──
         let (result, stderr_digest, stdout_digest, exit_code, timed_out) = (
             collector.final_result,
             collector.stderr_preview,
@@ -176,64 +192,83 @@ impl ProductionGoalPlanner {
             collector.timed_out,
         );
 
-        let result = result.ok_or_else(|| {
-            let context = format!(
-                "stderr_digest={} stdout_digest={} exit_code={} timed_out={}",
-                stderr_digest.as_deref().unwrap_or("none"),
-                stdout_digest.as_deref().unwrap_or("none"),
-                exit_code.unwrap_or(-1),
-                timed_out
-            );
-            if timed_out {
-                CoreError::new(
-                    ErrorCode::ProcessTimeout {
-                        duration_ms: 120_000,
-                    },
-                    format!("Planner process timeout after 120s — {context}"),
-                    ErrorSource::Harness,
-                )
-            } else if exit_code.is_some() && exit_code != Some(0) {
-                CoreError::new(
-                    ErrorCode::Internal,
-                    format!(
-                        "Planner exited with code {} without producing final result — {context}",
-                        exit_code.unwrap()
-                    ),
-                    ErrorSource::Harness,
-                )
-            } else {
-                CoreError::new(
-                    ErrorCode::Internal,
-                    format!("Planner produced no final result — {context}"),
-                    ErrorSource::Harness,
-                )
-            }
-        })?;
-
-        let output = result.map_err(|msg| {
-            CoreError::new(
+        // ── Plan outcome: unwrap Result<Value, String> ─────────────
+        let plan_outcome: Result<serde_json::Value, CoreError> = match result {
+            Some(Ok(value)) => Ok(value),
+            Some(Err(msg)) => Err(CoreError::new(
                 ErrorCode::Internal,
                 format!(
                     "Planner result was an error: {msg} — stderr={}",
                     stderr_digest.as_deref().unwrap_or("none")
                 ),
                 ErrorSource::Harness,
-            )
-        })?;
-
-        // ── Record invocation provenance ──────────────────────────
-        let completed_at = chrono::Utc::now();
-        let output_digest = {
-            use sha2::{Digest, Sha256};
-            let mut h = Sha256::new();
-            h.update(
-                serde_json::to_string(&output)
-                    .unwrap_or_default()
-                    .as_bytes(),
-            );
-            Some(format!("{:x}", h.finalize()))
+            )),
+            None => {
+                let context = format!(
+                    "stderr_digest={} stdout_digest={} exit_code={} timed_out={}",
+                    stderr_digest.as_deref().unwrap_or("none"),
+                    stdout_digest.as_deref().unwrap_or("none"),
+                    exit_code.unwrap_or(-1),
+                    timed_out
+                );
+                let err = if timed_out {
+                    CoreError::new(
+                        ErrorCode::ProcessTimeout {
+                            duration_ms: 120_000,
+                        },
+                        format!("Planner process timeout after 120s — {context}"),
+                        ErrorSource::Harness,
+                    )
+                } else if exit_code.is_some() && exit_code != Some(0) {
+                    CoreError::new(
+                        ErrorCode::Internal,
+                        format!("Planner exited with code {} without producing final result — {context}", exit_code.unwrap()),
+                        ErrorSource::Harness,
+                    )
+                } else {
+                    CoreError::new(
+                        ErrorCode::Internal,
+                        format!("Planner produced no final result — {context}"),
+                        ErrorSource::Harness,
+                    )
+                };
+                Err(err)
+            }
         };
 
+        // ── Update durable invocation record ───────────────────────
+        let completed_at = chrono::Utc::now();
+        let terminal_state = if plan_outcome.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        };
+        let output_digest = plan_outcome.as_ref().ok().map(|output| {
+            let mut h = Sha256::new();
+            h.update(serde_json::to_string(output).unwrap_or_default().as_bytes());
+            format!("{:x}", h.finalize())
+        });
+
+        // Also capture receive_result error for diagnostics
+        if let Err(ref e) = receive_result {
+            tracing::warn!(
+                invocation_id = %invocation_id,
+                error = %e,
+                "Planner receive_events returned error"
+            );
+        }
+
+        let _ = sqlx::query(
+            "UPDATE planner_invocations SET state = ?, output_digest = ?, completed_at = ? WHERE invocation_id = ?"
+        )
+        .bind(terminal_state)
+        .bind(output_digest.as_deref().unwrap_or(""))
+        .bind(completed_at.to_rfc3339())
+        .bind(&invocation_id)
+        .execute(&self.pool)
+        .await;
+
+        // ── Record in-memory provenance ────────────────────────────
         let record = super::RoleInvocation {
             invocation_id: invocation_id.clone(),
             role: "GoalPlanner".to_string(),
@@ -251,7 +286,7 @@ impl ProductionGoalPlanner {
             process_identity: format!("pid-{}", std::process::id()),
             started_at,
             completed_at: Some(completed_at),
-            terminal_state: Some("completed".to_string()),
+            terminal_state: Some(terminal_state.to_string()),
         };
 
         if let Ok(mut invocations) = self.invocations.lock() {
@@ -263,10 +298,11 @@ impl ProductionGoalPlanner {
             harness_session_id = %harness_session_id,
             role = "GoalPlanner",
             session_mode = "fresh",
-            "Planner invocation recorded (RC-C: session provenance)"
+            terminal_state = terminal_state,
+            "Planner invocation recorded (durable DB + in-memory)"
         );
 
-        Ok(output)
+        plan_outcome
     }
 }
 
