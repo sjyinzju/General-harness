@@ -32,11 +32,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Code HEAD: {code_head}");
 
     // ── Setup isolated canary environment ─────────────────────────
-    let canary_dir = std::env::temp_dir().join("harness-canary").join(&run_id);
+    // Must be OUTSIDE the harness repo (which is a git worktree).
+    // Use drive root to avoid worktree nesting errors.
+    let canary_dir = Path::new(r"E:\harness-canary").join(&run_id);
     std::fs::create_dir_all(&canary_dir)?;
     let db_path = canary_dir.join("harness.db");
     let test_repo = canary_dir.join("canary-repo");
-    let worktree_root = std::env::temp_dir().join("harness-canary-wt").join(&run_id);
+    let worktree_root = Path::new(r"E:\harness-canary-wt").join(&run_id);
 
     // ── Create canary fixture repo ────────────────────────────────
     println!("--- Setting up canary fixture repo ---");

@@ -74,7 +74,8 @@ impl ProductionGoalEvaluator {
 
         let envelope = build_evaluator_envelope(&rendered);
 
-        let output_json = self.call_adapter(&envelope).await?;
+        let goal_id = context.goal.goal_id.clone();
+        let output_json = self.call_adapter(&envelope, &goal_id).await?;
 
         let proposal: ProgressAssessmentProposal = serde_json::from_value(output_json.clone())
             .map_err(|e| {
@@ -120,19 +121,22 @@ impl ProductionGoalEvaluator {
         Ok(proposal)
     }
 
-    async fn call_adapter(&self, envelope: &TaskEnvelope) -> Result<serde_json::Value, CoreError> {
+    async fn call_adapter(
+        &self,
+        envelope: &TaskEnvelope,
+        goal_id: &str,
+    ) -> Result<serde_json::Value, CoreError> {
         let invocation_id = format!("inv-evaluator-{}", uuid::Uuid::new_v4());
         let harness_session_id = format!("hs-evaluator-{}", uuid::Uuid::new_v4());
         let started_at = chrono::Utc::now();
 
         // ── Durable invocation record — written BEFORE spawn ───────
-        let goal_id_fragment = &envelope.task_goal[..envelope.task_goal.len().min(64)];
         let idempotency_key = format!("evaluator-{}", &invocation_id);
         let _ = sqlx::query(
             "INSERT OR IGNORE INTO planner_invocations (invocation_id, goal_id, plan_revision_id, invocation_kind, profile_id, idempotency_key, input_digest, state, started_at, created_at) VALUES (?, ?, NULL, 'evaluator', ?, ?, ?, 'running', ?, ?)"
         )
         .bind(&invocation_id)
-        .bind(goal_id_fragment)
+        .bind(goal_id)
         .bind(&self.profile.id)
         .bind(&idempotency_key)
         .bind("") // input_digest computed at call site but not available here

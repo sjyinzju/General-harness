@@ -82,7 +82,8 @@ impl ProductionGoalPlanner {
         let envelope = build_planner_envelope(&rendered, context);
 
         // 5. Call the Agent Adapter
-        let output_json = self.call_adapter(&envelope, &rendered).await?;
+        let goal_id = context.goal.goal_id.clone();
+        let output_json = self.call_adapter(&envelope, &rendered, &goal_id).await?;
 
         // 6. Parse the structured output
         let raw_str = serde_json::to_string_pretty(&output_json).unwrap_or_default();
@@ -127,13 +128,13 @@ impl ProductionGoalPlanner {
         &self,
         envelope: &TaskEnvelope,
         rendered: &RenderedPrompt,
+        goal_id: &str,
     ) -> Result<serde_json::Value, CoreError> {
         let invocation_id = format!("inv-planner-{}", uuid::Uuid::new_v4());
         let harness_session_id = format!("hs-planner-{}", uuid::Uuid::new_v4());
         let started_at = chrono::Utc::now();
 
         // ── Durable invocation record — written BEFORE spawn ───────
-        let goal_id = &envelope.task_goal[..envelope.task_goal.len().min(64)];
         let idempotency_key = format!("planner-{}", &invocation_id);
         let _ = sqlx::query(
             "INSERT OR IGNORE INTO planner_invocations (invocation_id, goal_id, plan_revision_id, invocation_kind, profile_id, idempotency_key, input_digest, state, started_at, created_at) VALUES (?, ?, NULL, 'planner', ?, ?, ?, 'running', ?, ?)"
