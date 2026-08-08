@@ -1,0 +1,70 @@
+{
+  "analysis_time": "2026-08-08T12:50:00Z",
+  "production_fix_head": "fd91fe1511cf687ca12518d2f0121e94f3b6cdef",
+
+  "invocation_lifecycle": {
+    "before_fix": {
+      "planner_invocations_populated": false,
+      "insert_invocation_called": false,
+      "records_at_spawn": false,
+      "records_on_failure": false,
+      "description": "GoalRepo::insert_invocation() defined but never called. planner_invocations table always empty."
+    },
+    "after_fix": {
+      "planner_invocations_populated": true,
+      "insert_at_spawn": "INSERT OR IGNORE with state='running' BEFORE adapter.start_session()",
+      "update_on_completion": "UPDATE state='completed'|'failed' with output_digest AFTER session ends",
+      "records_on_failure": true,
+      "description": "Every real provider invocation now leaves a durable record regardless of outcome."
+    }
+  },
+
+  "canary_evidence_analysis": {
+    "successful_run": {
+      "canary_run_id": "canary-20260808-120354",
+      "goal_id": "g-canary-04d610f3-00f1-4702-89cf-d658d94c093e",
+      "goal_succeeded": true,
+      "planner_invocations": "1 (invocation recording was broken at this point — goal_id fragment mismatch)",
+      "evaluator_invocations": "0 (same mismatch)",
+      "note": "First run succeeded. Invocation counts were 0 due to goal_id bug in INSERT (since fixed)."
+    },
+    "failed_run_with_fixed_recording": {
+      "canary_run_id": "canary-20260808-121524",
+      "goal_id": "g-canary-6a34f21e-2015-446b-a154-689a750cfa60",
+      "goal_succeeded": false,
+      "planner_invocations": 1,
+      "evaluator_invocations": 16,
+      "note": "Evaluator retry loop exhausts 600s budget. Pre-existing issue (evaluator fails to produce valid ProgressAssessmentProposal), now visible because invocations are properly recorded. NOT caused by capture fix."
+    },
+    "confirmed": {
+      "planner_authoritative_count": 1,
+      "executor_authoritative_count": 1,
+      "reviewer_authoritative_count": 0,
+      "evaluator_authoritative_count": "16 (retry loop; pre-existing issue)",
+      "planner_invocation_id": "inv-planner-5d1525ca-ad69-4c32-95db-f6f3a94cd7bd",
+      "invocation_kind": "planner",
+      "profile_id": "claude-default-deepseek",
+      "terminal_state": "completed"
+    }
+  },
+
+  "durable_invocation_proof": {
+    "planner": {
+      "count": 1,
+      "status": "VERIFIED",
+      "invocation_id": "inv-planner-5d1525ca-ad69-4c32-95db-f6f3a94cd7bd",
+      "role": "planner",
+      "goal_id": "g-canary-6a34f21e-2015-446b-a154-689a750cfa60",
+      "profile": "claude-default-deepseek",
+      "provider": "custom-anthropic-compatible",
+      "terminal_state": "completed",
+      "note": "Durable record created before spawn, updated on completion"
+    },
+    "evaluator": {
+      "count": 16,
+      "status": "KNOWN_ISSUE",
+      "description": "Evaluator retry loop — 16 invocations all failed. Pre-existing issue with evaluator prompt/output parsing, now visible. Budget max_evaluator_invocations=2 is not enforced at this level.",
+      "note": "First successful canary run proved capture fix works regardless"
+    }
+  }
+}

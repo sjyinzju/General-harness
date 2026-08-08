@@ -1,0 +1,71 @@
+{
+  "analysis_time": "2026-08-08T11:47:00Z",
+  "current_head": "4830655d3f93144e5deb24875d1ceb3ef867fefd",
+  "summary": "Claude CLI output capture fails because: (1) mem_buf silently dropped at EOF when output is under spool threshold (64KB), (2) receive_events only reads spool file or truncated 2KB preview, (3) planner_invocations table never populated — insert_invocation() defined but never called.",
+
+  "root_causes": [
+    {
+      "id": "RC-1",
+      "title": "mem_buf silently dropped in run_sink at EOF",
+      "file": "crates/harness-runtime/src/process/capture.rs",
+      "lines": "142, 204-207, 241-247",
+      "severity": "critical",
+      "description": "When using CapturePolicy::Spool with output under max_memory_bytes threshold (64KB), data is buffered in mem_buf (line 142). At EOF (after while loop), mem_buf is dropped — it's never flushed to spool file or included in StreamCaptureResult. Only the 2048-byte preview is accessible. If Claude's output is between 2KB and 64KB (typical for real prompts), the 'result' event at the end of the stream is lost.",
+      "fix": "At EOF, if mem_buf is non-empty and no spool file exists, create spool file and flush mem_buf to it. This ensures spool_ref is always Some when output > 0 bytes."
+    },
+    {
+      "id": "RC-2",
+      "title": "receive_events only reads spool file or preview",
+      "file": "crates/harness-adapters/src/claude/mod.rs",
+      "lines": "630-693",
+      "severity": "critical",
+      "description": "ClaudeCliSession::receive_events() first checks outcome.stdout_ref (spool file path), else falls back to outcome.stdout_preview (2048 bytes max). Since RC-1 causes spool_ref to be None for small outputs, only the preview is available — which is truncated to 2048 bytes and may not contain the final 'result' event.",
+      "fix": "After RC-1 fix, spool_ref is always set for non-empty output. The existing fallback logic is correct but depends on RC-1."
+    },
+    {
+      "id": "RC-3",
+      "title": "planner_invocations table never populated",
+      "file": "crates/harness-runtime/src/goal/planner.rs, repo.rs",
+      "lines": "repo.rs:710-737, planner.rs:126-270",
+      "severity": "high",
+      "description": "GoalRepo::insert_invocation() is defined (repo.rs:710) but never called. ProductionGoalPlanner::call_adapter() only records in-memory RoleInvocation structs. The planner_invocations table (migration 028) remains empty, making durable invocation counting impossible. Same issue in ProductionGoalEvaluator.",
+      "fix": "Added SqlitePool to Planner/Evaluator constructors. call_adapter now INSERTs a 'running' record BEFORE spawn and UPDATEs to 'completed'/'failed' on completion."
+    },
+    {
+      "id": "RC-4",
+      "title": "Spool threshold too high for typical LLM output",
+      "file": "crates/harness-adapters/src/claude/mod.rs",
+      "lines": "568-573",
+      "severity": "contributing",
+      "description": "max_memory_bytes is set to 64KB. Typical Claude CLI output for a single-turn prompt is 5-15KB, well under the threshold. Without RC-1 fix, this means NO spool file is ever created for normal planner/evaluator invocations.",
+      "fix": "RC-1 fix makes this moot — data is flushed to spool regardless of threshold breach."
+    }
+  ],
+
+  "raw_cli_test": {
+    "executable": "C:\\Users\\shiju\\AppData\\Roaming\\npm\\claude.cmd",
+    "method": "System.Diagnostics.Process (not harness)",
+    "stdout_bytes": 8536,
+    "stderr_bytes": 0,
+    "exit_code": 0,
+    "result_event_found": true,
+    "result_field": "{\\\"result\\\":\\\"hello\\\"}",
+    "format": "stream-json lines, ending with type=result"
+  },
+
+  "capture_tests": {
+    "total": 7,
+    "passed": 7,
+    "key_test": "test_small_output_creates_spool_at_eof — PASS (proves EOF flush fix works)"
+  },
+
+  "fixes_applied": [
+    "capture.rs: Added EOF mem_buf→spool flush (lines after while loop)",
+    "claude/mod.rs: No changes needed — existing spool_ref→preview fallback correct",
+    "planner.rs: Added pool field, durable INSERT before spawn, UPDATE on completion",
+    "evaluator.rs: Same durable invocation lifecycle as planner",
+    "production_graph.rs: Pass pool to Planner/Evaluator constructors"
+  ],
+
+  "remaining_investigation": "If 0 bytes are still captured after fixes, investigate CREATE_SUSPENDED + .cmd file interaction with tokio::process. The raw CLI test via System.Diagnostics.Process (no CREATE_SUSPENDED) captures 8536 bytes correctly."
+}

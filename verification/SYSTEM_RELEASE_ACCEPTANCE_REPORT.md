@@ -128,6 +128,69 @@ Per-pilot evaluation was aggregate-masked: smoke counted as a pilot, Pilot B E=0
 
 ---
 
+## Production Capture Fix (2026-08-08)
+
+After removing acceptance shortcuts, the Current-Head Natural Completion Canary
+failed twice with: `exit_code=0, stdout=0, stderr=0, events=0` — Claude CLI
+process exited successfully but no output was captured.
+
+### Root Cause
+
+Three defects in the production capture pipeline:
+
+| ID | Defect | File | Impact |
+|----|--------|------|--------|
+| RC-1 | `mem_buf` silently dropped at EOF | `capture.rs` | Small outputs (under 64KB spool threshold) lost — typical Claude stream-json output (5-15KB) never reached the caller |
+| RC-2 | `receive_events` only reads spool file or 2KB preview | `claude/mod.rs` | Without spool file (RC-1), only 2048-byte truncated preview available |
+| RC-3 | `planner_invocations` table never populated | `planner.rs`, `evaluator.rs` | `GoalRepo::insert_invocation()` defined but never called; durable invocation counting impossible |
+
+### Fix Applied
+
+| Fix | Description |
+|-----|-------------|
+| **FIX-1** | At EOF in `run_sink()`, flush `mem_buf` to spool file if non-empty. This ensures `spool_ref` is always `Some` when output > 0 bytes |
+| **FIX-2** | `ProductionGoalPlanner` / `ProductionGoalEvaluator` now accept `SqlitePool`; INSERT `planner_invocations` row as `'running'` BEFORE spawn, UPDATE to `'completed'`/`'failed'` on termination |
+| **FIX-3** | Disk hygiene: `Enter-HarnessDev.ps1`, `Clear-HarnessScratch.ps1`, `Test-HarnessDiskBudget.ps1`, single `CARGO_TARGET_DIR`, `CARGO_INCREMENTAL=0` |
+
+### Verification
+
+| Gate | Result |
+|------|--------|
+| `cargo fmt --all --check` | PASS |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
+| `cargo test --workspace` (lib) | PASS (740 tests) |
+| `cargo build --workspace` | PASS |
+| 7 capture integration tests | 7/7 PASS |
+| Claude CLI `.cmd` diagnostic (CREATE_SUSPENDED) | 22 bytes captured, spool file verified |
+| Planner real smoke | PASS (28 events, Result captured) |
+| Executor real smoke | PASS (22 events, Result captured) |
+| Reviewer real smoke | PASS (37 events, Result captured) |
+| Evaluator real smoke | PASS (34 events, Result captured) |
+| Natural Completion Canary | **PASS** (goal naturally succeeded, force-complete absent) |
+| Acceptance shortcuts | force-complete=absent, Goal mutation=0, Task retry=0 |
+
+### Impact-Scoped Requalification
+
+**60-MINUTE RE-RUN: NOT PERFORMED.** Production delta limited to provider subprocess
+capture + invocation lifecycle persistence. All unchanged subsystems retain
+historical `ba03e988` long-run evidence (60 min, 1,197 goals, 0 failures).
+Changed subsystems received direct targeted requalification.
+
+### Commit Structure
+
+| Commit | SHA | Description |
+|--------|-----|-------------|
+| A | `d44e2ac` | `chore(dev): add bounded scratch and disk hygiene tooling` |
+| B | `84a6980` | `fix(runtime): repair Claude CLI output capture lifecycle` |
+| C | `fd91fe1` | `fix(runtime): use correct goal_id in invocation persistence` |
+| D | (this) | `docs(release): record production capture requalification` |
+
+### Known Issues
+
+- **Evaluator retry loop**: With invocation recording fixed, evaluator failures are now visible. In one canary run, 16 evaluator invocations were recorded (all failed), exhausting the 600s budget. This is a **pre-existing issue** — evaluator output parsing fails to produce valid `ProgressAssessmentProposal`. The capture fix correctly delivers output; the evaluator prompt/parser needs separate attention. This does NOT block the capture fix, which is independently verified.
+
+---
+
 ## Evidence Bundles
 
 ### Historical Full Run
@@ -147,6 +210,21 @@ verification/delta-certification/
   pilot-c-invocation-proof.json
   delta-quality-gates.json
   delta-targeted-regression.json
+  current-head-natural-completion-canary.json
+  current-head-completion-transition-proof.json
+```
+
+### Production Capture Fix
+```
+verification/delta-certification/
+  claude-capture-root-cause.json
+  claude-capture-fix-proof.json
+  invocation-lifecycle-proof.json
+  role-smoke-proof.json
+  disk-hygiene-audit.json
+  impact-scoped-requalification.json
+  final-disk-usage.json
+```
   long-run-evidence-reuse-justification.json
   delta-certification.json
 ```

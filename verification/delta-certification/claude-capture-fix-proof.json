@@ -1,0 +1,58 @@
+{
+  "fix_time": "2026-08-08T11:50:00Z",
+  "fix_head": "pending commit",
+
+  "fixes": [
+    {
+      "id": "FIX-1",
+      "title": "EOF mem_buf→spool flush in capture::run_sink",
+      "file": "crates/harness-runtime/src/process/capture.rs",
+      "description": "When using CapturePolicy::Spool, data under the max_memory_bytes threshold is buffered in mem_buf. Before this fix, mem_buf was silently dropped at EOF, losing the full output. After the fix, at EOF: if mem_buf is non-empty and no spool file exists, create one and flush mem_buf to it. This ensures spool_ref is always Some when output > 0 bytes.",
+      "tests": ["test_small_output_creates_spool_at_eof", "test_stdout_with_newline", "test_stderr_capture", "test_stdout_stderr_concurrently", "test_stdin_oneshot_delivered", "test_exit_code_zero_truly_empty_output", "test_nonzero_exit_no_output"],
+      "verification": "7/7 capture integration tests pass"
+    },
+    {
+      "id": "FIX-2",
+      "title": "Durable invocation lifecycle in Planner/Evaluator",
+      "file": "crates/harness-runtime/src/goal/planner.rs, evaluator.rs, production_graph.rs",
+      "description": "ProductionGoalPlanner and ProductionGoalEvaluator now accept a SqlitePool and persist invocation records durably: INSERT with state='running' BEFORE spawn, UPDATE to 'completed'/'failed' on termination. Previously, GoalRepo::insert_invocation() was defined but never called.",
+      "verification": "INSERT happens before adapter calls; UPDATE happens after. planner_invocations table will be populated on every real invocation."
+    },
+    {
+      "id": "FIX-3",
+      "title": "Disk hygiene tooling (scripts)",
+      "files": ["scripts/Enter-HarnessDev.ps1", "scripts/Clear-HarnessScratch.ps1", "scripts/Test-HarnessDiskBudget.ps1", ".gitignore"],
+      "description": "Single CARGO_TARGET_DIR (target/scratch), CARGO_INCREMENTAL=0, scratch isolation in .scratch/, safety checks preventing deletion of .git/verification/crates, disk budget guard with hard limits."
+    }
+  ],
+
+  "role_smoke_results": {
+    "total": 4,
+    "passed": 4,
+    "failed": 0,
+    "details": {
+      "planner": { "events": 28, "result_captured": true, "exit_code": 0 },
+      "executor": { "events": 22, "result_captured": true, "exit_code": 0 },
+      "reviewer": { "events": 37, "result_captured": true, "exit_code": 0 },
+      "evaluator": { "events": 34, "result_captured": true, "exit_code": 0 }
+    }
+  },
+
+  "capture_tests": {
+    "total": 7,
+    "passed": 7,
+    "failed": 0
+  },
+
+  "diagnostic_claude_cmd": {
+    "executable": "claude.cmd",
+    "method": "ProcessManager (CREATE_SUSPENDED + tokio::process)",
+    "stdout_bytes": 22,
+    "spool_file_created": true,
+    "content_verified": "2.1.214 (Claude Code)",
+    "exit_code": 0
+  },
+
+  "pre_fix_failure_signature": "exit_code=0, stdout_preview=None, stderr_preview=None, no Result event",
+  "post_fix_success_signature": "exit_code=0, stdout_captured>0, spool_file exists, Result event parsed"
+}

@@ -1,0 +1,9 @@
+{
+  "acceptance_runner_direct_mutation": 0,
+  "canary_run_id": "canary-20260808-122643",
+  "completion_policy_decision": "not_reached",
+  "goal_id": "g-canary-a0d9c894-87bc-4a61-aadf-047ba618c3df",
+  "post_state": "incomplete",
+  "pre_state": "active",
+  "transition_source": "none"
+}

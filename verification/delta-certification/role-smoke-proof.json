@@ -1,0 +1,38 @@
+{
+  "run_time": "2026-08-08T11:50:00Z",
+  "profile": "claude-default-deepseek",
+  "provider": "custom-anthropic-compatible (DeepSeek V4 Pro via Claude CLI 2.1.214)",
+  "results": {
+    "planner": {
+      "status": "PASS",
+      "events_count": 28,
+      "result_captured": true,
+      "exit_code": 0,
+      "description": "Claude produced stream-json output captured via spool, parsed into AgentEvents including Result"
+    },
+    "executor": {
+      "status": "PASS",
+      "events_count": 22,
+      "result_captured": true,
+      "exit_code": 0,
+      "description": "Claude produced stream-json output captured via spool, parsed into AgentEvents including Result"
+    },
+    "reviewer": {
+      "status": "PASS",
+      "events_count": 37,
+      "result_captured": true,
+      "exit_code": 0,
+      "description": "Claude produced stream-json output captured via spool, parsed into AgentEvents including Result"
+    },
+    "evaluator": {
+      "status": "PASS",
+      "events_count": 34,
+      "result_captured": true,
+      "exit_code": 0,
+      "description": "Claude produced stream-json output captured via spool, parsed into AgentEvents including Result"
+    }
+  },
+  "summary": "ALL 4 ROLE SMOKES PASS — production capture pipeline verified end-to-end",
+  "max_real_provider_invocations": 4,
+  "total_real_provider_invocations_used": 4
+}

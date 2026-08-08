@@ -1,0 +1,54 @@
+{
+  "audit_time": "2026-08-08T12:50:00Z",
+  "checks": {
+    "single_cargo_target_dir": {
+      "status": "PASS",
+      "path": "E:\\General-harness\\target\\scratch",
+      "size_mb": 7105.2,
+      "note": "Single shared target. No per-run target directories found."
+    },
+    "cargo_incremental_disabled": {
+      "status": "PASS",
+      "value": "0"
+    },
+    "scratch_isolation": {
+      "status": "PASS",
+      "dot_scratch_mb": 11.6,
+      "ownership_marker": true
+    },
+    "no_per_run_cargo_targets": {
+      "status": "PASS",
+      "description": "No target\\system-*, target\\delta-*, target\\canary-*, target\\fullrun-* directories found"
+    },
+    "harness_owned_large_c_temp": {
+      "status": "PASS",
+      "artifacts": 0,
+      "description": "No harness-owned large C-drive temp artifacts detected"
+    },
+    "e_drive_free_gb": 99.1,
+    "disk_budget": {
+      "min_free_gb": 20,
+      "current_free_gb": 99.1,
+      "status": "PASS"
+    },
+    "target_scratch_budget": {
+      "warn_gb": 30,
+      "hard_gb": 40,
+      "current_gb": 6.9,
+      "status": "OK (under warn threshold)"
+    },
+    "dot_scratch_budget": {
+      "warn_gb": 10,
+      "hard_gb": 20,
+      "current_gb": 0.01,
+      "status": "OK"
+    }
+  },
+  "canary_cleanup": {
+    "canary_dir": "E:\\harness-canary\\canary-20260808-120354",
+    "worktree_dir": "E:\\harness-canary-wt\\canary-20260808-120354",
+    "spool_files": "Cleaned by canary on success",
+    "orphan_processes": 0,
+    "orphan_worktrees": 0
+  }
+}
