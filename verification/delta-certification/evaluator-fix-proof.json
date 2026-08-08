@@ -1,0 +1,117 @@
+{
+  "generated_at": "2026-08-08T13:00:00Z",
+  "commit": "PENDING_COMMIT_A",
+  "fixes_applied": [
+    {
+      "id": "FIX-1",
+      "title": "Add #[serde(default)] to ProgressAssessmentProposal.blockers",
+      "file": "crates/harness-runtime/src/goal/mod.rs",
+      "description": "blockers field now defaults to empty Vec when omitted from LLM output. This was the primary root cause of ProgressAssessmentProposal parse failures — the schema did not list blockers in required, but the Rust struct required it.",
+      "before": "pub blockers: Vec<String>",
+      "after": "#[serde(default)]\npub blockers: Vec<String>"
+    },
+    {
+      "id": "FIX-2",
+      "title": "Add recommendation field to ProgressAssessmentProposal",
+      "file": "crates/harness-runtime/src/goal/mod.rs",
+      "description": "Schema requires 'recommendation' field but Rust type was missing it. Added as optional String with #[serde(default)].",
+      "before": "// no recommendation field",
+      "after": "#[serde(default)]\npub recommendation: String"
+    },
+    {
+      "id": "FIX-3",
+      "title": "Fix schema: add blockers to required array",
+      "file": "crates/harness-runtime/src/prompt/prompts/goal_evaluator_v1_schema.json",
+      "description": "Added 'blockers' to the JSON schema required array so LLM always outputs it.",
+      "before": "required: [..., 'recommendation', 'summary']",
+      "after": "required: [..., 'blockers', 'recommendation', 'summary']"
+    },
+    {
+      "id": "FIX-4",
+      "title": "Soften evaluator prompt fence instructions",
+      "file": "crates/harness-runtime/src/prompt/prompts/goal_evaluator_v1.md",
+      "description": "Changed from 'Do NOT use markdown fences' to 'Prefer raw JSON. Fences will be stripped automatically.' Reduces LLM confusion.",
+      "lines_changed": 2
+    },
+    {
+      "id": "FIX-5",
+      "title": "Enforce max_evaluator_invocations with durable count",
+      "file": "crates/harness-runtime/src/goal/service.rs",
+      "description": "Before spawning evaluator provider, count durable evaluator invocations from planner_invocations table. If count >= max_evaluator_invocations, skip provider spawn. Survives crash/restart.",
+      "function": "GoalLoopService::evaluate_and_complete",
+      "key_changes": [
+        "Durable count query BEFORE provider spawn",
+        "Budget exhaustion → skip evaluator (no provider spawn)",
+        "Retry loop within remaining budget for transient errors",
+        "Error classification: transient vs non-retryable"
+      ]
+    },
+    {
+      "id": "FIX-6",
+      "title": "Add count_durable_evaluator_invocations helper",
+      "file": "crates/harness-runtime/src/goal/service.rs",
+      "description": "Reads COUNT(*) FROM planner_invocations WHERE goal_id = ? AND invocation_kind = 'evaluator'. This is the authoritative budget counter.",
+      "table": "planner_invocations",
+      "discriminator": "invocation_kind = 'evaluator'"
+    },
+    {
+      "id": "FIX-7",
+      "title": "Add is_evaluator_error_retryable classifier",
+      "file": "crates/harness-runtime/src/goal/service.rs",
+      "description": "Classifies errors: ProcessTimeout → retryable; SerializationError/InvalidState → NOT retryable; Internal → heuristic (provider failure retryable, harness defect not)."
+    }
+  ],
+  "test_coverage": {
+    "parser_tests": 24,
+    "budget_tests": 16,
+    "total_new_tests": 40,
+    "all_pass": true,
+    "parser_coverage": [
+      "canonical valid ProgressAssessmentProposal",
+      "leading/trailing whitespace",
+      "json markdown fence",
+      "plain markdown fence",
+      "no trailing newline",
+      "provider noise before JSON",
+      "provider noise after JSON",
+      "invalid enum casing (PascalCase)",
+      "invalid enum value (unknown variant)",
+      "missing required field (overall_assessment)",
+      "malformed JSON",
+      "empty output",
+      "prose only (no JSON)",
+      "blockers omitted → defaults to empty",
+      "recommendation omitted → defaults to empty",
+      "partially_satisfied with evidence",
+      "satisfied without evidence → output guard rejects",
+      "unknown status parse",
+      "blocked status parse",
+      "all 5 criterion statuses"
+    ],
+    "budget_coverage": [
+      "process timeout → retryable",
+      "serialization error → NOT retryable",
+      "invalid state → NOT retryable",
+      "provider failure (exit code) → retryable",
+      "process timeout (message) → retryable",
+      "no final result → retryable",
+      "harness defect → NOT retryable",
+      "not found → NOT retryable",
+      "fresh goal → count 0",
+      "count evaluator rows only",
+      "count scoped to goal_id",
+      "durable count survives restart",
+      "GoalBudget::is_exhausted evaluator check",
+      "max=2 blocks third attempt",
+      "timeout consumes budget",
+      "serialization failure consumes budget"
+    ]
+  },
+  "quality_gates": {
+    "fmt": "PASS",
+    "clippy": "PASS",
+    "workspace_lib_tests": "629 PASS, 0 FAILED",
+    "workspace_build": "PASS",
+    "binary_e2e_tests": "8 pre-existing failures (binary not built — not related to evaluator changes)"
+  }
+}

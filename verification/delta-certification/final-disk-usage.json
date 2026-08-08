@@ -1,11 +1,13 @@
 {
-  "audit_time": "2026-08-08T12:50:00Z",
-  "e_drive_free_gb": 99.1,
-  "target_scratch_size_mb": 7105.2,
+  "audit_time": "2026-08-08T13:03:00Z",
+  "e_drive_free_gb": 94.6,
+  "target_scratch_size_mb": 12090.8,
   "dot_scratch_size_mb": 11.6,
-  "system_temp_path": "C:\\Users\\shiju\\AppData\\Local\\Temp",
+  "system_temp_path": "E:\\General-harness\\.scratch\\temp",
+  "cargo_target_dir": "E:\\General-harness\\target\\scratch",
+  "cargo_incremental": "0",
   "harness_owned_c_drive_temp_artifacts": 0,
-  "large_artifacts_note": "target\\scratch at 7.1 GB is from full workspace compilation — within warn threshold (30 GB). No per-run target accumulation.",
-  "verification_evidence_size_mb": "< 1 MB",
-  "cleanup_status": "Canary temp dirs cleaned. No orphan processes, worktrees, claims, leases, or git locks."
+  "single_cargo_target": true,
+  "multiple_cargo_targets": false,
+  "disk_hygiene": "PASS"
 }

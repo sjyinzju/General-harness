@@ -1,0 +1,94 @@
+{
+  "generated_at": "2026-08-08T12:44:00Z",
+  "commit": "c302c4cdb8cae7b03edcc60ab2822ceb44f2d535",
+  "root_causes": [
+    {
+      "id": "RC-1",
+      "severity": "HIGH",
+      "category": "F",
+      "category_label": "schema/serde mismatch — missing required field",
+      "title": "blockers field has no serde(default) but schema does not require it",
+      "detail": {
+        "rust_type": "ProgressAssessmentProposal",
+        "field": "blockers",
+        "rust_type_decl": "pub blockers: Vec<String>",
+        "has_serde_default": false,
+        "schema_required_array": ["schema_version", "overall_assessment", "criteria_assessments", "plan_sufficient", "replan_recommended", "completion_recommended", "recommendation", "summary"],
+        "schema_has_blockers_in_required": false,
+        "schema_lists_blockers": true,
+        "failure_mode": "If LLM omits `blockers` field (not in schema required array), serde_json::from_value fails with 'missing field `blockers`'",
+        "reproduction": "JSON without 'blockers' key → serde error → assess() returns SerializationError",
+        "fix": "Add #[serde(default)] to blockers field so it defaults to empty Vec when missing"
+      }
+    },
+    {
+      "id": "RC-2",
+      "severity": "MEDIUM",
+      "category": "F",
+      "category_label": "schema/serde mismatch — schema requires field not in Rust type",
+      "title": "Schema requires 'recommendation' field not present in Rust ProgressAssessmentProposal",
+      "detail": {
+        "rust_type": "ProgressAssessmentProposal",
+        "schema_requires": "recommendation",
+        "rust_has_field": false,
+        "impact": "NOT a parse failure (serde ignores unknown fields by default). However, the LLM must output a field that is semantically redundant with the boolean flags (replan_recommended, completion_recommended). This creates prompt confusion.",
+        "fix": "Either add recommendation field to Rust struct with #[serde(default)], or remove from schema. Recommendation: add it as optional string with default."
+      }
+    },
+    {
+      "id": "RC-3",
+      "severity": "CRITICAL",
+      "category": "budget_enforcement",
+      "title": "max_evaluator_invocations NOT enforced before provider spawn",
+      "detail": {
+        "config_location": "GoalBudget::max_evaluator_invocations (goal.rs:242, default=10)",
+        "enforcement_location": "evaluate_and_complete() (service.rs:2981)",
+        "current_behavior": "Calls evaluator.assess() once. On error, logs and continues with None. No durable count check before spawn. No retry. No budget enforcement.",
+        "gap": "evaluator.assess() always spawns provider regardless of prior attempts",
+        "durable_invocation_rows": "Written in call_adapter() BEFORE spawn, updated AFTER completion",
+        "restart_behavior": "After crash+restart, in-memory counter resets to 0. Durable rows exist but are not counted before next spawn.",
+        "fix": "Before calling evaluator.assess(), count durable evaluator invocations for this goal. If count >= max, skip evaluator and proceed to CompletionPolicy with existing evidence."
+      }
+    },
+    {
+      "id": "RC-4",
+      "severity": "MEDIUM",
+      "category": "H",
+      "category_label": "prompt/parser contract mismatch",
+      "title": "Prompt says 'no markdown fences' but parser handles them — conflicting instructions",
+      "detail": {
+        "prompt_text": "Do NOT wrap it in markdown fences (no ```json). Do NOT add any text before or after the JSON.",
+        "parser_behavior": "try_extract_json handles markdown fences via Strategy 2 (fence stripping)",
+        "impact": "LLM may still output fences despite prompt instruction. Parser handles this correctly. Not a bug, but the prompt rigidity could cause the LLM to second-guess its output format.",
+        "recommendation": "Change prompt to: 'Output raw JSON. If you must use fences, they will be stripped automatically.'"
+      }
+    },
+    {
+      "id": "RC-5",
+      "severity": "LOW",
+      "category": "I",
+      "category_label": "retry classification",
+      "title": "No retry classification — all evaluator errors treated identically",
+      "detail": {
+        "current_behavior": "Single attempt. Any error → None → fallback to task-count policy.",
+        "missing": "Distinction between transient provider errors (retryable) vs schema/semantic errors (non-retryable but consumes budget) vs capture bugs (should not retry)",
+        "fix": "Classify errors: provider transient → retry up to budget; schema violation → record and stop; capture bug → stop immediately"
+      }
+    }
+  ],
+  "failure_classification_matrix": {
+    "A_claude_cli_capture_failure": "Handled by receive_events error path — terminal state 'failed' written",
+    "B_empty_output": "Handled by try_extract_json → EmptyOutput error",
+    "C_event_collector_failure": "Handled by receive_events error path",
+    "D_json_extraction_failure": "Handled by try_extract_json → NoJsonFound/JsonParseError",
+    "E_json_syntax_failure": "Handled by serde_json::from_value after extraction",
+    "F_schema_serde_mismatch": "ROOT CAUSE RC-1: blockers field missing when LLM omits it",
+    "G_enum_casing_mismatch": "NOT an issue: CriterionStatus uses #[serde(rename_all = 'snake_case')], schema enum values are snake_case",
+    "H_missing_required_field": "ROOT CAUSE RC-1: blockers not in schema required array",
+    "I_extra_prose_markdown_fence": "Handled by try_extract_json strategies 1-3",
+    "J_partial_trailing_json": "NOT explicitly handled — could be added to try_extract_json",
+    "K_semantic_validation_failure": "Handled by Rust Output Guards (evidence_refs, completion check)",
+    "L_timeout": "Handled — terminal state 'failed', budget consumed",
+    "M_provider_process_failure": "Handled by exit_code check in call_adapter"
+  }
+}

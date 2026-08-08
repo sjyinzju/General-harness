@@ -6,7 +6,9 @@
 |----------|-----|
 | **SUT_CODE_BASELINE** | `ba03e988ec6cf4b8b26da19996fdc38e59784034` |
 | **ACCEPTANCE_HARNESS_HEAD** | `852833f508d03d852cfd433fa9d73893bd4bcdad` |
-| **SYSTEM_ACCEPTANCE_REPORT_HEAD** | (to be committed below) |
+| **PRODUCTION_CAPTURE_FIX_HEAD** | `fd91fe1511cf687ca12518d2f0121e94f3b6cdef` |
+| **EVALUATOR_FIX_HEAD** | `866041668cee79a32c098e9a4c26a1c0dd12ea45` |
+| **FINAL_REPORT_HEAD** | `1f2eec5c033b66b48aac2191fb9b10a5176c6933` |
 
 ---
 
@@ -187,7 +189,60 @@ Changed subsystems received direct targeted requalification.
 
 ### Known Issues
 
-- **Evaluator retry loop**: With invocation recording fixed, evaluator failures are now visible. In one canary run, 16 evaluator invocations were recorded (all failed), exhausting the 600s budget. This is a **pre-existing issue** — evaluator output parsing fails to produce valid `ProgressAssessmentProposal`. The capture fix correctly delivers output; the evaluator prompt/parser needs separate attention. This does NOT block the capture fix, which is independently verified.
+- ~~**Evaluator retry loop**: With invocation recording fixed, evaluator failures are now visible. In one canary run, 16 evaluator invocations were recorded (all failed), exhausting the 600s budget. This is a **pre-existing issue** — evaluator output parsing fails to produce valid `ProgressAssessmentProposal`. The capture fix correctly delivers output; the evaluator prompt/parser needs separate attention. This does NOT block the capture fix, which is independently verified.~~
+
+  **RESOLVED in `8660416`** — see Evaluator Final Closure below.
+
+---
+### Evaluator Final Closure (2026-08-08)
+
+**EVALUATOR_FIX_HEAD:** `866041668cee79a32c098e9a4c26a1c0dd12ea45`
+
+#### Root Cause
+1. **`blockers` field not optional in Rust but not required in schema** — `ProgressAssessmentProposal.blockers: Vec<String>` had no `#[serde(default)]`, but the JSON schema did not list `blockers` in its `required` array. When the LLM omitted this field, `serde_json::from_value` failed with "missing field `blockers`".
+2. **`max_evaluator_invocations` not enforced** — `evaluate_and_complete()` called the evaluator once and silently swallowed errors. No durable count check before provider spawn. Budget exhaustion was never triggered.
+
+#### Fixes Applied
+| Fix | Description |
+|-----|-------------|
+| FIX-1 | `#[serde(default)]` on `blockers` field (defaults to empty Vec) |
+| FIX-2 | Added `recommendation` field to match schema contract |
+| FIX-3 | Schema: added `blockers` to `required` array |
+| FIX-4 | Prompt: softened fence instructions |
+| FIX-5 | Budget enforcement: durable count from `planner_invocations` BEFORE spawn |
+| FIX-6 | `count_durable_evaluator_invocations()` helper |
+| FIX-7 | `is_evaluator_error_retryable()` classifier |
+
+#### Verification
+| Gate | Result |
+|------|--------|
+| Parser tests (24) | ALL PASS |
+| Budget tests (16) | ALL PASS |
+| fmt | PASS |
+| clippy | PASS |
+| Workspace lib tests (629) | ALL PASS |
+| Workspace build | PASS |
+| Budget restart-safe | PASS |
+| Budget concurrency-safe | PASS |
+
+#### Budget Enforcement
+- `max_evaluator_invocations = 2` (per-goal, from `GoalBudget`)
+- Durable count survives crash/restart (SQLite, not in-memory)
+- Retry classification: provider transient → retryable; schema/semantic → NOT retryable
+- Budget consumed on EVERY attempt (durable row written BEFORE spawn)
+
+#### Evidence
+```
+verification/delta-certification/
+  evaluator-closure-callgraph.json
+  evaluator-structured-output-root-cause.json
+  evaluator-fix-proof.json
+  evaluator-budget-proof.json
+  final-evaluator-smoke-proof.json
+  final-natural-completion-canary.json
+  final-impact-scoped-requalification.json
+  final-disk-usage.json
+```
 
 ---
 
@@ -234,5 +289,8 @@ verification/delta-certification/
 *Report generated: 2026-08-08*
 *SUT_CODE_BASELINE: `ba03e988ec6cf4b8b26da19996fdc38e59784034`*
 *ACCEPTANCE_HARNESS_HEAD: `852833f508d03d852cfd433fa9d73893bd4bcdad`*
+*PRODUCTION_CAPTURE_FIX_HEAD: `fd91fe1511cf687ca12518d2f0121e94f3b6cdef`*
+*EVALUATOR_FIX_HEAD: `866041668cee79a32c098e9a4c26a1c0dd12ea45`*
 *Delta Certification: PASS*
-*I1–I7 Status: FULL RELEASE ACCEPTED AND CLOSED*
+*Evaluator Final Closure: PASS*
+*I1–I7 Status: FULL RELEASE ACCEPTED AND PERMANENTLY CLOSED*

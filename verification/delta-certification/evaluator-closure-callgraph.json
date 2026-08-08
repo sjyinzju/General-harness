@@ -1,0 +1,98 @@
+{
+  "generated_at": "2026-08-08T12:43:00Z",
+  "commit": "c302c4cdb8cae7b03edcc60ab2822ceb44f2d535",
+  "call_chain": {
+    "entry_point": {
+      "function": "GoalLoopService::drive_goal_loop",
+      "file": "crates/harness-runtime/src/goal/service.rs",
+      "line": 1076,
+      "description": "Core orchestration method — drives one iteration of the goal loop"
+    },
+    "evaluator_invocation_point": {
+      "function": "GoalLoopService::evaluate_and_complete",
+      "file": "crates/harness-runtime/src/goal/service.rs",
+      "line": 2981,
+      "description": "Called when all tasks completed — invokes Evaluator, runs CompletionPolicy"
+    },
+    "adapter_layer": {
+      "function": "ProductionGoalEvaluator::assess",
+      "file": "crates/harness-runtime/src/goal/evaluator.rs",
+      "line": 56,
+      "description": "Builds context, calls AgentAdapter, parses ProgressAssessmentProposal"
+    },
+    "adapter_call": {
+      "function": "ProductionGoalEvaluator::call_adapter",
+      "file": "crates/harness-runtime/src/goal/evaluator.rs",
+      "line": 124,
+      "description": "Spawns provider, collects events, writes durable invocation rows"
+    },
+    "event_collector": {
+      "struct": "EvaluatorEventCollector",
+      "file": "crates/harness-runtime/src/goal/evaluator.rs",
+      "line": 313,
+      "description": "Implements AgentEventSink, captures Result/Error/ProcessExited/SessionEnded events"
+    },
+    "json_extraction": {
+      "function": "crate::prompt::try_extract_json",
+      "file": "crates/harness-runtime/src/prompt/mod.rs",
+      "line": 305,
+      "description": "Handles whitespace, fences, provider noise, nested braces"
+    },
+    "schema_deserialization": {
+      "type": "ProgressAssessmentProposal",
+      "file": "crates/harness-runtime/src/goal/mod.rs",
+      "line": 94,
+      "method": "serde_json::from_value",
+      "location": "evaluator.rs:80"
+    },
+    "output_guards": {
+      "location": "evaluator.rs:90-119",
+      "checks": [
+        "Satisfied/PartiallySatisfied criteria must have evidence_refs",
+        "completion_recommended requires at least one Satisfied criterion"
+      ]
+    },
+    "completion_policy": {
+      "function": "GoalLoopService::assess_progress",
+      "file": "crates/harness-runtime/src/goal/service.rs",
+      "line": 708,
+      "description": "Rust CompletionPolicy — authoritative, not LLM advisory"
+    },
+    "completion_gate": {
+      "function": "check_completion_gate",
+      "file": "crates/harness-runtime/src/goal/validation.rs"
+    },
+    "goal_transition": {
+      "function": "GoalLoopService::transition_goal",
+      "file": "crates/harness-runtime/src/goal/service.rs",
+      "line": 317,
+      "description": "FSM-validated state transition to Succeeded"
+    }
+  },
+  "budget_config": {
+    "field": "GoalBudget::max_evaluator_invocations",
+    "file": "crates/harness-core/src/contracts/goal.rs",
+    "line": 242,
+    "default": 10,
+    "target_for_this_closure": 2,
+    "enforcement_status": "NOT_ENFORCED",
+    "enforcement_gap": "evaluate_and_complete() does not check durable evaluator count before spawn"
+  },
+  "durable_invocation_table": {
+    "table": "planner_invocations",
+    "discriminator": "invocation_kind = 'evaluator'",
+    "write_timing": "BEFORE provider spawn (line 135-146 of evaluator.rs)",
+    "update_timing": "AFTER provider completes (line 252-260 of evaluator.rs)",
+    "state_values": ["running", "completed", "failed"]
+  },
+  "planner_vs_evaluator_comparison": {
+    "shared_parser": "crate::prompt::try_extract_json",
+    "shared_pattern": "Both use AgentEventSink + try_extract_json + serde_json::from_value",
+    "differences": [
+      "Planner validates schema_version == '1.0', milestones non-empty, tasks non-empty",
+      "Evaluator validates evidence_refs non-empty for Satisfied, completion requires Satisfied criteria",
+      "Planner uses PlanProposal type, Evaluator uses ProgressAssessmentProposal type"
+    ],
+    "parity": "Both have identical JSON extraction logic — no gap in extraction layer"
+  }
+}

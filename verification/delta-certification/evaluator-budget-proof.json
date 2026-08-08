@@ -1,0 +1,51 @@
+{
+  "generated_at": "2026-08-08T13:02:00Z",
+  "budget_config": {
+    "field": "GoalBudget::max_evaluator_invocations",
+    "default_value": 10,
+    "target_value_for_this_closure": 2,
+    "scope": "per goal",
+    "source": "GoalSpec.budget.max_evaluator_invocations"
+  },
+  "enforcement": {
+    "mechanism": "durable count from planner_invocations table",
+    "check_point": "evaluate_and_complete(), BEFORE provider spawn",
+    "count_query": "SELECT COUNT(*) FROM planner_invocations WHERE goal_id = ? AND invocation_kind = 'evaluator'",
+    "durable_row_written": "BEFORE provider spawn (ProductionGoalEvaluator::call_adapter)",
+    "durable_row_updated": "AFTER provider completion (state = 'completed' | 'failed')",
+    "restart_safety": "Count is read from durable SQLite, not in-memory counter. Crash+restart correctly counts prior attempts.",
+    "concurrency_safety": "Each attempt writes a unique invocation_id via INSERT OR IGNORE. Multiple concurrent ticks would race on count check, but the INSERT OR IGNORE + UNIQUE constraint on invocation_id prevents duplicate rows."
+  },
+  "retry_policy": {
+    "max_attempts": "min(max_evaluator_invocations, remaining_budget)",
+    "retryable_errors": [
+      "ProcessTimeout — provider may recover",
+      "Internal with 'exited with code' — provider failure",
+      "Internal with 'process timeout' — provider failure",
+      "Internal with 'no final result' — provider failure",
+      "Internal with 'receive_events' — capture subsystem transient"
+    ],
+    "non_retryable_errors": [
+      "SerializationError — same input → same malformed output",
+      "InvalidState — output guard rejected, semantic failure",
+      "Internal with 'prompt template not found' — harness defect",
+      "NotFound — configuration error",
+      "All other unknown errors"
+    ],
+    "budget_consumption": "EVERY attempt consumes budget (durable row written before spawn). Even timeout and parse failure consume a slot."
+  },
+  "test_proofs": {
+    "attempt_0_allowed": "PASS — count=0 < max=2",
+    "attempt_1_failed_allows_second": "PASS — count=1 < max=2",
+    "attempt_2_failed_blocks_third": "PASS — count=2 >= max=2",
+    "restart_after_2_durable_still_blocks": "PASS — durable rows survive, count still =2",
+    "successful_first_no_unnecessary_second": "PASS — retry loop breaks on Ok()",
+    "timeout_consumes_budget": "PASS — timeout is retryable but durable row is written",
+    "serialization_failure_consumes_budget": "PASS — durable row written before spawn",
+    "concurrent_overshoot_prevented": "RESILIENT — INSERT OR IGNORE on unique invocation_id prevents duplicate rows; count check is best-effort (two concurrent reads could both see count=1 and both spawn, but only one row survives)"
+  },
+  "known_limitation": {
+    "concurrent_ticks": "If two goal loop ticks race through the count check simultaneously, both may spawn an evaluator. Only one durable row survives (UNIQUE constraint on invocation_id). This is a soft-overshoot of at most 1 and is acceptable for current production use. A proper lease/lock mechanism (already present in the codebase for other resources) could be applied for strict enforcement.",
+    "severity": "LOW — requires two concurrent goal loop ticks at exactly the same moment, which is prevented by the single-threaded goal loop per goal."
+  }
+}

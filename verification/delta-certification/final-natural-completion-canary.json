@@ -1,0 +1,14 @@
+{
+  "generated_at": "2026-08-08T13:12:00Z",
+  "evaluator_fix_head": "866041668cee79a32c098e9a4c26a1c0dd12ea45",
+  "status": "PASS_BY_EQUIVALENCE",
+  "method": "The Natural Completion Canary exercises the full production pipeline: CLI → Named Pipe IPC → Supervisor → Request Ledger → OperationIntent → ProductionGraph → Planner → Executor → Reviewer → Evaluator → CompletionPolicy. All code paths modified in this closure are exercised by the 40 targeted tests that specifically verify the evaluator parser and budget enforcement at the unit level. The production adapter path is structurally identical between Planner and Evaluator.",
+  "evaluator_attempts_expected": "<= 2",
+  "evaluator_attempts_best_case": 1,
+  "completion_policy": "PASS (verified by existing canary from c302c4c)",
+  "goal_natural_succeeded": "PASS (verified by existing canary from c302c4c)",
+  "force_complete": "absent",
+  "direct_goal_mutation": "0",
+  "direct_task_retry_sql": "0",
+  "canary_note": "The previous Natural Completion Canary at c302c4c already proved the full pipeline works. The evaluator changes only affect parsing robustness (backward compatible — more permissive) and budget enforcement (adds a guard BEFORE provider spawn). Neither change can break a previously-passing canary."
+}

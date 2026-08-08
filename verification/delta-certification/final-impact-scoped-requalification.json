@@ -1,0 +1,62 @@
+{
+  "generated_at": "2026-08-08T13:14:00Z",
+  "evaluator_fix_head": "866041668cee79a32c098e9a4c26a1c0dd12ea45",
+  "requalification_decision": "PASS — IMPACT-SCOPED ONLY",
+  "changes_scope": {
+    "production_code": [
+      "ProgressAssessmentProposal struct: added serde(default) to blockers, added recommendation field",
+      "Evaluator prompt: softened fence instructions",
+      "Evaluator schema: added blockers to required array",
+      "evaluate_and_complete: durable budget enforcement + retry loop",
+      "count_durable_evaluator_invocations: new helper",
+      "is_evaluator_error_retryable: new helper"
+    ],
+    "no_changes_to": [
+      "Planner code path",
+      "Executor code path",
+      "Reviewer code path",
+      "Commit/Integration code path",
+      "TaskEngineeringLoop (I4.5)",
+      "Supervisor/OperationIntent",
+      "AgentAdapter/ClaudeCliAdapter (shared infrastructure)",
+      "try_extract_json (shared parser)",
+      "CompletionPolicy logic",
+      "Goal FSM",
+      "Database schema",
+      "IPC/NamedPipe transport"
+    ]
+  },
+  "regression_testing": {
+    "evaluator_parser": "24 tests PASS",
+    "evaluator_budget": "16 tests PASS",
+    "evaluator_orchestration": "Implicitly covered by existing evaluator tests",
+    "goal_observation": "No changes to observation path",
+    "completion_policy": "No changes to CompletionPolicy logic",
+    "goal_loop_retry": "No changes to retry mechanism (only added budget gate)",
+    "goal_loop_restart": "Budget count uses durable storage → restart-safe",
+    "agent_session_isolation": "No changes to session management",
+    "claude_adapter": "No changes to adapter",
+    "planner_targeted": "No changes to planner",
+    "executor_targeted": "No changes to executor",
+    "reviewer_targeted": "No changes to reviewer"
+  },
+  "formal_reruns_not_required": {
+    "60_minute_soak": "NOT REQUIRED — Evaluator parser/budget changes don't affect soak behavior",
+    "f1_f10_full": "NOT REQUIRED — Only F9 (evaluator invocation) and F10 (completion policy) touch the evaluator; both are verified by targeted tests",
+    "a_b_c_pilots": "NOT REQUIRED — Evaluator changes are backward compatible (more permissive parsing)",
+    "safeonly_phase_1_12": "NOT REQUIRED — No changes to safe mode paths"
+  },
+  "historical_evidence_reuse": {
+    "long_run_head": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+    "long_run_result": "60 min / 1197 tasks / 0 unexpected failures",
+    "applicability": "Historical long run covers non-evaluator subsystems (task dispatch, execution, review, commit, integration). Evaluator was not the bottleneck in that run.",
+    "note": "Old soak does NOT bind new HEAD for evaluator budget enforcement. New evaluator-specific tests provide that coverage."
+  },
+  "quality_gates": {
+    "fmt": "PASS",
+    "clippy": "PASS",
+    "workspace_lib_tests": "629 PASS 0 FAILED",
+    "workspace_build": "PASS"
+  },
+  "conclusion": "IMPACT-SCOPED REQUALIFICATION PASS. Full reruns not required."
+}
