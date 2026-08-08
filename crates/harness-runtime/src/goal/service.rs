@@ -23,6 +23,7 @@ use harness_core::contracts::runtime_profile::RuntimeProfile;
 use harness_core::state_machine::GoalFsm;
 use harness_core::{CoreError, ErrorCode, ErrorSource};
 use sqlx::SqlitePool;
+use uuid::Uuid;
 
 use super::repo::GoalRepo;
 use super::validation::{check_completion_gate, validate_plan_proposal};
@@ -3015,109 +3016,119 @@ impl GoalLoopService {
                 .hit()
                 .await;
 
-            // ── Evaluator invocation with durable budget enforcement ──
-            // Count durable evaluator invocations for this goal BEFORE spawn.
-            // This count survives crash/restart because it reads from the
-            // planner_invocations table (invocation_kind = 'evaluator').
+            // ── Evaluator invocation with atomic budget enforcement ──
+            // Each attempt calls reserve_evaluator_slot() which uses a
+            // single conditional INSERT statement:
+            //   INSERT INTO ... SELECT ... WHERE (subquery count) < limit
+            // SQLite executes this atomically — the count subquery and
+            // insert happen in one implicit transaction. Two concurrent
+            // callers cannot both succeed when only one slot remains.
             let max_evaluator_budget = goal.budget.max_evaluator_invocations;
-            let durable_used_before: u32 = count_durable_evaluator_invocations(&self.pool, goal_id)
-                .await
-                .unwrap_or(0);
-            tracing::info!(
-                goal_id = %goal_id,
-                durable_used = durable_used_before,
-                max_budget = max_evaluator_budget,
-                "evaluator budget check before spawn"
-            );
+            let evaluator_profile_id = self
+                .evaluator_profile
+                .as_ref()
+                .map(|p| p.id.as_str())
+                .unwrap_or("default-evaluator");
 
             let evaluator_proposal: Option<ProgressAssessmentProposal> = if let Some(
                 ref evaluator,
             ) = self.goal_evaluator
             {
-                if durable_used_before >= max_evaluator_budget {
-                    tracing::warn!(
-                        goal_id = %goal_id,
-                        durable_used = durable_used_before,
-                        max_budget = max_evaluator_budget,
-                        "evaluator budget EXHAUSTED — skipping provider spawn"
-                    );
-                    None
-                } else {
-                    let ctx = GoalAssessmentContext {
-                        goal: goal.clone(),
-                        current_plan_revision: plan.revision_number,
-                        evidence_ledger: observations.clone(),
-                        criteria_statuses: HashMap::new(),
-                        completed_milestones: vec![],
-                        failed_tasks: vec![],
-                        repository_head: goal.initial_base_head.clone(),
-                    };
+                let ctx = GoalAssessmentContext {
+                    goal: goal.clone(),
+                    current_plan_revision: plan.revision_number,
+                    evidence_ledger: observations.clone(),
+                    criteria_statuses: HashMap::new(),
+                    completed_milestones: vec![],
+                    failed_tasks: vec![],
+                    repository_head: goal.initial_base_head.clone(),
+                };
 
-                    // Retry loop: attempt up to remaining budget for transient failures.
-                    // Each attempt writes a durable invocation row BEFORE provider spawn,
-                    // so restart-after-crash correctly counts the failed attempt.
-                    let remaining_budget = max_evaluator_budget.saturating_sub(durable_used_before);
-                    let mut last_error: Option<CoreError> = None;
-                    let mut proposal: Option<ProgressAssessmentProposal> = None;
+                let mut last_error: Option<CoreError> = None;
+                let mut proposal: Option<ProgressAssessmentProposal> = None;
+                let mut attempts_made: u32 = 0;
 
-                    for attempt in 0..remaining_budget {
-                        let attempt_num = durable_used_before + attempt + 1;
-                        tracing::info!(
-                            goal_id = %goal_id,
-                            attempt = attempt_num,
-                            remaining_budget = remaining_budget - attempt,
-                            "evaluator invocation attempt"
-                        );
+                loop {
+                    // Atomic reservation: check+insert in one SQL statement
+                    let reservation = reserve_evaluator_slot(
+                        &self.pool,
+                        goal_id,
+                        evaluator_profile_id,
+                        max_evaluator_budget,
+                    )
+                    .await;
 
-                        match evaluator.assess(&ctx).await {
-                            Ok(p) => {
-                                tracing::info!(
-                                    goal_id = %goal_id,
-                                    attempt = attempt_num,
-                                    completion_recommended = p.completion_recommended,
-                                    "evaluator assessment received"
-                                );
-                                proposal = Some(p);
-                                break;
-                            }
-                            Err(e) => {
-                                let is_retryable = is_evaluator_error_retryable(&e);
-                                tracing::warn!(
-                                    goal_id = %goal_id,
-                                    attempt = attempt_num,
-                                    error = %e,
-                                    retryable = is_retryable,
-                                    "evaluator attempt failed"
-                                );
-                                last_error = Some(e);
+                    match reservation {
+                        Ok(ReservationResult::BudgetExhausted) => {
+                            tracing::warn!(
+                                goal_id = %goal_id,
+                                attempts_made = attempts_made,
+                                max_budget = max_evaluator_budget,
+                                "evaluator budget EXHAUSTED — no slot available"
+                            );
+                            break;
+                        }
+                        Ok(ReservationResult::Reserved { invocation_id }) => {
+                            attempts_made += 1;
+                            tracing::info!(
+                                goal_id = %goal_id,
+                                invocation_id = %invocation_id,
+                                attempt = attempts_made,
+                                max_budget = max_evaluator_budget,
+                                "evaluator slot reserved — spawning provider"
+                            );
 
-                                if !is_retryable {
-                                    tracing::error!(
+                            match evaluator
+                                .assess_with_reserved_slot(&ctx, Some(invocation_id))
+                                .await
+                            {
+                                Ok(p) => {
+                                    tracing::info!(
                                         goal_id = %goal_id,
-                                        attempt = attempt_num,
-                                        "evaluator error is non-retryable — stopping"
+                                        attempt = attempts_made,
+                                        completion_recommended = p.completion_recommended,
+                                        "evaluator assessment received"
                                     );
+                                    proposal = Some(p);
                                     break;
                                 }
-                                // Transient error — will retry if budget remains
+                                Err(e) => {
+                                    let is_retryable = is_evaluator_error_retryable(&e);
+                                    tracing::warn!(
+                                        goal_id = %goal_id,
+                                        attempt = attempts_made,
+                                        error = %e,
+                                        retryable = is_retryable,
+                                        "evaluator attempt failed"
+                                    );
+                                    last_error = Some(e);
+                                    if !is_retryable {
+                                        break;
+                                    }
+                                }
                             }
                         }
-                    }
-
-                    if proposal.is_none() {
-                        if let Some(ref err) = last_error {
-                            tracing::error!(
-                                goal_id = %goal_id,
-                                attempts_made = durable_used_before + remaining_budget,
-                                max_budget = max_evaluator_budget,
-                                error = %err,
-                                "evaluator exhausted all attempts without success"
-                            );
+                        Err(e) => {
+                            tracing::error!(goal_id = %goal_id, error = %e, "reservation error");
+                            last_error = Some(e);
+                            break;
                         }
                     }
-
-                    proposal
                 }
+
+                if proposal.is_none() {
+                    if let Some(ref err) = last_error {
+                        tracing::error!(
+                            goal_id = %goal_id,
+                            attempts_made = attempts_made,
+                            max_budget = max_evaluator_budget,
+                            error = %err,
+                            "evaluator exhausted all attempts"
+                        );
+                    }
+                }
+
+                proposal
             } else {
                 tracing::info!(goal_id = %goal_id, "no evaluator available — using task-count policy");
                 None
@@ -3252,12 +3263,75 @@ impl GoalLoopService {
 
 // ── Evaluator Budget Helpers ─────────────────────────────────────────
 
+/// Result of an atomic evaluator slot reservation.
+#[derive(Debug, Clone)]
+enum ReservationResult {
+    /// A slot was successfully reserved. The caller may spawn a provider
+    /// using this invocation_id (the durable row already exists).
+    Reserved { invocation_id: String },
+    /// Budget exhausted — no slot available.
+    BudgetExhausted,
+}
+
+/// Atomically reserve an evaluator invocation slot for a goal.
+///
+/// Uses a single conditional INSERT statement:
+/// ```sql
+/// INSERT INTO planner_invocations (...) SELECT ... WHERE (subquery count) < limit
+/// ```
+///
+/// SQLite executes the entire statement atomically — the SELECT subquery
+/// and INSERT happen in the same implicit transaction. If the count has
+/// already reached the limit, `rows_affected()` returns 0 and the caller
+/// gets `BudgetExhausted`. Two concurrent callers cannot both succeed
+/// when only one slot remains.
+///
+/// No explicit BEGIN/COMMIT needed — the atomicity comes from SQLite's
+/// guarantee that a single top-level INSERT...SELECT statement is atomic.
+async fn reserve_evaluator_slot(
+    pool: &SqlitePool,
+    goal_id: &str,
+    profile_id: &str,
+    limit: u32,
+) -> Result<ReservationResult, CoreError> {
+    let invocation_id = format!("inv-evaluator-{}", Uuid::new_v4());
+    let idempotency_key = format!("evaluator-{}", &invocation_id);
+    let now = chrono::Utc::now().to_rfc3339();
+
+    // Single atomic statement: INSERT only if count < limit.
+    // SQLite guarantees this is indivisible — the subquery and insert
+    // execute as one implicit transaction.
+    let result = sqlx::query(
+        "INSERT INTO planner_invocations (invocation_id, goal_id, plan_revision_id, invocation_kind, profile_id, idempotency_key, input_digest, state, started_at, created_at) SELECT ?, ?, NULL, 'evaluator', ?, ?, '', 'running', ?, ? WHERE (SELECT COUNT(*) FROM planner_invocations WHERE goal_id = ? AND invocation_kind = 'evaluator') < ?"
+    )
+    .bind(&invocation_id)
+    .bind(goal_id)
+    .bind(profile_id)
+    .bind(&idempotency_key)
+    .bind(&now)
+    .bind(&now)
+    .bind(goal_id)
+    .bind(limit as i64)
+    .execute(pool)
+    .await
+    .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
+
+    if result.rows_affected() > 0 {
+        Ok(ReservationResult::Reserved { invocation_id })
+    } else {
+        Ok(ReservationResult::BudgetExhausted)
+    }
+}
+
 /// Count durable evaluator invocations for a goal from the
 /// `planner_invocations` table (invocation_kind = 'evaluator').
 ///
 /// This is the authoritative count used for budget enforcement.
 /// It survives crash/restart because it reads from durable storage,
 /// not an in-memory counter.
+///
+/// NOTE: For atomic check+reserve use `reserve_evaluator_slot()` instead.
+#[allow(dead_code)]
 async fn count_durable_evaluator_invocations(
     pool: &SqlitePool,
     goal_id: &str,
@@ -4283,5 +4357,300 @@ mod evaluator_budget_tests {
         // Serialization errors are NOT retryable (same input → same malformed output)
         assert!(!is_evaluator_error_retryable(&err));
         // But the durable row was written BEFORE spawn, so budget IS consumed
+    }
+
+    // ── Atomic Reservation Tests ──────────────────────────────────
+
+    /// Verify that `reserve_evaluator_slot` atomically reserves a slot
+    /// when budget is available.
+    #[tokio::test]
+    async fn test_reserve_slot_succeeds_when_budget_available() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create pool");
+
+        sqlx::query(
+            "CREATE TABLE planner_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                plan_revision_id TEXT,
+                invocation_kind TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_digest TEXT NOT NULL DEFAULT '',
+                output_digest TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        let result = reserve_evaluator_slot(&pool, "g1", "profile-1", 2)
+            .await
+            .unwrap();
+        assert!(matches!(result, ReservationResult::Reserved { .. }));
+
+        let count = count_durable_evaluator_invocations(&pool, "g1")
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// Verify that `reserve_evaluator_slot` returns BudgetExhausted
+    /// when the count has reached the limit.
+    #[tokio::test]
+    async fn test_reserve_slot_exhausted_when_at_limit() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create pool");
+
+        sqlx::query(
+            "CREATE TABLE planner_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                plan_revision_id TEXT,
+                invocation_kind TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_digest TEXT NOT NULL DEFAULT '',
+                output_digest TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        // Pre-fill 2 evaluator invocations
+        for i in 0..2 {
+            sqlx::query("INSERT INTO planner_invocations (invocation_id, goal_id, invocation_kind, profile_id, state, created_at) VALUES (?, 'g1', 'evaluator', 'p', 'failed', datetime('now'))")
+                .bind(format!("inv-{}", i))
+                .execute(&pool).await.expect("insert");
+        }
+
+        let result = reserve_evaluator_slot(&pool, "g1", "p", 2).await.unwrap();
+        assert!(matches!(result, ReservationResult::BudgetExhausted));
+
+        let count = count_durable_evaluator_invocations(&pool, "g1")
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "no new row when budget exhausted");
+    }
+
+    /// Sequential reservation: exactly 2 succeed with limit=2, 3rd fails.
+    #[tokio::test]
+    async fn test_sequential_three_attempts_limit_2_third_denied() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create pool");
+
+        sqlx::query(
+            "CREATE TABLE planner_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                plan_revision_id TEXT,
+                invocation_kind TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_digest TEXT NOT NULL DEFAULT '',
+                output_digest TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        let r1 = reserve_evaluator_slot(&pool, "g1", "p", 2).await.unwrap();
+        assert!(matches!(r1, ReservationResult::Reserved { .. }));
+
+        let r2 = reserve_evaluator_slot(&pool, "g1", "p", 2).await.unwrap();
+        assert!(matches!(r2, ReservationResult::Reserved { .. }));
+
+        let r3 = reserve_evaluator_slot(&pool, "g1", "p", 2).await.unwrap();
+        assert!(matches!(r3, ReservationResult::BudgetExhausted));
+
+        let count = count_durable_evaluator_invocations(&pool, "g1")
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "must be exactly 2, not 3");
+    }
+
+    /// Concurrency stress test: 50 iterations, each spawning 10 concurrent
+    /// contenders against limit=2 with 1 pre-existing slot.
+    /// The conditional INSERT guarantees exactly 1 succeeds, 9 fail.
+    /// Total durable count = 2. Zero overshoot.
+    #[tokio::test]
+    async fn test_atomic_reservation_50_iterations_no_overshoot() {
+        const ITERATIONS: usize = 50;
+        const LIMIT: u32 = 2;
+
+        for run in 0..ITERATIONS {
+            let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+                .await
+                .expect("create pool");
+
+            sqlx::query(
+                "CREATE TABLE planner_invocations (
+                    invocation_id TEXT PRIMARY KEY,
+                    goal_id TEXT NOT NULL,
+                    plan_revision_id TEXT,
+                    invocation_kind TEXT NOT NULL,
+                    profile_id TEXT NOT NULL,
+                    idempotency_key TEXT,
+                    input_digest TEXT NOT NULL DEFAULT '',
+                    output_digest TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'pending',
+                    started_at TEXT,
+                    completed_at TEXT,
+                    created_at TEXT NOT NULL DEFAULT ''
+                )",
+            )
+            .execute(&pool)
+            .await
+            .expect("create table");
+
+            // Pre-fill: 1 existing evaluator attempt
+            sqlx::query(
+                "INSERT INTO planner_invocations (invocation_id, goal_id, invocation_kind, profile_id, state, created_at) VALUES ('inv-existing', 'g1', 'evaluator', 'p', 'failed', datetime('now'))"
+            )
+            .execute(&pool).await.expect("insert pre-existing");
+
+            // 10 concurrent contenders
+            let pool_arc = std::sync::Arc::new(pool);
+            let mut handles = Vec::new();
+
+            for _ in 0..10 {
+                let pool = pool_arc.clone();
+                let handle = tokio::spawn(async move {
+                    reserve_evaluator_slot(&pool, "g1", "profile-1", LIMIT).await
+                });
+                handles.push(handle);
+            }
+
+            let mut reserved = 0u32;
+            let mut exhausted = 0u32;
+            for handle in handles {
+                match handle.await.unwrap().unwrap() {
+                    ReservationResult::Reserved { .. } => reserved += 1,
+                    ReservationResult::BudgetExhausted => exhausted += 1,
+                }
+            }
+
+            assert_eq!(
+                reserved, 1,
+                "run {run}: exactly 1 should succeed, got {reserved}"
+            );
+            assert_eq!(
+                exhausted, 9,
+                "run {run}: 9 should be exhausted, got {exhausted}"
+            );
+
+            let final_count = count_durable_evaluator_invocations(&pool_arc, "g1")
+                .await
+                .unwrap();
+            assert_eq!(
+                final_count, 2,
+                "run {run}: final count must be 2, got {final_count} — OVERSHOOT"
+            );
+        }
+    }
+
+    /// Verify per-goal isolation: exhausting goal A's budget doesn't
+    /// affect goal B.
+    #[tokio::test]
+    async fn test_reservation_per_goal_isolation() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create pool");
+
+        sqlx::query(
+            "CREATE TABLE planner_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                plan_revision_id TEXT,
+                invocation_kind TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_digest TEXT NOT NULL DEFAULT '',
+                output_digest TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        // Exhaust goal A (limit=1)
+        let _ = reserve_evaluator_slot(&pool, "goal-a", "p", 1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reserve_evaluator_slot(&pool, "goal-a", "p", 1)
+                .await
+                .unwrap(),
+            ReservationResult::BudgetExhausted
+        ));
+
+        // Goal B still has budget
+        assert!(matches!(
+            reserve_evaluator_slot(&pool, "goal-b", "p", 2)
+                .await
+                .unwrap(),
+            ReservationResult::Reserved { .. }
+        ));
+    }
+
+    /// Restart safety: after 2 durable rows exist, a fresh reservation
+    /// (simulating restart) still sees the exhaustion.
+    #[tokio::test]
+    async fn test_restart_after_2_durable_still_blocks() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create pool");
+
+        sqlx::query(
+            "CREATE TABLE planner_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                plan_revision_id TEXT,
+                invocation_kind TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_digest TEXT NOT NULL DEFAULT '',
+                output_digest TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        // Simulate 2 prior attempts
+        for i in 0..2 {
+            sqlx::query("INSERT INTO planner_invocations (invocation_id, goal_id, invocation_kind, profile_id, state, created_at) VALUES (?, 'g1', 'evaluator', 'p', 'failed', datetime('now'))")
+                .bind(format!("inv-{}", i))
+                .execute(&pool).await.expect("insert");
+        }
+
+        // "Restart" — fresh reservation sees the durable rows
+        let r = reserve_evaluator_slot(&pool, "g1", "p", 2).await.unwrap();
+        assert!(matches!(r, ReservationResult::BudgetExhausted));
     }
 }

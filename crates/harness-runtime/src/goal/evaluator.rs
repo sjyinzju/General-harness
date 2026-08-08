@@ -53,9 +53,24 @@ impl ProductionGoalEvaluator {
     }
 
     /// Assess goal progress by invoking the LLM.
+    /// Uses an internally-generated invocation_id and inserts a durable row.
     pub async fn assess(
         &self,
         context: &GoalAssessmentContext,
+    ) -> Result<ProgressAssessmentProposal, CoreError> {
+        self.assess_with_reserved_slot(context, None).await
+    }
+
+    /// Assess goal progress using a pre-reserved invocation slot.
+    ///
+    /// When `reserved_invocation_id` is `Some(id)`, the durable row was
+    /// already written by `reserve_evaluator_slot()` inside an atomic
+    /// transaction. This method skips its own INSERT and uses the
+    /// pre-reserved id — eliminating the TOCTOU race between count and insert.
+    pub async fn assess_with_reserved_slot(
+        &self,
+        context: &GoalAssessmentContext,
+        reserved_invocation_id: Option<String>,
     ) -> Result<ProgressAssessmentProposal, CoreError> {
         let template = self
             .prompt_registry
@@ -75,7 +90,9 @@ impl ProductionGoalEvaluator {
         let envelope = build_evaluator_envelope(&rendered);
 
         let goal_id = context.goal.goal_id.clone();
-        let output_json = self.call_adapter(&envelope, &goal_id).await?;
+        let output_json = self
+            .call_adapter(&envelope, &goal_id, reserved_invocation_id)
+            .await?;
 
         let proposal: ProgressAssessmentProposal = serde_json::from_value(output_json.clone())
             .map_err(|e| {
@@ -125,25 +142,35 @@ impl ProductionGoalEvaluator {
         &self,
         envelope: &TaskEnvelope,
         goal_id: &str,
+        reserved_invocation_id: Option<String>,
     ) -> Result<serde_json::Value, CoreError> {
-        let invocation_id = format!("inv-evaluator-{}", uuid::Uuid::new_v4());
+        // Use pre-reserved id if available (atomic reservation already wrote the row),
+        // otherwise generate a new id and insert the row here.
+        let (invocation_id, is_pre_reserved) = match reserved_invocation_id {
+            Some(id) => (id, true),
+            None => (format!("inv-evaluator-{}", uuid::Uuid::new_v4()), false),
+        };
         let harness_session_id = format!("hs-evaluator-{}", uuid::Uuid::new_v4());
         let started_at = chrono::Utc::now();
 
         // ── Durable invocation record — written BEFORE spawn ───────
+        // When pre-reserved, the row already exists from the atomic
+        // reserve_evaluator_slot() transaction — INSERT OR IGNORE is a no-op.
         let idempotency_key = format!("evaluator-{}", &invocation_id);
-        let _ = sqlx::query(
-            "INSERT OR IGNORE INTO planner_invocations (invocation_id, goal_id, plan_revision_id, invocation_kind, profile_id, idempotency_key, input_digest, state, started_at, created_at) VALUES (?, ?, NULL, 'evaluator', ?, ?, ?, 'running', ?, ?)"
-        )
-        .bind(&invocation_id)
-        .bind(goal_id)
-        .bind(&self.profile.id)
-        .bind(&idempotency_key)
-        .bind("") // input_digest computed at call site but not available here
-        .bind(started_at.to_rfc3339())
-        .bind(started_at.to_rfc3339())
-        .execute(&self.pool)
-        .await;
+        if !is_pre_reserved {
+            let _ = sqlx::query(
+                "INSERT OR IGNORE INTO planner_invocations (invocation_id, goal_id, plan_revision_id, invocation_kind, profile_id, idempotency_key, input_digest, state, started_at, created_at) VALUES (?, ?, NULL, 'evaluator', ?, ?, ?, 'running', ?, ?)"
+            )
+            .bind(&invocation_id)
+            .bind(goal_id)
+            .bind(&self.profile.id)
+            .bind(&idempotency_key)
+            .bind("") // input_digest computed at call site but not available here
+            .bind(started_at.to_rfc3339())
+            .bind(started_at.to_rfc3339())
+            .execute(&self.pool)
+            .await;
+        }
 
         let opts = SessionOptions {
             working_directory: std::env::temp_dir(),
