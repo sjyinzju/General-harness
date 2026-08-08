@@ -1,6 +1,6 @@
 {
   "type": "object",
-  "required": ["schema_version", "overall_assessment", "criteria_assessments", "plan_sufficient", "replan_recommended", "completion_recommended", "recommendation", "summary"],
+  "required": ["schema_version", "overall_assessment", "criteria_assessments", "plan_sufficient", "replan_recommended", "completion_recommended", "blockers", "recommendation", "summary"],
   "properties": {
     "schema_version": {"type": "string", "const": "1.0"},
     "overall_assessment": {"type": "string"},

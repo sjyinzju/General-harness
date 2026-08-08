@@ -27,7 +27,7 @@ You will receive:
 
 ## OUTPUT
 
-Your ENTIRE response must be a single JSON object. Do NOT wrap it in markdown fences (no ```json). Do NOT add any text before or after the JSON. Output ONLY the JSON object on its own.
+Your ENTIRE response must be a single JSON object. Prefer raw JSON without markdown fences. If you include fences (```json), they will be stripped automatically. Do NOT add explanatory text before or after the JSON.
 
 The JSON must match this schema (shown without fences so you output it the same way):
 
@@ -52,4 +52,4 @@ The JSON must match this schema (shown without fences so you output it the same 
   "summary": "<one-paragraph summary>"
 }
 
-CRITICAL: Do NOT use markdown fences. Start your response with { and end with }. No other text.
+Start your response with { and end with }. Fences are tolerated but not needed.

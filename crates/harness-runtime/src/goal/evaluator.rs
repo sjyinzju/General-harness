@@ -553,6 +553,7 @@ mod tests {
             replan_recommended: false,
             completion_recommended: true,
             blockers: vec![],
+            recommendation: String::new(),
             summary: "all done".into(),
         };
 
@@ -579,11 +580,298 @@ mod tests {
             replan_recommended: false,
             completion_recommended: true,
             blockers: vec![],
+            recommendation: String::new(),
             summary: "all done".into(),
         };
 
         let result = validate_proposal_static(&proposal);
         assert!(result.is_ok());
+    }
+
+    // ── ProgressAssessmentProposal parser tests ─────────────────
+
+    /// Helper: parse ProgressAssessmentProposal from a JSON string,
+    /// going through the full extraction + deserialization path.
+    fn parse_proposal(raw: &str) -> Result<ProgressAssessmentProposal, String> {
+        let json_str = crate::prompt::try_extract_json(raw).map_err(|e| e.to_string())?;
+        let value: serde_json::Value =
+            serde_json::from_str(&json_str).map_err(|e| format!("json parse: {e}"))?;
+        let proposal: ProgressAssessmentProposal =
+            serde_json::from_value(value).map_err(|e| format!("deserialize: {e}"))?;
+        Ok(proposal)
+    }
+
+    fn canonical_json() -> &'static str {
+        r#"{
+  "schema_version": "1.0",
+  "overall_assessment": "All criteria satisfied",
+  "criteria_assessments": [
+    {
+      "criterion_id": "c1",
+      "status": "satisfied",
+      "evidence_refs": ["obs-1"],
+      "reason": "Function exists in source",
+      "confidence": 0.95,
+      "requires_human_confirmation": false
+    }
+  ],
+  "plan_sufficient": true,
+  "replan_recommended": false,
+  "completion_recommended": true,
+  "blockers": [],
+  "recommendation": "recommend_completion",
+  "summary": "Goal is complete"
+}"#
+    }
+
+    #[test]
+    fn test_parse_canonical_valid() {
+        let proposal = parse_proposal(canonical_json()).unwrap();
+        assert_eq!(proposal.schema_version, "1.0");
+        assert_eq!(proposal.criteria_assessments.len(), 1);
+        assert_eq!(
+            proposal.criteria_assessments[0].status,
+            CriterionStatus::Satisfied
+        );
+        assert!(proposal.completion_recommended);
+        assert!(proposal.blockers.is_empty());
+        assert_eq!(proposal.recommendation, "recommend_completion");
+    }
+
+    #[test]
+    fn test_parse_leading_trailing_whitespace() {
+        let raw = format!("  \n  {}  \n  ", canonical_json());
+        let proposal = parse_proposal(&raw).unwrap();
+        assert_eq!(proposal.schema_version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_json_markdown_fence() {
+        let raw = format!("```json\n{}\n```", canonical_json());
+        let proposal = parse_proposal(&raw).unwrap();
+        assert_eq!(proposal.schema_version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_plain_markdown_fence() {
+        let raw = format!("```\n{}\n```", canonical_json());
+        let proposal = parse_proposal(&raw).unwrap();
+        assert_eq!(proposal.schema_version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_no_trailing_newline() {
+        let raw = canonical_json().trim_end().to_string();
+        let proposal = parse_proposal(&raw).unwrap();
+        assert_eq!(proposal.schema_version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_with_provider_noise_before() {
+        let raw = format!("Here is the assessment:\n{}", canonical_json());
+        let proposal = parse_proposal(&raw).unwrap();
+        assert_eq!(proposal.schema_version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_with_provider_noise_after() {
+        let raw = format!("{}\nThis assessment looks correct.", canonical_json());
+        let proposal = parse_proposal(&raw).unwrap();
+        assert_eq!(proposal.schema_version, "1.0");
+    }
+
+    #[test]
+    fn test_parse_invalid_enum_casing() {
+        // The enum is snake_case: "satisfied", not "Satisfied"
+        let raw = canonical_json().replace("\"satisfied\"", "\"Satisfied\"");
+        let result = parse_proposal(&raw);
+        assert!(
+            result.is_err(),
+            "PascalCase enum should fail: {:?}",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn test_parse_invalid_enum_value() {
+        let raw = canonical_json().replace("\"satisfied\"", "\"completed\"");
+        let result = parse_proposal(&raw);
+        assert!(
+            result.is_err(),
+            "unknown enum variant should fail: {:?}",
+            result.ok()
+        );
+    }
+
+    #[test]
+    fn test_parse_missing_required_field() {
+        // Remove overall_assessment field
+        let raw = r#"{
+  "schema_version": "1.0",
+  "criteria_assessments": [],
+  "plan_sufficient": true,
+  "replan_recommended": false,
+  "completion_recommended": false,
+  "blockers": [],
+  "recommendation": "continue",
+  "summary": "test"
+}"#;
+        let result = parse_proposal(raw);
+        assert!(result.is_err(), "missing overall_assessment should fail");
+    }
+
+    #[test]
+    fn test_parse_malformed_json() {
+        let raw = r#"{"schema_version": "1.0", "overall_assessment": "test", broken}"#;
+        let result = parse_proposal(raw);
+        assert!(result.is_err(), "malformed JSON should fail");
+    }
+
+    #[test]
+    fn test_parse_empty_output() {
+        let result = parse_proposal("");
+        assert!(result.is_err(), "empty output should fail");
+    }
+
+    #[test]
+    fn test_parse_prose_only() {
+        let result = parse_proposal("The goal is complete and all tasks passed.");
+        assert!(result.is_err(), "prose-only should fail");
+    }
+
+    #[test]
+    fn test_parse_blockers_omitted_defaults_to_empty() {
+        // blockers field is NOT present — should default to empty vec
+        let raw = r#"{
+  "schema_version": "1.0",
+  "overall_assessment": "all done",
+  "criteria_assessments": [],
+  "plan_sufficient": true,
+  "replan_recommended": false,
+  "completion_recommended": false,
+  "recommendation": "continue",
+  "summary": "test"
+}"#;
+        let proposal = parse_proposal(raw).unwrap();
+        assert!(
+            proposal.blockers.is_empty(),
+            "blockers should default to empty vec"
+        );
+    }
+
+    #[test]
+    fn test_parse_recommendation_omitted_defaults_to_empty() {
+        // recommendation field is NOT present — should default to empty string
+        let raw = r#"{
+  "schema_version": "1.0",
+  "overall_assessment": "all done",
+  "criteria_assessments": [],
+  "plan_sufficient": true,
+  "replan_recommended": false,
+  "completion_recommended": false,
+  "blockers": [],
+  "summary": "test"
+}"#;
+        let proposal = parse_proposal(raw).unwrap();
+        assert!(
+            proposal.recommendation.is_empty(),
+            "recommendation should default to empty"
+        );
+    }
+
+    #[test]
+    fn test_parse_partially_satisfied_requires_evidence() {
+        let raw = r#"{
+  "schema_version": "1.0",
+  "overall_assessment": "partial",
+  "criteria_assessments": [
+    {
+      "criterion_id": "c1",
+      "status": "partially_satisfied",
+      "evidence_refs": ["obs-1"],
+      "reason": "partial evidence",
+      "confidence": 0.5
+    }
+  ],
+  "plan_sufficient": true,
+  "replan_recommended": false,
+  "completion_recommended": false,
+  "blockers": [],
+  "recommendation": "continue",
+  "summary": "partial"
+}"#;
+        let proposal = parse_proposal(raw).unwrap();
+        assert_eq!(
+            proposal.criteria_assessments[0].status,
+            CriterionStatus::PartiallySatisfied
+        );
+        // Output guard: partially_satisfied with evidence_refs should pass
+        assert!(validate_proposal_static(&proposal).is_ok());
+    }
+
+    #[test]
+    fn test_output_guard_satisfied_without_evidence_fails() {
+        let raw = r#"{
+  "schema_version": "1.0",
+  "overall_assessment": "bad",
+  "criteria_assessments": [
+    {
+      "criterion_id": "c1",
+      "status": "satisfied",
+      "evidence_refs": [],
+      "reason": "no evidence",
+      "confidence": 0.9
+    }
+  ],
+  "plan_sufficient": true,
+  "replan_recommended": false,
+  "completion_recommended": false,
+  "blockers": [],
+  "recommendation": "continue",
+  "summary": "bad"
+}"#;
+        let proposal = parse_proposal(raw).unwrap();
+        let result = validate_proposal_static(&proposal);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no evidence_refs"));
+    }
+
+    #[test]
+    fn test_parse_unknown_status() {
+        let raw = canonical_json().replace("\"satisfied\"", "\"unknown\"");
+        let proposal = parse_proposal(&raw).unwrap();
+        assert_eq!(
+            proposal.criteria_assessments[0].status,
+            CriterionStatus::Unknown
+        );
+    }
+
+    #[test]
+    fn test_parse_blocked_status() {
+        let raw = canonical_json().replace("\"satisfied\"", "\"blocked\"");
+        let proposal = parse_proposal(&raw).unwrap();
+        assert_eq!(
+            proposal.criteria_assessments[0].status,
+            CriterionStatus::Blocked
+        );
+    }
+
+    #[test]
+    fn test_parse_all_criterion_statuses() {
+        for (json_val, expected) in &[
+            ("satisfied", CriterionStatus::Satisfied),
+            ("partially_satisfied", CriterionStatus::PartiallySatisfied),
+            ("unsatisfied", CriterionStatus::Unsatisfied),
+            ("unknown", CriterionStatus::Unknown),
+            ("blocked", CriterionStatus::Blocked),
+        ] {
+            let raw = canonical_json().replace("\"satisfied\"", &format!("\"{}\"", json_val));
+            let proposal = parse_proposal(&raw).unwrap();
+            assert_eq!(
+                proposal.criteria_assessments[0].status, *expected,
+                "failed for {json_val}"
+            );
+        }
     }
 }
 

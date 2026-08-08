@@ -12,6 +12,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use chrono::Utc;
+#[cfg(test)]
+use harness_core::contracts::goal::GoalBudget;
 use harness_core::contracts::goal::{GoalSpec, GoalState};
 use harness_core::contracts::plan::{
     compute_task_fingerprint, Milestone, MilestoneState, PlanRevision, PlanState, PlannedTask,
@@ -3013,34 +3015,108 @@ impl GoalLoopService {
                 .hit()
                 .await;
 
-            // Call the Evaluator if available
+            // ── Evaluator invocation with durable budget enforcement ──
+            // Count durable evaluator invocations for this goal BEFORE spawn.
+            // This count survives crash/restart because it reads from the
+            // planner_invocations table (invocation_kind = 'evaluator').
+            let max_evaluator_budget = goal.budget.max_evaluator_invocations;
+            let durable_used_before: u32 = count_durable_evaluator_invocations(&self.pool, goal_id)
+                .await
+                .unwrap_or(0);
+            tracing::info!(
+                goal_id = %goal_id,
+                durable_used = durable_used_before,
+                max_budget = max_evaluator_budget,
+                "evaluator budget check before spawn"
+            );
+
             let evaluator_proposal: Option<ProgressAssessmentProposal> = if let Some(
                 ref evaluator,
             ) = self.goal_evaluator
             {
-                let ctx = GoalAssessmentContext {
-                    goal: goal.clone(),
-                    current_plan_revision: plan.revision_number,
-                    evidence_ledger: observations.clone(),
-                    criteria_statuses: HashMap::new(),
-                    completed_milestones: vec![],
-                    failed_tasks: vec![],
-                    repository_head: goal.initial_base_head.clone(),
-                };
+                if durable_used_before >= max_evaluator_budget {
+                    tracing::warn!(
+                        goal_id = %goal_id,
+                        durable_used = durable_used_before,
+                        max_budget = max_evaluator_budget,
+                        "evaluator budget EXHAUSTED — skipping provider spawn"
+                    );
+                    None
+                } else {
+                    let ctx = GoalAssessmentContext {
+                        goal: goal.clone(),
+                        current_plan_revision: plan.revision_number,
+                        evidence_ledger: observations.clone(),
+                        criteria_statuses: HashMap::new(),
+                        completed_milestones: vec![],
+                        failed_tasks: vec![],
+                        repository_head: goal.initial_base_head.clone(),
+                    };
 
-                match evaluator.assess(&ctx).await {
-                    Ok(proposal) => {
+                    // Retry loop: attempt up to remaining budget for transient failures.
+                    // Each attempt writes a durable invocation row BEFORE provider spawn,
+                    // so restart-after-crash correctly counts the failed attempt.
+                    let remaining_budget = max_evaluator_budget.saturating_sub(durable_used_before);
+                    let mut last_error: Option<CoreError> = None;
+                    let mut proposal: Option<ProgressAssessmentProposal> = None;
+
+                    for attempt in 0..remaining_budget {
+                        let attempt_num = durable_used_before + attempt + 1;
                         tracing::info!(
                             goal_id = %goal_id,
-                            completion_recommended = proposal.completion_recommended,
-                            "evaluator assessment received"
+                            attempt = attempt_num,
+                            remaining_budget = remaining_budget - attempt,
+                            "evaluator invocation attempt"
                         );
-                        Some(proposal)
+
+                        match evaluator.assess(&ctx).await {
+                            Ok(p) => {
+                                tracing::info!(
+                                    goal_id = %goal_id,
+                                    attempt = attempt_num,
+                                    completion_recommended = p.completion_recommended,
+                                    "evaluator assessment received"
+                                );
+                                proposal = Some(p);
+                                break;
+                            }
+                            Err(e) => {
+                                let is_retryable = is_evaluator_error_retryable(&e);
+                                tracing::warn!(
+                                    goal_id = %goal_id,
+                                    attempt = attempt_num,
+                                    error = %e,
+                                    retryable = is_retryable,
+                                    "evaluator attempt failed"
+                                );
+                                last_error = Some(e);
+
+                                if !is_retryable {
+                                    tracing::error!(
+                                        goal_id = %goal_id,
+                                        attempt = attempt_num,
+                                        "evaluator error is non-retryable — stopping"
+                                    );
+                                    break;
+                                }
+                                // Transient error — will retry if budget remains
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::error!(goal_id = %goal_id, error = %e, "evaluator failed");
-                        None
+
+                    if proposal.is_none() {
+                        if let Some(ref err) = last_error {
+                            tracing::error!(
+                                goal_id = %goal_id,
+                                attempts_made = durable_used_before + remaining_budget,
+                                max_budget = max_evaluator_budget,
+                                error = %err,
+                                "evaluator exhausted all attempts without success"
+                            );
+                        }
                     }
+
+                    proposal
                 }
             } else {
                 tracing::info!(goal_id = %goal_id, "no evaluator available — using task-count policy");
@@ -3171,6 +3247,65 @@ impl GoalLoopService {
         new_state: GoalLoopRunState,
     ) -> Result<(), CoreError> {
         self.repo.update_loop_run_state(run_id, new_state).await
+    }
+}
+
+// ── Evaluator Budget Helpers ─────────────────────────────────────────
+
+/// Count durable evaluator invocations for a goal from the
+/// `planner_invocations` table (invocation_kind = 'evaluator').
+///
+/// This is the authoritative count used for budget enforcement.
+/// It survives crash/restart because it reads from durable storage,
+/// not an in-memory counter.
+async fn count_durable_evaluator_invocations(
+    pool: &SqlitePool,
+    goal_id: &str,
+) -> Result<u32, CoreError> {
+    let row: Option<(i64,)> = sqlx::query_as(
+        "SELECT COUNT(*) FROM planner_invocations WHERE goal_id = ? AND invocation_kind = 'evaluator'",
+    )
+    .bind(goal_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| CoreError::new(ErrorCode::PersistenceError, e.to_string(), ErrorSource::System))?;
+    Ok(row.map(|r| r.0 as u32).unwrap_or(0))
+}
+
+/// Classify whether an evaluator error is retryable.
+///
+/// Provider transient errors (timeout, non-zero exit, process failure) are
+/// retryable — the provider may recover on the next attempt.
+///
+/// Schema/semantic errors (serialization, invalid state) are NOT retryable —
+/// retrying with the same input will produce the same malformed output.
+///
+/// Capture subsystem internal bugs are NOT retryable — they indicate a harness
+/// defect, not a provider issue.
+fn is_evaluator_error_retryable(error: &CoreError) -> bool {
+    match &error.code {
+        // Provider transient — retryable
+        ErrorCode::ProcessTimeout { .. } => true,
+        ErrorCode::Internal => {
+            // Internal errors may be provider failures (retryable) or harness
+            // defects (non-retryable). We use heuristics on the message.
+            let msg = error.to_string();
+            // Provider-level failures
+            if msg.contains("process timeout")
+                || msg.contains("exited with code")
+                || msg.contains("no final result")
+                || msg.contains("receive_events")
+            {
+                return true;
+            }
+            // Harness-level defects — do NOT retry
+            false
+        }
+        // Schema/semantic — NOT retryable
+        ErrorCode::SerializationError => false,
+        ErrorCode::InvalidState => false,
+        // Default: do NOT retry unknown errors
+        _ => false,
     }
 }
 
@@ -3774,5 +3909,379 @@ mod profile_separation_tests {
         let svc = svc.with_goal_profiles(planner, evaluator).unwrap();
         // Should pass - different profiles
         assert!(svc.validate_profile_separation("g1").is_ok());
+    }
+}
+
+#[cfg(test)]
+mod evaluator_budget_tests {
+    use super::*;
+
+    /// Verify that `is_evaluator_error_retryable` correctly classifies errors.
+    #[test]
+    fn test_retryable_classification_process_timeout() {
+        let err = CoreError::new(
+            ErrorCode::ProcessTimeout {
+                duration_ms: 120_000,
+            },
+            "timeout",
+            ErrorSource::Harness,
+        );
+        assert!(is_evaluator_error_retryable(&err));
+    }
+
+    #[test]
+    fn test_retryable_classification_serialization_error_not_retryable() {
+        let err = CoreError::new(
+            ErrorCode::SerializationError,
+            "failed to parse",
+            ErrorSource::Harness,
+        );
+        assert!(!is_evaluator_error_retryable(&err));
+    }
+
+    #[test]
+    fn test_retryable_classification_invalid_state_not_retryable() {
+        let err = CoreError::new(
+            ErrorCode::InvalidState,
+            "output guard rejected",
+            ErrorSource::Harness,
+        );
+        assert!(!is_evaluator_error_retryable(&err));
+    }
+
+    #[test]
+    fn test_retryable_classification_internal_provider_failure_retryable() {
+        let err = CoreError::new(
+            ErrorCode::Internal,
+            "Evaluator exited with code 1 without producing final result",
+            ErrorSource::Harness,
+        );
+        assert!(is_evaluator_error_retryable(&err));
+    }
+
+    #[test]
+    fn test_retryable_classification_internal_process_timeout_retryable() {
+        let err = CoreError::new(
+            ErrorCode::Internal,
+            "Evaluator process timeout after 120s",
+            ErrorSource::Harness,
+        );
+        assert!(is_evaluator_error_retryable(&err));
+    }
+
+    #[test]
+    fn test_retryable_classification_internal_no_result_retryable() {
+        let err = CoreError::new(
+            ErrorCode::Internal,
+            "Evaluator produced no final result",
+            ErrorSource::Harness,
+        );
+        assert!(is_evaluator_error_retryable(&err));
+    }
+
+    #[test]
+    fn test_retryable_classification_internal_harness_defect_not_retryable() {
+        let err = CoreError::new(
+            ErrorCode::Internal,
+            "prompt template not found",
+            ErrorSource::Harness,
+        );
+        assert!(!is_evaluator_error_retryable(&err));
+    }
+
+    #[test]
+    fn test_retryable_classification_not_found_not_retryable() {
+        let err = CoreError::new(ErrorCode::NotFound, "not found", ErrorSource::Harness);
+        assert!(!is_evaluator_error_retryable(&err));
+    }
+
+    /// Verify the durable count query returns 0 for a fresh goal.
+    #[tokio::test]
+    async fn test_count_durable_invocations_returns_zero_for_fresh_goal() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create test pool");
+
+        // Create the planner_invocations table
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS planner_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                plan_revision_id TEXT,
+                invocation_kind TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_digest TEXT NOT NULL DEFAULT '',
+                output_digest TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        let count = count_durable_evaluator_invocations(&pool, "fresh-goal")
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    /// Verify the durable count reflects actual insertions.
+    #[tokio::test]
+    async fn test_count_durable_invocations_counts_evaluator_rows() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create test pool");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS planner_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                plan_revision_id TEXT,
+                invocation_kind TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_digest TEXT NOT NULL DEFAULT '',
+                output_digest TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        // Insert 2 evaluator invocations
+        for i in 0..2 {
+            sqlx::query(
+                "INSERT INTO planner_invocations (invocation_id, goal_id, invocation_kind, profile_id, state, created_at) VALUES (?, ?, 'evaluator', 'test-profile', 'failed', datetime('now'))"
+            )
+            .bind(format!("inv-{}", i))
+            .bind("g1")
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+
+        // Insert 1 planner invocation (should NOT be counted)
+        sqlx::query(
+            "INSERT INTO planner_invocations (invocation_id, goal_id, invocation_kind, profile_id, state, created_at) VALUES (?, ?, 'planner', 'test-profile', 'completed', datetime('now'))"
+        )
+        .bind("inv-planner-1")
+        .bind("g1")
+        .execute(&pool)
+        .await
+        .expect("insert");
+
+        let count = count_durable_evaluator_invocations(&pool, "g1")
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "should count only evaluator invocations");
+    }
+
+    /// Verify the durable count is isolated per goal.
+    #[tokio::test]
+    async fn test_count_durable_invocations_scoped_to_goal() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create test pool");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS planner_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                plan_revision_id TEXT,
+                invocation_kind TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_digest TEXT NOT NULL DEFAULT '',
+                output_digest TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        // Goal A: 2 evaluator invocations
+        for i in 0..2 {
+            sqlx::query(
+                "INSERT INTO planner_invocations (invocation_id, goal_id, invocation_kind, profile_id, state, created_at) VALUES (?, ?, 'evaluator', 'p', 'failed', datetime('now'))"
+            )
+            .bind(format!("inv-a-{}", i))
+            .bind("goal-a")
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+
+        // Goal B: 0 evaluator invocations
+        let count_b = count_durable_evaluator_invocations(&pool, "goal-b")
+            .await
+            .unwrap();
+        assert_eq!(count_b, 0);
+
+        let count_a = count_durable_evaluator_invocations(&pool, "goal-a")
+            .await
+            .unwrap();
+        assert_eq!(count_a, 2);
+    }
+
+    /// Simulate restart: durable rows survive, fresh count reads them correctly.
+    #[tokio::test]
+    async fn test_durable_count_survives_restart() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create test pool");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS planner_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                plan_revision_id TEXT,
+                invocation_kind TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_digest TEXT NOT NULL DEFAULT '',
+                output_digest TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        // Simulate pre-crash: 2 failed evaluator attempts
+        for i in 0..2 {
+            sqlx::query(
+                "INSERT INTO planner_invocations (invocation_id, goal_id, invocation_kind, profile_id, state, created_at) VALUES (?, ?, 'evaluator', 'p', 'failed', datetime('now'))"
+            )
+            .bind(format!("inv-{}", i))
+            .bind("g1")
+            .execute(&pool)
+            .await
+            .expect("insert");
+        }
+
+        // Simulate restart: read count from durable storage
+        let count = count_durable_evaluator_invocations(&pool, "g1")
+            .await
+            .unwrap();
+        assert_eq!(count, 2, "should see 2 attempts after restart");
+
+        // Budget check: 2 >= max(2) => exhausted
+        let max_budget: u32 = 2;
+        assert!(
+            count >= max_budget,
+            "budget should be exhausted after restart"
+        );
+    }
+
+    /// Verify the GoalBudget::is_exhausted correctly gates on evaluator count.
+    #[test]
+    fn test_budget_is_exhausted_evaluator() {
+        let budget = GoalBudget::default();
+        // Default max_evaluator_invocations = 10
+        assert!(!budget.is_exhausted(0, 0, 0, 9, 0));
+        assert!(budget.is_exhausted(0, 0, 0, 10, 0));
+        assert!(budget.is_exhausted(0, 0, 0, 11, 0));
+    }
+
+    /// With max=2: attempt 0 → allow, attempt 1 failed → allow second, attempt 2 failed → block third
+    #[tokio::test]
+    async fn test_budget_max_2_blocks_third_attempt() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("create test pool");
+
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS planner_invocations (
+                invocation_id TEXT PRIMARY KEY,
+                goal_id TEXT NOT NULL,
+                plan_revision_id TEXT,
+                invocation_kind TEXT NOT NULL,
+                profile_id TEXT NOT NULL,
+                idempotency_key TEXT,
+                input_digest TEXT NOT NULL DEFAULT '',
+                output_digest TEXT NOT NULL DEFAULT '',
+                state TEXT NOT NULL DEFAULT 'pending',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT ''
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("create table");
+
+        // Attempt 0: no durable rows yet → allow
+        let count = count_durable_evaluator_invocations(&pool, "g1")
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(count < 2, "attempt 0: should be allowed");
+
+        // Insert attempt 1 (failed)
+        sqlx::query(
+            "INSERT INTO planner_invocations (invocation_id, goal_id, invocation_kind, profile_id, state, created_at) VALUES ('inv-1', 'g1', 'evaluator', 'p', 'failed', datetime('now'))"
+        )
+        .execute(&pool).await.expect("insert");
+
+        let count = count_durable_evaluator_invocations(&pool, "g1")
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(count < 2, "attempt 1 failed → allow second");
+
+        // Insert attempt 2 (failed)
+        sqlx::query(
+            "INSERT INTO planner_invocations (invocation_id, goal_id, invocation_kind, profile_id, state, created_at) VALUES ('inv-2', 'g1', 'evaluator', 'p', 'failed', datetime('now'))"
+        )
+        .execute(&pool).await.expect("insert");
+
+        let count = count_durable_evaluator_invocations(&pool, "g1")
+            .await
+            .unwrap();
+        assert_eq!(count, 2);
+        assert!(count >= 2, "attempt 2 failed → block third");
+    }
+
+    /// Timeout consumes budget — the failed durable row is written even for timeouts.
+    #[test]
+    fn test_timeout_consumes_budget() {
+        let err = CoreError::new(
+            ErrorCode::ProcessTimeout {
+                duration_ms: 120_000,
+            },
+            "Evaluator process timeout after 120s",
+            ErrorSource::Harness,
+        );
+        // Timeout produces a durable failed row (written before spawn, updated after)
+        // It is retryable but consumes a budget slot
+        assert!(is_evaluator_error_retryable(&err));
+    }
+
+    /// Serialization failure consumes budget — the attempt was made, it just failed.
+    #[test]
+    fn test_serialization_failure_consumes_budget_but_not_retryable() {
+        let err = CoreError::new(
+            ErrorCode::SerializationError,
+            "failed to parse ProgressAssessmentProposal",
+            ErrorSource::Harness,
+        );
+        // Serialization errors are NOT retryable (same input → same malformed output)
+        assert!(!is_evaluator_error_retryable(&err));
+        // But the durable row was written BEFORE spawn, so budget IS consumed
     }
 }

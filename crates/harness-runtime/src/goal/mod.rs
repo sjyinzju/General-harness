@@ -100,7 +100,12 @@ pub struct ProgressAssessmentProposal {
     pub plan_sufficient: bool,
     pub replan_recommended: bool,
     pub completion_recommended: bool,
+    #[serde(default)]
     pub blockers: Vec<String>,
+    /// Human-readable recommendation (advisory — Rust CompletionPolicy is authoritative).
+    /// Mirrors the schema's `recommendation` enum field.
+    #[serde(default)]
+    pub recommendation: String,
     pub summary: String,
 }
 
