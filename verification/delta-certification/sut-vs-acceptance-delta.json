@@ -1,0 +1,27 @@
+{
+  "certification": "I1-I7 Delta Certification — SUT vs Acceptance Harness Boundary",
+  "generated_at": "2026-08-08T15:45:00Z",
+  "delta_run_id": "delta-certification-final-20260808-154500",
+
+  "sut_code_baseline": {
+    "head": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+    "description": "Production Harness runtime code — unchanged by this delta certification"
+  },
+
+  "acceptance_harness_head": {
+    "head": "852833f508d03d852cfd433fa9d73893bd4bcdad",
+    "description": "Acceptance harness integrity fixes — single-file change, acceptance-only binary"
+  },
+
+  "report_head": {
+    "description": "Verification evidence and certification artifacts — separate report-only commit"
+  },
+
+  "delta_verdict": {
+    "sut_unchanged": true,
+    "acceptance_harness_modified": true,
+    "report_only": false,
+    "no_production_control_flow_changes": true,
+    "changes_are_acceptance_or_observability_only": true
+  }
+}

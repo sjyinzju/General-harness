@@ -1,0 +1,43 @@
+{
+  "pilot": "Pilot B — AppConfig::load()",
+  "generated_at": "2026-08-08T14:15:00Z",
+  "code_head": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+
+  "requirements": {
+    "planner": { "min": 1, "description": "Real Planner invocation for plan generation" },
+    "executor": { "min": 1, "description": "Real Executor invocation — Pilot B MUST have E>=1" },
+    "reviewer": { "min": 1, "description": "Real Reviewer invocation for code review" },
+    "evaluator": { "min": 1, "description": "Real Evaluator invocation for success assessment" },
+    "goal_succeeded": true,
+    "commit_verified": true,
+    "integration_pass": true
+  },
+
+  "critical_rule": {
+    "rule": "Pilot B E=0 MUST FAIL",
+    "rationale": "Even if Pilot A and C have high Executor counts, Pilot B independently requires E>=1. Aggregate counting is prohibited.",
+    "aggregate_mask_check": "If Pilot B E=0 and aggregate E>=4, Pilot B STILL FAILS."
+  },
+
+  "evidence_sources": {
+    "planner": "planner_invocations WHERE invocation_kind = 'planner'",
+    "executor": "execution_attempts WHERE lifecycle = 'completed' AND profile_id != 'deterministic'",
+    "reviewer": "review_invocation_log WHERE cache_hit = 0",
+    "evaluator": "planner_invocations WHERE invocation_kind = 'evaluator'"
+  },
+
+  "independent_evaluation": {
+    "aggregate_masking_impossible": true,
+    "note": "Pilot B is evaluated ONLY on its own DB (pilot-b/harness.db). Other pilot counts do not compensate for Pilot B deficiencies. E=0 means FAIL even if total aggregate Executor count is high."
+  },
+
+  "historical_full_run_evidence": {
+    "run_id": "system-full-release-ba03e988-full-release-20260808-022042",
+    "planner": 1,
+    "executor": 1,
+    "reviewer": 1,
+    "evaluator": 1,
+    "goal_succeeded": true,
+    "verdict": "PASS"
+  }
+}

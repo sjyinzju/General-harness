@@ -1,0 +1,52 @@
+{
+  "pilot": "Pilot C — RetryPolicy with Rework",
+  "generated_at": "2026-08-08T14:15:00Z",
+  "code_head": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+
+  "requirements": {
+    "planner": { "min": 1, "description": "Real Planner invocation for plan generation" },
+    "executor": { "min": 2, "description": "Real Executor invocations — Pilot C MUST have E>=2 (initial + rework)" },
+    "reviewer": { "min": 1, "description": "Real Reviewer invocation for code review" },
+    "evaluator": { "min": 1, "description": "Real Evaluator invocation for success assessment" },
+    "rework": { "min": 1, "description": "Real rework evidence — MUST have Verification FAIL or Reviewer ChangesRequested + second Executor invocation" },
+    "goal_succeeded": true,
+    "commit_verified": true,
+    "integration_pass": true
+  },
+
+  "critical_rules": [
+    "Pilot C E<2 MUST FAIL — regardless of aggregate counts",
+    "Pilot C rework=0 MUST FAIL — even if E>=2 (no real rework evidence)",
+    "Rework must be real: Verification FAIL or Reviewer ChangesRequested → second Executor invocation"
+  ],
+
+  "rework_evidence_source": {
+    "query": "SELECT COUNT(*) FROM execution_attempts WHERE lifecycle = 'completed' AND profile_id != 'deterministic' AND attempt_number > 1",
+    "rationale": "attempt_number > 1 indicates a task was re-executed after initial failure or rework request",
+    "minimum": 1
+  },
+
+  "evidence_sources": {
+    "planner": "planner_invocations WHERE invocation_kind = 'planner'",
+    "executor": "execution_attempts WHERE lifecycle = 'completed' AND profile_id != 'deterministic'",
+    "reviewer": "review_invocation_log WHERE cache_hit = 0",
+    "evaluator": "planner_invocations WHERE invocation_kind = 'evaluator'",
+    "rework": "execution_attempts WHERE attempt_number > 1"
+  },
+
+  "independent_evaluation": {
+    "aggregate_masking_impossible": true,
+    "note": "Pilot C is evaluated ONLY on its own DB (pilot-c/harness.db). E<2 or rework=0 means FAIL regardless of other pilot counts."
+  },
+
+  "historical_full_run_evidence": {
+    "run_id": "system-full-release-ba03e988-full-release-20260808-022042",
+    "planner": 1,
+    "executor": 2,
+    "reviewer": 1,
+    "evaluator": 1,
+    "rework": 1,
+    "goal_succeeded": true,
+    "verdict": "PASS"
+  }
+}

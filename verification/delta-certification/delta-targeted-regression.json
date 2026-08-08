@@ -1,0 +1,104 @@
+{
+  "artifact": "Delta Targeted Production Regression",
+  "generated_at": "2026-08-08T14:15:00Z",
+  "code_head": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+
+  "regression_scope": {
+    "description": "Targeted regression of production paths affected by acceptance harness changes. SUT code unchanged, but tests verify no accidental breakage.",
+    "full_phase_rerun_not_required": true,
+    "rationale": "Only acceptance harness and observability code modified. Production control flow unchanged."
+  },
+
+  "test_targets": [
+    {
+      "file": "task_engineering_loop",
+      "category": "Phase 4 Core Journey + Phase 5 Retry",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "task_loop_i4_integration",
+      "category": "Phase 4 Core Journey",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "i7_final_e2e_tests",
+      "category": "Phase 4/5 E2E",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "i7_acceptance_tests",
+      "category": "Phase 4/5 Acceptance",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "i4_6_review_smoke",
+      "category": "Phase 5 Reviewer Orchestration",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "i5_1_controlled_commit",
+      "category": "Phase 5 Commit",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "verification_finalization_recovery",
+      "category": "Goal Recovery + CompletionPolicy",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "verification_reconciliation_recovery",
+      "category": "Goal Recovery",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "i5_2_integration_queue",
+      "category": "Integration",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "i5_3_integration_e2e",
+      "category": "Integration E2E",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "task_loop_fault_tests",
+      "category": "Phase 5 Retry/Rework",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "real_i4_e2e_tests",
+      "category": "Evaluator/Completion",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "real_runtime_pipeline_tests",
+      "category": "Evaluator/Completion + Pipeline",
+      "result": "PASS",
+      "tests_passed": "all"
+    },
+    {
+      "file": "liveness_cross_process",
+      "category": "Supervisor/Recovery",
+      "result": "PASS",
+      "tests_passed": "all"
+    }
+  ],
+
+  "verdict": {
+    "targeted_production_regression_pass": true,
+    "all_targeted_tests_passed": true,
+    "failures": 0
+  }
+}

@@ -1,0 +1,26 @@
+{
+  "artifact": "Long-Run Evidence Reuse Justification",
+  "generated_at": "2026-08-08T15:45:00Z",
+  "delta_run_id": "delta-certification-final-20260808-154500",
+  "acceptance_harness_head": "852833f508d03d852cfd433fa9d73893bd4bcdad",
+  "sut_code_baseline": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+
+  "reused_evidence": {
+    "head": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+    "verdict": "FULL_RELEASE_PASS",
+    "soak": "60 min, 1197 goals, 0 unexpected failures",
+    "fault_matrix": "F1-F10 PASS, F0 PASS"
+  },
+
+  "justification": {
+    "sut_business_behavior_unchanged": true,
+    "changes_limited_to": ["Acceptance harness source", "Acceptance integrity tests", "Pure invocation observability"],
+    "no_production_control_flow_changes": true,
+    "no_db_schema_changes": true,
+    "no_state_machine_changes": true,
+    "no_service_behavior_changes": true
+  },
+
+  "not_rerunning": ["60-minute soak", "Full F1-F10 fault matrix", "Full Phase 1-12"],
+  "verdict": "Long-run evidence reuse justified — SUT stability preserved"
+}

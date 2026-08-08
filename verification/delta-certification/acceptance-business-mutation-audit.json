@@ -1,0 +1,24 @@
+{
+  "audit": "Acceptance Runner Business State Mutation Audit",
+  "generated_at": "2026-08-08T15:45:00Z",
+  "acceptance_harness_head": "852833f508d03d852cfd433fa9d73893bd4bcdad",
+  "sut_code_baseline": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+
+  "pre_delta_state": {
+    "category_d_business_mutations": 4,
+    "mutations": [
+      {"id": "mutation-1", "sql": "UPDATE planned_tasks SET state = 'pending' (in-loop)", "severity": "HIGH"},
+      {"id": "mutation-2", "sql": "UPDATE planned_tasks SET state = 'pending' (post-shutdown)", "severity": "HIGH"},
+      {"id": "mutation-3", "sql": "UPDATE goals SET state = 'succeeded' (force-complete)", "severity": "CRITICAL"},
+      {"id": "mutation-4", "sql": "INSERT INTO goal_events ... source:'force-complete'", "severity": "HIGH"}
+    ]
+  },
+
+  "post_delta_state": {
+    "phase13_direct_business_mutations": 0,
+    "force_complete_present": false,
+    "direct_failed_task_retry_sql": false,
+    "remaining_read_only_queries": 13,
+    "acceptance_runner_purity": "PASS — no business state writes"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "audit": "max_total_tasks=1 Scope Audit",
+  "generated_at": "2026-08-08T14:15:00Z",
+  "code_head": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+
+  "production_default": {
+    "value": 20,
+    "location": "crates/harness-core/src/contracts/goal.rs:251",
+    "field": "GoalBudget.max_total_tasks"
+  },
+
+  "acceptance_fixture_value": {
+    "value": 1,
+    "locations": [
+      "system_release_acceptance.rs:2423 (make_pilot_goal_spec → max_total_tasks: 1)",
+      "fault_scenario.rs:1036 (fault test fixture → max_total_tasks: 1)",
+      "i7_acceptance.rs:1984 (i7 acceptance fixture → max_total_tasks: 1)"
+    ]
+  },
+
+  "scope_analysis": {
+    "affects_production_default": false,
+    "acceptance_fixture_only": true,
+    "rationale": "max_total_tasks=1 is set ONLY in acceptance pilot GoalSpec fixtures. The production default (20) is unchanged in harness-core contracts. The acceptance pilots are single-task goals by design (Pilot A: bug fix, Pilot B: AppConfig::load(), Pilot C: RetryPolicy), maximizing to a single planned task is appropriate for a focused pilot.",
+    "no_production_weakening": true,
+    "multi_task_goals_still_supported": true
+  },
+
+  "verdict": {
+    "acceptance_fixture_only": true,
+    "no_production_default_change": true,
+    "escalation_required": false
+  }
+}

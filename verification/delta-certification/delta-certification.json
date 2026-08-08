@@ -1,0 +1,65 @@
+{
+  "certification": "I1-I7 Lightweight Delta Certification — Acceptance Harness Integrity Closure",
+  "generated_at": "2026-08-08T15:45:00Z",
+  "delta_run_id": "delta-certification-final-20260808-154500",
+
+  "sut_code_baseline": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+  "acceptance_harness_head": "852833f508d03d852cfd433fa9d73893bd4bcdad",
+
+  "historical_full_run": {
+    "head": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+    "verdict": "FULL_RELEASE_PASS",
+    "evidence": "verification/system-accepted-ba03e988-system-accept-20260808-022042"
+  },
+
+  "historical_soak": {
+    "duration": "60 minutes",
+    "goals": 1197,
+    "unexpected_failures": 0
+  },
+
+  "delta_certification": {
+    "status": "PASS",
+    "blocking_findings": 0,
+
+    "acceptance_integrity": {
+      "direct_goal_mutation": 0,
+      "direct_task_retry_mutation": 0,
+      "force_complete_absent": true,
+      "authoritative_invocation_evidence": "PASS",
+      "aggregate_pilot_masking_impossible": true
+    },
+
+    "quality_gates": {
+      "fmt": "PASS",
+      "clippy": "PASS",
+      "workspace_tests": "PASS (0 failures)",
+      "workspace_build": "PASS",
+      "integrity_tests": "19/19 PASS"
+    },
+
+    "targeted_regression": {
+      "result": "PASS",
+      "test_files": 14,
+      "all_passed": true
+    },
+
+    "per_pilot_evaluation": {
+      "routing_smoke_separate": true,
+      "formal_pilots_count": 3,
+      "pilot_a_independent": true,
+      "pilot_b_independent": true,
+      "pilot_c_independent": true,
+      "pilot_c_min_executor": 2,
+      "pilot_c_min_rework": 1,
+      "aggregate_masking_prevented": true
+    }
+  },
+
+  "production_changes": "NONE — all changes are acceptance harness or observability only",
+
+  "escalation_required": false,
+  "final_verdict": "PASS — I1-I7 Full Release Delta Certification complete. Acceptance Harness Integrity verified.",
+  "i1_i7_status": "FULL RELEASE ACCEPTED AND CLOSED",
+  "next": "Do not start I8 automatically."
+}
