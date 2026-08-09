@@ -143,14 +143,34 @@ fn draw_tasks_panel(f: &mut Frame, area: Rect, state: &TuiAppState) {
                     "failed" => Style::default().fg(Color::Red),
                     _ => Style::default(),
                 };
-                lines.push(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(format!("{} ", task_symbol(&t.state)), style),
                     Span::styled(
                         format!("{} ", t.client_ref),
                         Style::default().add_modifier(Modifier::DIM),
                     ),
                     Span::raw(t.title.clone()),
-                ]));
+                ];
+                // Real runtime assignment where available; "unknown" for a
+                // running task without one — never fabricated (I8B §67).
+                let assignment = match (&t.agent_kind, &t.model) {
+                    (Some(agent), Some(model)) => Some(format!("{agent} · {model}")),
+                    (Some(agent), None) => Some(agent.clone()),
+                    (None, Some(model)) => Some(model.clone()),
+                    (None, None) => None,
+                };
+                if let Some(a) = assignment {
+                    spans.push(Span::styled(
+                        format!(" [{a}]"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                } else if t.state == "running" {
+                    spans.push(Span::styled(
+                        " [agent: unknown]",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ));
+                }
+                lines.push(Line::from(spans));
             }
         }
     }
@@ -193,6 +213,20 @@ fn draw_activity_panel(f: &mut Frame, area: Rect, state: &TuiAppState) {
                         run.iteration_number, run.state, run.run_id
                     )),
                 ]));
+                if let Some(title) = &run.task_title {
+                    lines.push(Line::from(Span::styled(
+                        format!("    task: {title}"),
+                        Style::default().add_modifier(Modifier::DIM),
+                    )));
+                }
+                // Real runtime assignment; absent values shown honestly as
+                // "unknown" — never fabricated (I8B §67).
+                let agent = run.agent_kind.as_deref().unwrap_or("unknown");
+                let model = run.model.as_deref().unwrap_or("unknown");
+                lines.push(Line::from(Span::styled(
+                    format!("    agent: {agent} · model: {model}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                )));
                 if let Some(pr) = &run.plan_revision_id {
                     lines.push(Line::from(Span::styled(
                         format!("    plan revision: {pr}"),

@@ -1,9 +1,14 @@
 //! I8B TUI — the interactive goal console for `general-harness`.
 //!
-//! Hard boundary: this module depends ONLY on `harness_core` presentation /
-//! IPC contracts plus the Named Pipe transport. It never imports repository,
-//! service, or sqlx code, and it never opens the business database — every
-//! mutation travels TUI → IPC → Supervisor → production services.
+//! Hard boundary: production code in this module depends ONLY on
+//! `harness_core` presentation / IPC contracts plus the Named Pipe
+//! transport. It never imports repository, service, or sqlx code, and it
+//! never opens the business database — every mutation travels
+//! TUI → IPC → Supervisor → production services.
+//!
+//! The `cfg(test)` integration tests are the exception by design: they spin
+//! up a real in-process Supervisor behind a live Named Pipe to prove the
+//! full control path end to end.
 
 pub mod action;
 pub mod commands;
@@ -16,6 +21,9 @@ pub mod spec;
 pub mod state;
 pub mod terminal;
 pub mod widgets;
+
+#[cfg(test)]
+mod integration_tests;
 
 use std::path::Path;
 

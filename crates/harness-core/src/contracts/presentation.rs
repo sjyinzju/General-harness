@@ -52,6 +52,15 @@ pub struct SnapshotTask {
     /// Set once the planned task is materialized as a real Task.
     pub materialized_task_id: Option<String>,
     pub materialized_loop_id: Option<String>,
+    /// Real runtime assignment of the current execution, when available.
+    /// Additive presentation fields — `None` means "unknown", never
+    /// fabricated (I8B §67).
+    #[serde(default)]
+    pub agent_kind: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
 }
 
 /// A pending interaction (clarification or plan approval) awaiting the user.
@@ -87,6 +96,16 @@ pub struct RunningActivity {
     pub state: String,
     pub iteration_number: i64,
     pub plan_revision_id: Option<String>,
+    /// Title of the currently executing planned task, when available.
+    #[serde(default)]
+    pub task_title: Option<String>,
+    /// Real runtime assignment of the current execution, when available.
+    /// Additive presentation fields — `None` means "unknown", never
+    /// fabricated (I8B §67).
+    #[serde(default)]
+    pub agent_kind: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Optional usage totals. Provider-absent metrics stay `None` — never

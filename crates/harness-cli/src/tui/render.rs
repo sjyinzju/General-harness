@@ -100,6 +100,9 @@ mod tests {
                     expected_evidence: vec![],
                     materialized_task_id: None,
                     materialized_loop_id: None,
+                    agent_kind: None,
+                    model: None,
+                    provider: None,
                 },
                 SnapshotTask {
                     planned_task_id: "pt-2".into(),
@@ -113,6 +116,9 @@ mod tests {
                     expected_evidence: vec![],
                     materialized_task_id: None,
                     materialized_loop_id: None,
+                    agent_kind: Some("claude-code".into()),
+                    model: Some("sonnet-4".into()),
+                    provider: None,
                 },
             ],
             pending_interactions: vec![],
@@ -156,11 +162,15 @@ mod tests {
     #[test]
     fn running_goal_renders_tasks_and_activity() {
         let mut s = attached("active");
+        s.term_cols = 300; // wide enough that the activity row is not wrapped
         s.snapshot.as_mut().unwrap().running_activities = vec![RunningActivity {
             run_id: "run-1".into(),
             state: "running".into(),
             iteration_number: 2,
             plan_revision_id: Some("pr-1".into()),
+            task_title: Some("Implement widget".into()),
+            agent_kind: Some("claude-code".into()),
+            model: None,
         }];
         let buf = render(&s);
         assert!(contains(&buf, "Ship the widget"));
@@ -170,6 +180,11 @@ mod tests {
         assert!(contains(&buf, "✓"));
         assert!(contains(&buf, "●"));
         assert!(contains(&buf, "iteration 2"));
+        // Real runtime assignment is displayed where available (§67)…
+        assert!(contains(&buf, "claude-code"));
+        assert!(contains(&buf, "sonnet-4"));
+        // …and absent values are shown honestly, never fabricated.
+        assert!(contains(&buf, "agent: claude-code · model: unknown"));
     }
 
     #[test]

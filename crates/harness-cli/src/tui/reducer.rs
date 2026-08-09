@@ -572,12 +572,11 @@ fn submit_answer(state: &mut TuiAppState, text: &str) -> Vec<Effect> {
             .clarify_approval_id
             .clone()
             .unwrap_or_default();
-        let answers: Vec<serde_json::Value> = state
-            .pending
-            .clarify_questions
-            .iter()
-            .map(|q| json!({ "question_id": q.question_id, "answer": q.answer }))
-            .collect();
+        // Map keyed by question_id — the shape the I8A contract uses.
+        let mut answers = serde_json::Map::new();
+        for q in &state.pending.clarify_questions {
+            answers.insert(q.question_id.clone(), json!(q.answer));
+        }
         let key = next_key(state, "answer");
         vec![Effect::Ipc {
             slot: MutationSlot::Answer,
@@ -1042,6 +1041,9 @@ mod tests {
                 state: "running".into(),
                 iteration_number: 1,
                 plan_revision_id: Some("pr-1".into()),
+                task_title: None,
+                agent_kind: None,
+                model: None,
             }],
             usage: UsageSummary::default(),
             last_event_sequence: 5,
@@ -1292,8 +1294,8 @@ mod tests {
             } => {
                 assert_eq!(command, "goal.answer");
                 assert_eq!(payload["approval_id"], "ap-1");
-                assert_eq!(payload["answers"][0]["answer"], "sqlite");
-                assert_eq!(payload["answers"][1]["answer"], "none");
+                assert_eq!(payload["answers"]["q1"], "sqlite");
+                assert_eq!(payload["answers"]["q2"], "none");
             }
             _ => panic!("expected goal.answer"),
         }

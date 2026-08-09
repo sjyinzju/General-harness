@@ -1507,25 +1507,47 @@ impl SupervisorCommandHandler {
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, CoreError> {
         let state_filter = payload.get("state").and_then(|v| v.as_str());
-        let goal_repo = crate::goal::repo::GoalRepo::new(self.pool.clone());
-        let goals = goal_repo
-            .list_goals_by_state(state_filter)
-            .await
-            .map_err(|e| {
-                CoreError::new(
-                    harness_core::ErrorCode::PersistenceError,
-                    format!("goal list: {e}"),
-                    harness_core::ErrorSource::System,
-                )
-            })?;
 
-        let items: Vec<serde_json::Value> = goals
+        // Direct projection query: the TUI goal list needs state and
+        // timestamps in addition to identity (additive presentation,
+        // I8B §71 — no schema change).
+        let list_err = |e: sqlx::Error| {
+            CoreError::new(
+                harness_core::ErrorCode::PersistenceError,
+                format!("goal list: {e}"),
+                harness_core::ErrorSource::System,
+            )
+        };
+        type ListRow = (String, String, i64, String, String, String);
+        let rows: Vec<ListRow> = if let Some(s) = state_filter {
+            sqlx::query_as(
+                r#"SELECT goal_id, title, revision, state, created_at, updated_at
+                   FROM goals WHERE state = ? ORDER BY created_at DESC"#,
+            )
+            .bind(s)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(list_err)?
+        } else {
+            sqlx::query_as(
+                r#"SELECT goal_id, title, revision, state, created_at, updated_at
+                   FROM goals ORDER BY created_at DESC"#,
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(list_err)?
+        };
+
+        let items: Vec<serde_json::Value> = rows
             .iter()
             .map(|g| {
                 serde_json::json!({
-                    "goal_id": g.goal_id,
-                    "title": g.title,
-                    "revision": g.revision,
+                    "goal_id": g.0,
+                    "title": g.1,
+                    "revision": g.2,
+                    "state": g.3,
+                    "created_at": g.4,
+                    "updated_at": g.5,
                 })
             })
             .collect();
@@ -2216,20 +2238,64 @@ impl SupervisorCommandHandler {
             .fetch_all(&self.pool)
             .await
             .map_err(db_err("tasks"))?;
+
+            // Real runtime assignments for materialized tasks (I8B §67):
+            // task → current execution → runtime profile. Absent values stay
+            // None ("unknown"), never fabricated.
+            let materialized: Vec<&String> = rows.iter().filter_map(|r| r.9.as_ref()).collect();
+            type Assignment = (Option<String>, Option<String>, Option<String>);
+            let mut assignments: std::collections::HashMap<String, Assignment> =
+                std::collections::HashMap::new();
+            if !materialized.is_empty() {
+                let placeholders = vec!["?"; materialized.len()].join(",");
+                let sql = format!(
+                    "SELECT t.id, NULLIF(rp.agent_kind, ''), rp.model, \
+                     NULLIF(rp.provider, '') \
+                     FROM tasks t \
+                     LEFT JOIN execution_attempts ea ON ea.id = t.current_execution_id \
+                     LEFT JOIN runtime_profiles rp ON rp.id = ea.profile_id \
+                     WHERE t.id IN ({placeholders})"
+                );
+                let mut query = sqlx::query_as::<
+                    _,
+                    (String, Option<String>, Option<String>, Option<String>),
+                >(&sql);
+                for id in &materialized {
+                    query = query.bind(id);
+                }
+                let assignment_rows = query
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(db_err("task assignments"))?;
+                for (task_id, agent_kind, model, provider) in assignment_rows {
+                    assignments.insert(task_id, (agent_kind, model, provider));
+                }
+            }
+
             tasks = rows
                 .into_iter()
-                .map(|r| pres::SnapshotTask {
-                    planned_task_id: r.0,
-                    milestone_id: r.1,
-                    client_ref: r.2,
-                    title: r.3,
-                    state: r.4,
-                    dependencies: serde_json::from_str(&r.5).unwrap_or_default(),
-                    risk_level: r.6,
-                    requires_approval: r.7,
-                    expected_evidence: serde_json::from_str(&r.8).unwrap_or_default(),
-                    materialized_task_id: r.9,
-                    materialized_loop_id: r.10,
+                .map(|r| {
+                    let (agent_kind, model, provider) =
+                        r.9.as_ref()
+                            .and_then(|tid| assignments.get(tid))
+                            .cloned()
+                            .unwrap_or((None, None, None));
+                    pres::SnapshotTask {
+                        planned_task_id: r.0,
+                        milestone_id: r.1,
+                        client_ref: r.2,
+                        title: r.3,
+                        state: r.4,
+                        dependencies: serde_json::from_str(&r.5).unwrap_or_default(),
+                        risk_level: r.6,
+                        requires_approval: r.7,
+                        expected_evidence: serde_json::from_str(&r.8).unwrap_or_default(),
+                        materialized_task_id: r.9,
+                        materialized_loop_id: r.10,
+                        agent_kind,
+                        model,
+                        provider,
+                    }
                 })
                 .collect();
         }
@@ -2274,15 +2340,45 @@ impl SupervisorCommandHandler {
         .fetch_all(&self.pool)
         .await
         .map_err(db_err("loop runs"))?;
-        let running_activities = run_rows
-            .into_iter()
-            .map(|r| pres::RunningActivity {
-                run_id: r.0,
-                state: r.1,
-                iteration_number: r.2,
-                plan_revision_id: r.3,
-            })
-            .collect();
+        let running_activities = {
+            // Currently executing planned task + its real runtime assignment
+            // (I8B §67). Absent values stay None ("unknown").
+            let current: Option<(String, Option<String>, Option<String>)> =
+                match tasks_plan_id.as_ref() {
+                    Some(plan_id) => sqlx::query_as(
+                        r#"SELECT pt.title, NULLIF(rp.agent_kind, ''), rp.model
+                           FROM planned_tasks pt
+                           LEFT JOIN tasks t ON t.id = pt.materialized_task_id
+                           LEFT JOIN execution_attempts ea ON ea.id = t.current_execution_id
+                           LEFT JOIN runtime_profiles rp ON rp.id = ea.profile_id
+                           WHERE pt.plan_revision_id = ? AND pt.state = 'running'
+                           ORDER BY pt.client_ref ASC LIMIT 1"#,
+                    )
+                    .bind(plan_id)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(db_err("current task"))?,
+                    None => None,
+                };
+            run_rows
+                .into_iter()
+                .map(|r| {
+                    let (task_title, agent_kind, model) = current
+                        .clone()
+                        .map(|(t, a, m)| (Some(t), a, m))
+                        .unwrap_or((None, None, None));
+                    pres::RunningActivity {
+                        run_id: r.0,
+                        state: r.1,
+                        iteration_number: r.2,
+                        plan_revision_id: r.3,
+                        task_title,
+                        agent_kind,
+                        model,
+                    }
+                })
+                .collect()
+        };
 
         let usage = self.project_usage_summary(goal_id).await?;
 
