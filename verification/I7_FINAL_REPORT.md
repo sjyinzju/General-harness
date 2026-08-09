@@ -122,11 +122,15 @@ Evidence reconciliation confirms all mandatory acceptance criteria met. Previous
 
 ---
 
-## Evidence Bundle
+## Evidence
 
-**Absolute path**: `E:\General-harness\verification\i7-accepted-0094034a-run-20260728-160433-final\`
+Historical raw acceptance evidence was pruned from the repository after final certification.
 
-**Original run**: `E:\General-harness\verification\i7-accepted-0094034a-run-20260728-160433\`
+**Acceptance Code HEAD**: `0094034afe00abd79ceedfbccac7143041fcebdb`
+
+Compact certification and requalification evidence is retained under:
+
+`verification/delta-certification/`
 
 ---
 

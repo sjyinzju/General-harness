@@ -9,7 +9,11 @@
   "historical_full_run": {
     "head": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
     "verdict": "FULL_RELEASE_PASS",
-    "evidence": "verification/system-accepted-ba03e988-system-accept-20260808-022042"
+    "historical_raw_evidence": {
+      "status": "pruned_after_final_certification",
+      "code_head": "ba03e988ec6cf4b8b26da19996fdc38e59784034"
+    },
+    "compact_evidence_root": "verification/delta-certification"
   },
 
   "historical_soak": {

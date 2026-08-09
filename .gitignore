@@ -6,15 +6,42 @@ target/
 # Debug symbols
 *.pdb
 
-# Runtime SQLite database files (default path is now target/data/harness.db)
-harness.db
-harness.db-shm
-harness.db-wal
-harness.db-journal
-
 # Harness scratch directories (never commit)
 .scratch/
 target/scratch/
 
-# Verification auto-generated acceptance directories (committed intentionally)
-# verification/system-accepted-*/ are committed via release process
+# Local build / test logs (never commit)
+/build_*.txt
+/build_errors*.txt
+/clippy_*.txt
+/test_output*.txt
+
+# Runtime local databases
+/harness.db
+/harness.db-shm
+/harness.db-wal
+/harness.db-journal
+
+# Local Claude state (never commit)
+/.claude/settings.local.json
+/.claude/cache/
+/.claude/logs/
+/.claude/tmp/
+
+# Raw verification runs (never commit — only compact evidence retained)
+/verification/system-accepted-*/
+/verification/system-full-release-*/
+/verification/i7-accepted-*/
+/verification/i7-complete-*/
+/verification/i7-core-*/
+/verification/i7-definitive-*/
+/verification/i7-final-*/
+
+# Generic runtime residues (never commit)
+*.log
+*.tmp
+*.bak
+
+# Harness runtime artifacts (never commit)
+/grandchild.txt
+/ready.json

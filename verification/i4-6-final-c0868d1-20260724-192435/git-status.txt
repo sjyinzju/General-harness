@@ -1,2 +1,0 @@
-﻿On branch feat/i4-6-candidate-review-gate
-nothing to commit, working tree clean

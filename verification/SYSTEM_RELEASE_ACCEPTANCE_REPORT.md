@@ -16,9 +16,9 @@
 ## Historical Full Run (v10)
 
 **HEAD:** `ba03e988ec6cf4b8b26da19996fdc38e59784034`
-**Run ID:** `system-full-release-ba03e988-full-release-20260808-022042`
+**Run ID:** `system-full-release-ba03e988-full-release-20260808-022042` (historical)
 **Verdict:** `FULL_RELEASE_PASS`
-**Evidence:** `verification/system-accepted-ba03e988-system-accept-20260808-022042`
+**Evidence:** Historical raw acceptance evidence was pruned from the repository after final certification. Compact certification and requalification evidence is retained under `verification/delta-certification/`.
 
 ### Historical Soak
 
@@ -257,9 +257,10 @@ verification/delta-certification/
 ## Evidence Bundles
 
 ### Historical Full Run
-```
-verification/system-accepted-ba03e988-system-accept-20260808-022042/
-```
+
+Raw evidence pruned after final certification. Historical code HEAD: `ba03e988ec6cf4b8b26da19996fdc38e59784034`.
+
+Compact evidence retained under `verification/delta-certification/`.
 
 ### Delta Certification
 ```

@@ -6,7 +6,7 @@
 - **Code HEAD at plan creation**: 729b994 (post quality-gate fixes)
 - **I7 Acceptance Code HEAD**: 0094034afe00abd79ceedfbccac7143041fcebdb
 - **I7 Acceptance Report HEAD**: 59f8e5ac3059f7fa311830426bc19fec20fffe5b
-- **I7 Evidence Bundle**: `verification/i7-accepted-0094034a-run-20260728-160433-final/`
+- **I7 Evidence**: Historical raw acceptance evidence pruned after final certification. Compact evidence retained under `verification/delta-certification/`. I7 Acceptance Code HEAD: `0094034afe00abd79ceedfbccac7143041fcebdb`.
 
 ## Scope
 
