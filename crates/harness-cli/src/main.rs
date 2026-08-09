@@ -29,6 +29,7 @@
 mod bootstrap;
 mod commands;
 mod ipc_client;
+mod tui;
 
 use harness_runtime::db::Database;
 use harness_runtime::liveness::RunContext;
@@ -43,6 +44,20 @@ use ipc_client::{ClientError, SupervisorClient, DEFAULT_ENDPOINT};
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let raw_args: Vec<String> = std::env::args().collect();
     if raw_args.len() < 2 {
+        // No-arg entry: interactive TUI on a real terminal, classic usage
+        // text everywhere else (scripts/CI stay byte-for-byte unchanged).
+        // HARNESS_NO_TUI=1 forces usage output even on a TTY.
+        if tui::terminal::stdout_is_tty() && std::env::var("HARNESS_NO_TUI").is_err() {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let options = tui::TuiOptions {
+                endpoint: std::env::var("HARNESS_ENDPOINT")
+                    .unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string()),
+                project_label: tui::project_label_from_path(&cwd),
+                repo_root: Some(cwd.to_string_lossy().to_string()),
+                db_path: None,
+            };
+            return tui::run_tui(options).await.map_err(Into::into);
+        }
         print_usage();
         return Ok(());
     }
