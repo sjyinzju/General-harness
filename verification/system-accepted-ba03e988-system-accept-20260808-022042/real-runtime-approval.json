@@ -1,0 +1,15 @@
+{
+  "approval_id": "apr-f4c5feaa-9684-453a-a8b1-3c526454351d",
+  "approved_at": "2026-08-08T02:20:42.472609800+00:00",
+  "code_head": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
+  "max_duration_secs": 7200,
+  "max_llm_invocations": 32,
+  "roles": [
+    "planner",
+    "executor",
+    "reviewer",
+    "evaluator",
+    "certification"
+  ],
+  "run_id": "system-accept-20260808-022042"
+}

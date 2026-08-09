@@ -36,7 +36,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Find the harness binary
-    let harness_bin = repo_root.join("target").join("debug").join("harness.exe");
+    let harness_bin = repo_root
+        .join("target")
+        .join("debug")
+        .join("harness-cli.exe");
     if !harness_bin.exists() {
         eprintln!("harness binary not found at: {}", harness_bin.display());
         std::process::exit(1);

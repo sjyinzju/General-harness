@@ -15,7 +15,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let test_repo = tmp.join("repo");
     let wt_root = std::env::temp_dir().join("f1-diag-wt");
     let state_dir = "f1-diag-shared";
-    let harness_bin = PathBuf::from("target/debug/harness.exe");
+    let harness_bin = PathBuf::from("target/debug/harness-cli.exe");
 
     // Cleanup
     let _ = std::fs::remove_file(&db_path);

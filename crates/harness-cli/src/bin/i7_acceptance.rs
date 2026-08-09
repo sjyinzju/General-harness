@@ -1748,11 +1748,17 @@ async fn run_certification(
 // ── Helpers ──────────────────────────────────────────────────────────
 
 fn find_harness_binary(repo_root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let debug_bin = repo_root.join("target").join("debug").join("harness.exe");
+    let debug_bin = repo_root
+        .join("target")
+        .join("debug")
+        .join("harness-cli.exe");
     if debug_bin.exists() {
         return Ok(debug_bin);
     }
-    let release_bin = repo_root.join("target").join("release").join("harness.exe");
+    let release_bin = repo_root
+        .join("target")
+        .join("release")
+        .join("harness-cli.exe");
     if release_bin.exists() {
         return Ok(release_bin);
     }

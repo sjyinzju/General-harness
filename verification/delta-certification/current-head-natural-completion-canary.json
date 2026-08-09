@@ -1,19 +1,19 @@
 {
   "acceptance_harness_head": "852833f508d03d852cfd433fa9d73893bd4bcdad",
-  "canary_run_id": "canary-20260808-122643",
-  "current_head": "84a69807e1ac7584a4eda470e58025e7d9ec8cb8",
+  "canary_run_id": "canary-20260808-153131",
+  "current_head": "348854a69c0ce9d8846036203ee98fd82ac7aa8f",
   "direct_business_mutations": 0,
   "direct_task_retry_sql_used": false,
   "evidence": {
     "completion": {
       "force_complete_found": false,
-      "source": "none",
-      "transition_events_count": 3
+      "source": "production_completion_policy",
+      "transition_events_count": 4
     },
     "goal": {
-      "goal_id": "g-canary-a0d9c894-87bc-4a61-aadf-047ba618c3df",
-      "succeeded": false,
-      "terminal_state": "active"
+      "goal_id": "g-canary-793597e6-f0e5-42e9-966e-97b10d9869e8",
+      "succeeded": true,
+      "terminal_state": "succeeded"
     },
     "integrity": {
       "direct_goal_mutation": 0,
@@ -23,22 +23,10 @@
     },
     "invocations": {
       "evaluator": {
-        "count": 14,
+        "count": 2,
         "invocation_ids": [
-          "inv-evaluator-d2a9dfc0-a88b-494b-a637-a0c269366fde",
-          "inv-evaluator-96ddde5b-2c51-41ab-b19b-eac166faf48d",
-          "inv-evaluator-aeb3844b-372b-466b-9359-38387d560063",
-          "inv-evaluator-439efdb4-30ad-465f-9e94-469b91dd23c9",
-          "inv-evaluator-acfd23d4-b05b-4a99-b994-eab01ebe2234",
-          "inv-evaluator-b2b7114b-2cca-464c-bebc-e2e003d3b0e1",
-          "inv-evaluator-fb1e99e8-1396-4396-85f6-69a213a7e347",
-          "inv-evaluator-50450b41-536a-4c57-bc4f-b96411684de8",
-          "inv-evaluator-ff6c4253-18c4-4e2b-b532-c245395bbb07",
-          "inv-evaluator-995cefce-3f7a-4f07-b460-fdda78363677",
-          "inv-evaluator-96f56c56-e680-4f68-a33c-58a8fd62b021",
-          "inv-evaluator-01bc87e1-da59-4fb4-85e7-d0933ba6bc34",
-          "inv-evaluator-fe802f8b-1a0a-4e39-ad43-b42adafdae56",
-          "inv-evaluator-e3c24ca5-fe8a-4598-8d09-1f0df2e66f7b"
+          "inv-evaluator-07781cca-3e65-45a0-b734-9f1ebd508e8f",
+          "inv-evaluator-92189893-d152-4197-b9e7-e9f2169b2555"
         ]
       },
       "executor": {
@@ -47,14 +35,14 @@
       "planner": {
         "count": 1,
         "invocation_ids": [
-          "inv-planner-abea99e6-e2e8-4e3e-81a2-526776182ffd"
+          "inv-planner-3dce32ba-adf5-405f-aa42-2a3bba11a0f1"
         ]
       },
       "reviewer": {
         "count": 0,
         "invocation_ids": []
       },
-      "total": 16
+      "total": 4
     },
     "pipeline": {
       "assessments": 0,
@@ -69,10 +57,10 @@
     }
   },
   "force_complete_used": false,
-  "goal_id": "g-canary-a0d9c894-87bc-4a61-aadf-047ba618c3df",
-  "goal_terminal_state": "incomplete",
-  "repository_id": "canary-repo-610b3f12-d495-437c-b87b-873d2ed629ca",
-  "started_at": "2026-08-08T12:36:45.274096400+00:00",
+  "goal_id": "g-canary-793597e6-f0e5-42e9-966e-97b10d9869e8",
+  "goal_terminal_state": "succeeded",
+  "repository_id": "canary-repo-9e82fbe4-5619-4ae3-bab2-de048c5f29b1",
+  "started_at": "2026-08-08T15:35:14.257387+00:00",
   "sut_code_baseline": "ba03e988ec6cf4b8b26da19996fdc38e59784034",
-  "terminal_result": "FAIL"
+  "terminal_result": "PASS"
 }

@@ -646,11 +646,14 @@ fn run_phase1_quality_gates(repo_root: &Path, results: &mut SystemAcceptanceResu
         .map(|s| s.success())
         .unwrap_or(false);
     // Verify the main harness binary was produced
-    let harness_exists = isolated_target.join("debug").join("harness.exe").exists()
+    let harness_exists = isolated_target
+        .join("debug")
+        .join("harness-cli.exe")
+        .exists()
         || repo_root
             .join("target")
             .join("debug")
-            .join("harness.exe")
+            .join("harness-cli.exe")
             .exists();
     results.p1_build_passed = build_ok && harness_exists;
     results.log_phase(
@@ -3077,11 +3080,17 @@ fn get_current_head(repo_root: &Path) -> Result<String, Box<dyn std::error::Erro
 }
 
 fn find_harness_binary(repo_root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let debug_bin = repo_root.join("target").join("debug").join("harness.exe");
+    let debug_bin = repo_root
+        .join("target")
+        .join("debug")
+        .join("harness-cli.exe");
     if debug_bin.exists() {
         return Ok(debug_bin);
     }
-    let release_bin = repo_root.join("target").join("release").join("harness.exe");
+    let release_bin = repo_root
+        .join("target")
+        .join("release")
+        .join("harness-cli.exe");
     if release_bin.exists() {
         return Ok(release_bin);
     }
