@@ -27,6 +27,46 @@ use tracing;
 use self::framing::{read_frame, write_frame, FrameTooLarge};
 use self::transport::{IpcConnection, IpcListener};
 
+/// Per-request identity threaded from the IPC envelope to handlers.
+///
+/// This is what lets mutating interaction commands participate in the
+/// durable request ledger without handlers re-parsing the envelope.
+#[derive(Debug, Clone)]
+pub struct IpcRequestContext {
+    /// Unique request identifier from the envelope.
+    pub request_id: String,
+    /// Idempotency key from the envelope (may be empty for reads).
+    pub idempotency_key: String,
+    /// Client process ID.
+    pub client_pid: u32,
+}
+
+/// Handler outcome: a payload plus the response status to report.
+///
+/// Lets ledgered handlers signal `Duplicate`/`Accepted` replays without
+/// abusing the error channel.
+#[derive(Debug, Clone)]
+pub struct IpcHandlerOutcome {
+    pub status: IpcResponseStatus,
+    pub payload: serde_json::Value,
+}
+
+impl IpcHandlerOutcome {
+    pub fn success(payload: serde_json::Value) -> Self {
+        Self {
+            status: IpcResponseStatus::Success,
+            payload,
+        }
+    }
+
+    pub fn duplicate(payload: serde_json::Value) -> Self {
+        Self {
+            status: IpcResponseStatus::Duplicate,
+            payload,
+        }
+    }
+}
+
 /// Trait for command handlers that process IPC requests.
 #[async_trait::async_trait]
 pub trait IpcCommandHandler: Send + Sync {
@@ -36,6 +76,23 @@ pub trait IpcCommandHandler: Send + Sync {
         command: &IpcCommand,
         payload: &serde_json::Value,
     ) -> Result<serde_json::Value, CoreError>;
+
+    /// Handle a command with the request identity from the envelope.
+    ///
+    /// The default implementation delegates to [`handle_command`] so
+    /// legacy handlers and tests keep compiling. Handlers that ledger
+    /// mutations (I8A interaction commands) override this.
+    ///
+    /// [`handle_command`]: IpcCommandHandler::handle_command
+    async fn handle_request(
+        &self,
+        _ctx: &IpcRequestContext,
+        command: &IpcCommand,
+        payload: &serde_json::Value,
+    ) -> Result<IpcHandlerOutcome, CoreError> {
+        let result = self.handle_command(command, payload).await?;
+        Ok(IpcHandlerOutcome::success(result))
+    }
 }
 
 /// IPC server that listens for connections and routes commands to handlers.
@@ -273,14 +330,22 @@ async fn process_connection_loop(
             }
         };
 
-        // Handle command
-        match handler.handle_command(&command, &request.payload).await {
-            Ok(result) => {
+        // Handle command with envelope identity (ledger participation).
+        let ctx = IpcRequestContext {
+            request_id: request.request_id.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            client_pid: request.client_pid,
+        };
+        match handler
+            .handle_request(&ctx, &command, &request.payload)
+            .await
+        {
+            Ok(outcome) => {
                 let response = IpcResponseEnvelope {
                     protocol_version: "1.0".to_string(),
                     request_id: request.request_id,
-                    status: IpcResponseStatus::Success,
-                    payload: Some(result),
+                    status: outcome.status,
+                    payload: Some(outcome.payload),
                     error: None,
                     completed_at: Utc::now(),
                 };
@@ -291,10 +356,17 @@ async fn process_connection_loop(
                 }
             }
             Err(e) => {
+                // Idempotency conflicts surface as a dedicated status so
+                // clients can distinguish "retry with same payload" bugs.
+                let status = if e.code == harness_core::ErrorCode::Conflict {
+                    IpcResponseStatus::Conflict
+                } else {
+                    IpcResponseStatus::Error
+                };
                 let response = IpcResponseEnvelope {
                     protocol_version: "1.0".to_string(),
                     request_id: request.request_id,
-                    status: IpcResponseStatus::Error,
+                    status,
                     payload: None,
                     error: Some(StructuredIpcError {
                         code: format!("{:?}", e.code).to_lowercase(),

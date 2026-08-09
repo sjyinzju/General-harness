@@ -137,6 +137,12 @@ pub enum IpcCommand {
     GoalReject,
     GoalAnswer,
     GoalEvents,
+    /// Read-only projection of the full goal state (I8A).
+    GoalSnapshot,
+    /// Reject a plan revision with feedback → replan (I8A).
+    GoalRequestChanges,
+    /// Free-text user intervention (I8A).
+    GoalIntervene,
 
     // Health / Diagnostics
     Health,
@@ -193,6 +199,9 @@ impl IpcCommand {
             "goal.reject" => Some(IpcCommand::GoalReject),
             "goal.answer" => Some(IpcCommand::GoalAnswer),
             "goal.events" => Some(IpcCommand::GoalEvents),
+            "goal.snapshot" => Some(IpcCommand::GoalSnapshot),
+            "goal.request_changes" => Some(IpcCommand::GoalRequestChanges),
+            "goal.intervene" => Some(IpcCommand::GoalIntervene),
 
             _ => None,
         }
@@ -218,6 +227,7 @@ impl IpcCommand {
                 | IpcCommand::GoalStatus
                 | IpcCommand::GoalApprovals
                 | IpcCommand::GoalEvents
+                | IpcCommand::GoalSnapshot
         )
     }
 
@@ -263,6 +273,9 @@ impl IpcCommand {
             IpcCommand::GoalReject => "goal.reject",
             IpcCommand::GoalAnswer => "goal.answer",
             IpcCommand::GoalEvents => "goal.events",
+            IpcCommand::GoalSnapshot => "goal.snapshot",
+            IpcCommand::GoalRequestChanges => "goal.request_changes",
+            IpcCommand::GoalIntervene => "goal.intervene",
         }
     }
 }

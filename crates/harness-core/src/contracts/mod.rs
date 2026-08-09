@@ -10,6 +10,7 @@ pub mod goal_contract;
 pub mod integration;
 pub mod ipc;
 pub mod plan;
+pub mod presentation;
 pub mod project;
 pub mod repository;
 pub mod review;
