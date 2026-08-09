@@ -6,6 +6,7 @@
 
 pub mod evaluator;
 pub mod failpoint;
+pub mod interaction;
 pub mod planner;
 pub mod repo;
 pub mod service;
@@ -268,6 +269,19 @@ pub struct ApprovalRequest {
     pub created_at: DateTime<Utc>,
     pub resolved_at: Option<DateTime<Utc>>,
     pub resolved_by: Option<String>,
+    /// User's answer or decision detail (I8A, migration 030).
+    #[serde(default)]
+    pub response: Option<serde_json::Value>,
+    /// Originating IPC request id, when created via IPC.
+    #[serde(default)]
+    pub request_id: Option<String>,
+    /// Who created the request: "system" | "user" | "ipc".
+    #[serde(default = "default_approval_source")]
+    pub source: String,
+}
+
+fn default_approval_source() -> String {
+    "system".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -326,6 +340,112 @@ impl ApprovalState {
             Self::Approved | Self::Rejected | Self::Expired | Self::Cancelled
         )
     }
+}
+
+// ── User Intervention (I8A) ────────────────────────────────────────────
+
+/// A user→harness message that does not block progress by itself.
+/// Stored durably and consumed by future planning iterations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserIntervention {
+    pub intervention_id: String,
+    pub goal_id: GoalId,
+    pub request_id: Option<String>,
+    pub source: String,
+    pub message: String,
+    pub classification: InterventionClassification,
+    pub state: InterventionState,
+    pub created_at: DateTime<Utc>,
+    pub processed_at: Option<DateTime<Utc>>,
+    pub applied_plan_revision_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterventionClassification {
+    Informational,
+    ConstraintAddition,
+    PlanChangeRequired,
+    PauseRequested,
+    CancelRequested,
+}
+
+impl InterventionClassification {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Informational => "informational",
+            Self::ConstraintAddition => "constraint_addition",
+            Self::PlanChangeRequired => "plan_change_required",
+            Self::PauseRequested => "pause_requested",
+            Self::CancelRequested => "cancel_requested",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "informational" => Some(Self::Informational),
+            "constraint_addition" => Some(Self::ConstraintAddition),
+            "plan_change_required" => Some(Self::PlanChangeRequired),
+            "pause_requested" => Some(Self::PauseRequested),
+            "cancel_requested" => Some(Self::CancelRequested),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InterventionState {
+    Received,
+    Applied,
+    Superseded,
+}
+
+impl InterventionState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Received => "received",
+            Self::Applied => "applied",
+            Self::Superseded => "superseded",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "received" => Some(Self::Received),
+            "applied" => Some(Self::Applied),
+            "superseded" => Some(Self::Superseded),
+            _ => None,
+        }
+    }
+}
+
+// ── Planner Outcome (I8A) ──────────────────────────────────────────────
+
+/// One clarifying question the Planner asks the user before it can plan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClarificationQuestion {
+    #[serde(default)]
+    pub question_id: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub choices: Vec<String>,
+    #[serde(default = "default_true")]
+    pub required: bool,
+    #[serde(default)]
+    pub reason: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Structured Planner result: either a full plan proposal or a request for
+/// missing information (interactive mode only).
+#[derive(Debug, Clone)]
+pub enum PlannerOutcome {
+    Plan(Box<PlanProposal>),
+    ClarificationNeeded(Vec<ClarificationQuestion>),
 }
 
 // ── Replan Trigger ─────────────────────────────────────────────────────

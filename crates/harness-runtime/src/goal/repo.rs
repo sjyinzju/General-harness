@@ -16,7 +16,7 @@ use sqlx::SqlitePool;
 
 use super::{
     ApprovalRequest, ApprovalState, ApprovalType, GoalLoopRunState, GoalObservation,
-    ProgressAssessmentProposal,
+    InterventionClassification, InterventionState, ProgressAssessmentProposal, UserIntervention,
 };
 
 // ── Goal Repo ─────────────────────────────────────────────────────────
@@ -364,6 +364,25 @@ impl GoalRepo {
         Ok(row.map(|r| r.into_plan_revision()))
     }
 
+    /// Fetch a single plan revision by id (any state).
+    pub async fn get_plan_revision(
+        &self,
+        plan_revision_id: &str,
+    ) -> Result<Option<PlanRevision>, CoreError> {
+        let row: Option<PlanRow> = sqlx::query_as(
+            r#"SELECT plan_revision_id, goal_id, goal_revision, revision_number,
+               base_repository_head, planner_profile_id, planner_invocation_id,
+               proposal_digest, validation_digest, state, created_at, activated_at, superseded_at
+               FROM plan_revisions WHERE plan_revision_id = ?"#,
+        )
+        .bind(plan_revision_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+
+        Ok(row.map(|r| r.into_plan_revision()))
+    }
+
     // ── Milestones ──────────────────────────────────────────────────
 
     pub async fn insert_milestone(&self, m: &Milestone) -> Result<(), CoreError> {
@@ -648,8 +667,9 @@ impl GoalRepo {
     pub async fn create_approval(&self, approval: &ApprovalRequest) -> Result<(), CoreError> {
         sqlx::query(
             r#"INSERT INTO approval_requests (approval_id, goal_id, plan_revision_id,
-               approval_type, requested_action_json, payload_digest, reason, state, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
+               approval_type, requested_action_json, payload_digest, reason, state, created_at,
+               request_id, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"#,
         )
         .bind(&approval.approval_id)
         .bind(&approval.goal_id)
@@ -660,6 +680,8 @@ impl GoalRepo {
         .bind(&approval.reason)
         .bind("pending")
         .bind(now_sql())
+        .bind(&approval.request_id)
+        .bind(&approval.source)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -686,13 +708,59 @@ impl GoalRepo {
         Ok(())
     }
 
+    /// Resolve a pending approval, storing the user's response payload.
+    /// Returns `true` if the row was transitioned (was still pending),
+    /// `false` if the approval was already resolved — callers use this for
+    /// idempotent replay / conflict reporting.
+    pub async fn resolve_approval_with_response(
+        &self,
+        approval_id: &str,
+        new_state: &str,
+        resolved_by: &str,
+        response_json: Option<&str>,
+    ) -> Result<bool, CoreError> {
+        let result = sqlx::query(
+            r#"UPDATE approval_requests
+               SET state = ?, resolved_at = ?, resolved_by = ?, response_json = ?
+               WHERE approval_id = ? AND state = 'pending'"#,
+        )
+        .bind(new_state)
+        .bind(now_sql())
+        .bind(resolved_by)
+        .bind(response_json)
+        .bind(approval_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Fetch a single approval request by id.
+    pub async fn get_approval(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<ApprovalRequest>, CoreError> {
+        let row: Option<ApprovalRow> = sqlx::query_as(
+            r#"SELECT approval_id, goal_id, plan_revision_id, approval_type,
+               requested_action_json, payload_digest, reason, state, created_at,
+               resolved_at, resolved_by, response_json, request_id, source
+               FROM approval_requests WHERE approval_id = ?"#,
+        )
+        .bind(approval_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| r.into_approval()))
+    }
+
     pub async fn list_pending_approvals(
         &self,
         goal_id: &str,
     ) -> Result<Vec<ApprovalRequest>, CoreError> {
         let rows: Vec<ApprovalRow> = sqlx::query_as(
             r#"SELECT approval_id, goal_id, plan_revision_id, approval_type,
-               requested_action_json, payload_digest, reason, state, created_at, resolved_at, resolved_by
+               requested_action_json, payload_digest, reason, state, created_at,
+               resolved_at, resolved_by, response_json, request_id, source
                FROM approval_requests WHERE goal_id = ? AND state = 'pending'
                ORDER BY created_at ASC"#,
         )
@@ -702,6 +770,128 @@ impl GoalRepo {
         .map_err(db_err)?;
 
         Ok(rows.into_iter().map(|r| r.into_approval()).collect())
+    }
+
+    /// Cancel all pending approvals of a given type for a goal (e.g. when a
+    /// newer plan revision supersedes an outstanding plan-approval request).
+    /// Returns the number of approvals cancelled.
+    pub async fn cancel_pending_approvals(
+        &self,
+        goal_id: &str,
+        approval_type: &str,
+        resolved_by: &str,
+    ) -> Result<u64, CoreError> {
+        let result = sqlx::query(
+            r#"UPDATE approval_requests SET state = 'cancelled', resolved_at = ?, resolved_by = ?
+               WHERE goal_id = ? AND approval_type = ? AND state = 'pending'"#,
+        )
+        .bind(now_sql())
+        .bind(resolved_by)
+        .bind(goal_id)
+        .bind(approval_type)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
+
+    // ── User Interventions (I8A) ────────────────────────────────────
+
+    pub async fn insert_intervention(
+        &self,
+        intervention: &UserIntervention,
+    ) -> Result<(), CoreError> {
+        sqlx::query(
+            r#"INSERT INTO user_interventions (intervention_id, goal_id, request_id,
+               source, message, classification, state, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)"#,
+        )
+        .bind(&intervention.intervention_id)
+        .bind(&intervention.goal_id)
+        .bind(&intervention.request_id)
+        .bind(&intervention.source)
+        .bind(&intervention.message)
+        .bind(intervention.classification.as_str())
+        .bind(intervention.state.as_str())
+        .bind(now_sql())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(())
+    }
+
+    /// List interventions for a goal, optionally filtered by state,
+    /// ordered by insertion order.
+    pub async fn list_interventions(
+        &self,
+        goal_id: &str,
+        state: Option<&str>,
+    ) -> Result<Vec<UserIntervention>, CoreError> {
+        let rows: Vec<InterventionRow> = match state {
+            Some(s) => {
+                sqlx::query_as(
+                    r#"SELECT intervention_id, goal_id, request_id, source, message,
+                       classification, state, created_at, processed_at, applied_plan_revision_id
+                       FROM user_interventions WHERE goal_id = ? AND state = ?
+                       ORDER BY rowid ASC"#,
+                )
+                .bind(goal_id)
+                .bind(s)
+                .fetch_all(&self.pool)
+                .await
+            }
+            None => {
+                sqlx::query_as(
+                    r#"SELECT intervention_id, goal_id, request_id, source, message,
+                       classification, state, created_at, processed_at, applied_plan_revision_id
+                       FROM user_interventions WHERE goal_id = ?
+                       ORDER BY rowid ASC"#,
+                )
+                .bind(goal_id)
+                .fetch_all(&self.pool)
+                .await
+            }
+        }
+        .map_err(db_err)?;
+        Ok(rows.into_iter().map(|r| r.into_intervention()).collect())
+    }
+
+    /// Mark all `received` interventions for a goal as applied to a plan
+    /// revision. Returns the number of interventions marked.
+    pub async fn mark_interventions_applied(
+        &self,
+        goal_id: &str,
+        plan_revision_id: &str,
+    ) -> Result<u64, CoreError> {
+        let result = sqlx::query(
+            r#"UPDATE user_interventions
+               SET state = 'applied', processed_at = ?, applied_plan_revision_id = ?
+               WHERE goal_id = ? AND state = 'received'"#,
+        )
+        .bind(now_sql())
+        .bind(plan_revision_id)
+        .bind(goal_id)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(result.rows_affected())
+    }
+
+    /// Latest plan revision id for a goal (highest revision_number), used as
+    /// the stale-approval guard reference.
+    pub async fn get_latest_plan_revision_id(
+        &self,
+        goal_id: &str,
+    ) -> Result<Option<String>, CoreError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            r#"SELECT plan_revision_id FROM plan_revisions
+               WHERE goal_id = ? ORDER BY revision_number DESC LIMIT 1"#,
+        )
+        .bind(goal_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(row.map(|r| r.0))
     }
 
     // ── Invocations ─────────────────────────────────────────────────
@@ -805,22 +995,20 @@ impl GoalRepo {
         event_type: &str,
         payload_json: &str,
     ) -> Result<(), CoreError> {
-        let seq: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(MAX(sequence_num), 0) + 1 FROM goal_events WHERE goal_id = ?",
-        )
-        .bind(goal_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(db_err)?;
-
+        // Atomic sequence allocation: a single INSERT…SELECT avoids the
+        // read-then-insert race when IPC handlers and the goal loop append
+        // concurrently. UNIQUE (goal_id, sequence_num) (migration 030) makes
+        // any residual collision a hard error instead of a silent duplicate,
+        // and busy_timeout retries cover contention between writers.
         sqlx::query(
             r#"INSERT INTO goal_events (goal_id, event_type, payload_json, sequence_num)
-               VALUES (?, ?, ?, ?)"#,
+               SELECT ?, ?, ?, COALESCE(MAX(sequence_num), 0) + 1
+               FROM goal_events WHERE goal_id = ?"#,
         )
         .bind(goal_id)
         .bind(event_type)
         .bind(payload_json)
-        .bind(seq)
+        .bind(goal_id)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -1101,6 +1289,9 @@ struct ApprovalRow {
     created_at: String,
     resolved_at: Option<String>,
     resolved_by: Option<String>,
+    response_json: Option<String>,
+    request_id: Option<String>,
+    source: String,
 }
 
 impl ApprovalRow {
@@ -1118,6 +1309,43 @@ impl ApprovalRow {
             created_at: parse_dt(&self.created_at),
             resolved_at: self.resolved_at.map(|s| parse_dt(&s)),
             resolved_by: self.resolved_by,
+            response: self
+                .response_json
+                .and_then(|s| serde_json::from_str(&s).ok()),
+            request_id: self.request_id,
+            source: self.source,
+        }
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct InterventionRow {
+    intervention_id: String,
+    goal_id: String,
+    request_id: Option<String>,
+    source: String,
+    message: String,
+    classification: String,
+    state: String,
+    created_at: String,
+    processed_at: Option<String>,
+    applied_plan_revision_id: Option<String>,
+}
+
+impl InterventionRow {
+    fn into_intervention(self) -> UserIntervention {
+        UserIntervention {
+            intervention_id: self.intervention_id,
+            goal_id: self.goal_id,
+            request_id: self.request_id,
+            source: self.source,
+            message: self.message,
+            classification: InterventionClassification::parse(&self.classification)
+                .unwrap_or(InterventionClassification::ConstraintAddition),
+            state: InterventionState::parse(&self.state).unwrap_or(InterventionState::Received),
+            created_at: parse_dt(&self.created_at),
+            processed_at: self.processed_at.map(|s| parse_dt(&s)),
+            applied_plan_revision_id: self.applied_plan_revision_id,
         }
     }
 }

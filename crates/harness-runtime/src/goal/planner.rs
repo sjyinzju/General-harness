@@ -19,7 +19,39 @@ use sqlx::SqlitePool;
 use crate::prompt::{PromptRegistry, RenderedPrompt};
 
 use super::service::GoalPlanningContext;
-use super::PlanProposal;
+use super::{ClarificationQuestion, PlanProposal, PlannerOutcome};
+
+/// Detect the additive clarification output shape:
+/// `{"clarification_needed": true, "questions": [{prompt, ...}]}`.
+/// Returns `None` when the output is a regular PlanProposal.
+fn parse_clarification_output(
+    output_json: &serde_json::Value,
+) -> Option<Vec<ClarificationQuestion>> {
+    if !output_json
+        .get("clarification_needed")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let questions = output_json
+        .get("questions")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .enumerate()
+                .filter_map(|(i, q)| {
+                    let mut q: ClarificationQuestion = serde_json::from_value(q.clone()).ok()?;
+                    if q.question_id.is_empty() {
+                        q.question_id = format!("q-{}", i + 1);
+                    }
+                    (!q.prompt.is_empty()).then_some(q)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(questions)
+}
 
 /// Production Planner that calls a real LLM via the Agent Adapter.
 pub struct ProductionGoalPlanner {
@@ -53,10 +85,29 @@ impl ProductionGoalPlanner {
     }
 
     /// Generate a PlanProposal by invoking the LLM.
+    ///
+    /// Non-interactive entry point (I1–I7 behavior): a clarification output
+    /// is an error because there is no user to answer it.
     pub async fn propose_plan(
         &self,
         context: &GoalPlanningContext,
     ) -> Result<PlanProposal, CoreError> {
+        match self.propose(context).await? {
+            PlannerOutcome::Plan(proposal) => Ok(*proposal),
+            PlannerOutcome::ClarificationNeeded(_) => Err(CoreError::new(
+                ErrorCode::InvalidState,
+                "planner requested clarification but interactive mode is not enabled",
+                ErrorSource::Harness,
+            )),
+        }
+    }
+
+    /// Generate a planner outcome by invoking the LLM: either a full
+    /// PlanProposal or a ClarificationNeeded request (interactive mode).
+    pub async fn propose(
+        &self,
+        context: &GoalPlanningContext,
+    ) -> Result<PlannerOutcome, CoreError> {
         // 1. Get prompt template
         let prompt_id = if context.current_plan_revision.is_some() {
             "goal_replanner"
@@ -85,9 +136,22 @@ impl ProductionGoalPlanner {
         let goal_id = context.goal.goal_id.clone();
         let output_json = self.call_adapter(&envelope, &rendered, &goal_id).await?;
 
-        // 6. Parse the structured output
+        // 6. Clarification detection (additive schema: the planner may emit
+        //    {"clarification_needed": true, "questions": [...]} instead of a plan)
         let raw_str = serde_json::to_string_pretty(&output_json).unwrap_or_default();
         tracing::info!(planner_output = %raw_str, "Planner raw output");
+        if let Some(questions) = parse_clarification_output(&output_json) {
+            if questions.is_empty() {
+                return Err(CoreError::new(
+                    ErrorCode::InvalidState,
+                    "planner signalled clarification_needed without questions",
+                    ErrorSource::Harness,
+                ));
+            }
+            return Ok(PlannerOutcome::ClarificationNeeded(questions));
+        }
+
+        // 7. Parse the structured output
         let proposal: PlanProposal = serde_json::from_value(output_json.clone()).map_err(|e| {
             CoreError::new(
                 ErrorCode::SerializationError,
@@ -96,7 +160,7 @@ impl ProductionGoalPlanner {
             )
         })?;
 
-        // 7. Basic output validation
+        // 8. Basic output validation
         if proposal.schema_version != "1.0" {
             return Err(CoreError::new(
                 ErrorCode::InvalidState,
@@ -119,7 +183,7 @@ impl ProductionGoalPlanner {
             ));
         }
 
-        Ok(proposal)
+        Ok(PlannerOutcome::Plan(Box::new(proposal)))
     }
 
     /// Call the Agent Adapter and extract the final JSON result.

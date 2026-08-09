@@ -162,6 +162,8 @@ mod tests {
             "task_loop_operations",
             "task_usage_ledger",
             "tasks",
+            // 030 — interaction domain
+            "user_interventions",
             "verification_approvals",
             "verification_diagnostics",
             "verification_evidence",
@@ -206,7 +208,7 @@ mod tests {
         expected.sort();
         assert_eq!(
             names, expected,
-            "81 business tables expected (001\u{2013}029)"
+            "82 business tables expected (001\u{2013}030)"
         );
     }
 

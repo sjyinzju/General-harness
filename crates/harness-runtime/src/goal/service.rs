@@ -29,8 +29,9 @@ use super::repo::GoalRepo;
 use super::validation::{check_completion_gate, validate_plan_proposal};
 use super::{
     ApprovalRequest, ApprovalState, ApprovalType, CriterionStatus, GoalLoopRunState,
-    GoalObservation, GoalRuntimeConfig, ObservationOutcome, PlanProposal, ProfileSeparationError,
-    ProgressAssessmentProposal, ReplanDecision, ReplanTrigger, RoleIsolationPolicy,
+    GoalObservation, GoalRuntimeConfig, ObservationOutcome, PlanProposal, PlannerOutcome,
+    ProfileSeparationError, ProgressAssessmentProposal, ReplanDecision, ReplanTrigger,
+    RoleIsolationPolicy,
 };
 
 use crate::commit::service::ControlledCommitService;
@@ -72,8 +73,8 @@ pub struct GoalAssessmentContext {
 
 /// The GoalLoopService orchestrates the outer Goal → Plan → Task loop.
 pub struct GoalLoopService {
-    pool: SqlitePool,
-    repo: GoalRepo,
+    pub(crate) pool: SqlitePool,
+    pub(crate) repo: GoalRepo,
     /// Runtime config with profile separation validation.
     pub runtime_config: Option<GoalRuntimeConfig>,
     /// Planner profile for invocation tracking.
@@ -372,6 +373,37 @@ impl GoalLoopService {
         base_head: &str,
         goal_revision: i64,
     ) -> Result<PlanRevision, CoreError> {
+        let plan = self
+            .persist_plan_revision(
+                goal_id,
+                proposal,
+                planner_profile_id,
+                planner_invocation_id,
+                base_head,
+                goal_revision,
+            )
+            .await?;
+
+        self.activate_validated_plan(goal_id, &plan.plan_revision_id)
+            .await?;
+
+        Ok(plan)
+    }
+
+    /// Persist a plan revision in Validated state (steps 1–5 of activation):
+    /// validate the proposal, create the PlanRevision, milestones, and
+    /// planned tasks — WITHOUT activating. Interactive mode stops here and
+    /// asks the user for approval; activation happens in
+    /// `activate_validated_plan` on Approve.
+    pub async fn persist_plan_revision(
+        &self,
+        goal_id: &str,
+        proposal: &PlanProposal,
+        planner_profile_id: &str,
+        planner_invocation_id: &str,
+        base_head: &str,
+        goal_revision: i64,
+    ) -> Result<PlanRevision, CoreError> {
         let goal = self.repo.get_goal(goal_id).await?.ok_or_else(|| {
             CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
         })?;
@@ -462,32 +494,87 @@ impl GoalLoopService {
             self.repo.insert_planned_task(&pt).await?;
         }
 
+        Ok(plan)
+    }
+
+    /// Activate a Validated plan revision (step 6 of activation): supersede
+    /// old active plans, flip the revision to Active, emit `plan_activated`,
+    /// and mark pending user interventions as applied to this revision.
+    pub async fn activate_validated_plan(
+        &self,
+        goal_id: &str,
+        plan_revision_id: &str,
+    ) -> Result<(), CoreError> {
+        let plan = self
+            .repo
+            .get_plan_revision(plan_revision_id)
+            .await?
+            .ok_or_else(|| {
+                CoreError::new(
+                    ErrorCode::NotFound,
+                    "plan revision not found",
+                    ErrorSource::Harness,
+                )
+            })?;
+
+        let milestone_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM plan_milestones WHERE plan_revision_id = ?")
+                .bind(plan_revision_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        e.to_string(),
+                        ErrorSource::System,
+                    )
+                })?;
+        let task_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM planned_tasks WHERE plan_revision_id = ?")
+                .bind(plan_revision_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| {
+                    CoreError::new(
+                        ErrorCode::PersistenceError,
+                        e.to_string(),
+                        ErrorSource::System,
+                    )
+                })?;
+
         // 6. Activate the plan (supersede old active plans)
         self.repo
-            .supersede_active_plans(goal_id, &plan_revision_id)
+            .supersede_active_plans(goal_id, plan_revision_id)
             .await?;
         self.repo
             .update_plan_state(
-                &plan_revision_id,
+                plan_revision_id,
                 PlanState::Active,
-                Some(&validation.proposal_digest),
+                plan.validation_digest.as_deref(),
             )
             .await?;
 
         self.repo
             .append_plan_event(
-                &plan_revision_id,
+                plan_revision_id,
                 goal_id,
                 "plan_activated",
                 &serde_json::json!({
-                    "revision_number": revision_number,
-                    "proposal_digest": validation.proposal_digest,
-                    "milestone_count": proposal.milestones.len(),
-                    "task_count": proposal.tasks.len()
+                    "revision_number": plan.revision_number,
+                    "proposal_digest": plan.proposal_digest,
+                    "milestone_count": milestone_count,
+                    "task_count": task_count
                 })
                 .to_string(),
             )
             .await?;
+
+        // I8A: user interventions consumed by this planning round are now
+        // applied to the activated revision.
+        let _ = self
+            .repo
+            .mark_interventions_applied(goal_id, plan_revision_id)
+            .await;
 
         // F2: PlanRevision durable commit complete, before PlannedTask dispatch.
         // The plan and tasks are persisted; materialization has NOT started.
@@ -495,7 +582,7 @@ impl GoalLoopService {
             .hit()
             .await;
 
-        Ok(plan)
+        Ok(())
     }
 
     async fn next_plan_revision_number(&self, goal_id: &str) -> Result<i64, CoreError> {
@@ -884,6 +971,9 @@ impl GoalLoopService {
             created_at: Utc::now(),
             resolved_at: None,
             resolved_by: None,
+            response: None,
+            request_id: None,
+            source: "system".to_string(),
         };
 
         self.repo.create_approval(&approval).await?;
@@ -1094,6 +1184,23 @@ impl GoalLoopService {
             CoreError::new(ErrorCode::NotFound, "goal not found", ErrorSource::Harness)
         })?;
 
+        // ── I8A dispatch gate ───────────────────────────────────────
+        // A paused, waiting-for-approval, or terminal goal must not plan
+        // or dispatch. Interaction resolutions restart the loop via
+        // ensure_loop_run once the goal is Active again.
+        let gate_state = get_goal_state(&self.pool, goal_id).await?;
+        if gate_state == GoalState::Paused
+            || gate_state == GoalState::WaitingForApproval
+            || gate_state.is_terminal()
+        {
+            tracing::info!(
+                goal_id = %goal_id,
+                state = ?gate_state,
+                "goal loop gated — no planning or dispatch in this state"
+            );
+            return Ok(());
+        }
+
         // Check if we have an active plan
         let active_plan = self.repo.get_active_plan(goal_id).await?;
 
@@ -1141,10 +1248,6 @@ impl GoalLoopService {
                 }
             } else if let Some(ref planner) = self.goal_planner {
                 let ctx = self.build_planning_context(&goal).await?;
-                let proposal = planner.propose_plan(&ctx).await.map_err(|e| {
-                    tracing::error!(goal_id = %goal_id, error = %e, "planner failed");
-                    e
-                })?;
 
                 let planner_profile_id = self
                     .planner_profile
@@ -1152,6 +1255,51 @@ impl GoalLoopService {
                     .map(|p| p.id.as_str())
                     .unwrap_or("default");
                 let planner_invocation_id = format!("inv-{}", uuid::Uuid::new_v4());
+
+                // I8A interactive mode: the planner may ask for clarification,
+                // and a proposed plan needs user approval before activation.
+                if goal.approval_policy.require_initial_plan_approval {
+                    let outcome = planner.propose(&ctx).await.map_err(|e| {
+                        tracing::error!(goal_id = %goal_id, error = %e, "planner failed");
+                        e
+                    })?;
+                    match outcome {
+                        PlannerOutcome::ClarificationNeeded(questions) => {
+                            self.request_clarification(goal_id, &questions).await?;
+                            tracing::info!(
+                                goal_id = %goal_id,
+                                question_count = questions.len(),
+                                "clarification requested — waiting for user"
+                            );
+                            return Ok(());
+                        }
+                        PlannerOutcome::Plan(proposal) => {
+                            let plan = self
+                                .persist_plan_revision(
+                                    goal_id,
+                                    &proposal,
+                                    planner_profile_id,
+                                    &planner_invocation_id,
+                                    &goal.initial_base_head,
+                                    goal.revision,
+                                )
+                                .await?;
+                            self.request_plan_approval(goal_id, &plan, &proposal)
+                                .await?;
+                            tracing::info!(
+                                goal_id = %goal_id,
+                                plan_revision_id = %plan.plan_revision_id,
+                                "plan approval requested — waiting for user"
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+
+                let proposal = planner.propose_plan(&ctx).await.map_err(|e| {
+                    tracing::error!(goal_id = %goal_id, error = %e, "planner failed");
+                    e
+                })?;
 
                 let plan = self
                     .activate_plan(
@@ -1283,12 +1431,46 @@ impl GoalLoopService {
             .map(|o| format!("{}: {}", o.source_aggregate_type, o.claim))
             .collect();
 
+        // ── I8A: inject user input into planner context ─────────────
+        // Clarification answers (resolved provide_missing_information
+        // approvals) and pending user interventions are facts the planner
+        // must honor. User text is data — it is never executed.
+        let mut relevant_architecture_facts: Vec<String> = Vec::new();
+        let answered: Vec<(String, Option<String>)> = sqlx::query_as(
+            r#"SELECT requested_action_json, response_json FROM approval_requests
+               WHERE goal_id = ? AND approval_type = 'provide_missing_information'
+               AND state = 'approved' ORDER BY created_at ASC"#,
+        )
+        .bind(&goal.goal_id)
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        for (questions_json, response_json) in answered {
+            if let Some(resp) = response_json {
+                relevant_architecture_facts.push(format!(
+                    "user_clarification: questions={questions_json} answers={resp}"
+                ));
+            }
+        }
+        let interventions = self
+            .repo
+            .list_interventions(&goal.goal_id, Some("received"))
+            .await
+            .unwrap_or_default();
+        for iv in &interventions {
+            relevant_architecture_facts.push(format!(
+                "user_intervention ({}): {}",
+                iv.classification.as_str(),
+                iv.message
+            ));
+        }
+
         Ok(GoalPlanningContext {
             goal: goal.clone(),
             current_goal_revision: goal.revision,
             repository_head: goal.initial_base_head.clone(),
             repository_summary: format!("Repository: {} @ {}", goal.repository_id, goal.target_ref),
-            relevant_architecture_facts: vec![],
+            relevant_architecture_facts,
             existing_completed_tasks: completed_tasks,
             existing_observations,
             budget_remaining: serde_json::json!({
@@ -1307,6 +1489,23 @@ impl GoalLoopService {
         plan_revision_id: &str,
         pt: &PlannedTask,
     ) -> Result<(), CoreError> {
+        // ── I8A per-task dispatch gate ──────────────────────────────
+        // Re-check goal state before every materialization: a pause or
+        // interaction request may land between task selection and dispatch.
+        let gate_state = get_goal_state(&self.pool, goal_id).await?;
+        if gate_state == GoalState::Paused
+            || gate_state == GoalState::WaitingForApproval
+            || gate_state.is_terminal()
+        {
+            tracing::info!(
+                goal_id = %goal_id,
+                planned_task_id = %pt.planned_task_id,
+                state = ?gate_state,
+                "skipping task materialization — goal is gated"
+            );
+            return Ok(());
+        }
+
         // Check if already materialized
         if let Some(ref task_id) = pt.materialized_task_id {
             // Already dispatched through I4.5 — check status and import observations
@@ -3384,7 +3583,10 @@ fn is_evaluator_error_retryable(error: &CoreError) -> bool {
 }
 
 // Goal state lookup — reads from DB
-async fn get_goal_state(pool: &SqlitePool, goal_id: &str) -> Result<GoalState, CoreError> {
+pub(crate) async fn get_goal_state(
+    pool: &SqlitePool,
+    goal_id: &str,
+) -> Result<GoalState, CoreError> {
     let row: Option<(String,)> = sqlx::query_as("SELECT state FROM goals WHERE goal_id = ?")
         .bind(goal_id)
         .fetch_optional(pool)
