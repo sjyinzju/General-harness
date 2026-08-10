@@ -109,7 +109,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .await
         {
-            Ok(()) => return Ok(()),
+            Ok(_child) => return Ok(()),
             Err(e) => {
                 eprintln!("error: {e}");
                 return Err("supervisor start failed".into());
@@ -1214,7 +1214,7 @@ async fn dispatch_supervisor(
         )
         .await
         {
-            Ok(()) => true,
+            Ok(_child) => true,
             Err(e) => {
                 eprintln!("error: {e}");
                 false

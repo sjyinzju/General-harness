@@ -39,6 +39,11 @@ pub async fn cmd_supervisor_run(
 /// Start the supervisor as a background process.
 /// Spawns the same binary with `supervisor run` as a detached child.
 /// Forwards --repo, --worktree-root, --code-head for isolated multi-instance operation.
+///
+/// Returns the [`std::process::Child`] handle so callers can detect early
+/// exit (via `try_wait`) and read piped stderr for crash diagnostics.
+/// Callers that do not need the handle may drop it — dropping a `Child`
+/// does NOT kill the process.
 pub async fn cmd_supervisor_start(
     db_path: &str,
     state_directory_id: &str,
@@ -46,7 +51,7 @@ pub async fn cmd_supervisor_start(
     worktree_root: Option<&str>,
     code_head: Option<&str>,
     failpoint_enable: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<std::process::Child, Box<dyn std::error::Error>> {
     // Check if a supervisor is already running for this directory
     let db = Database::open(&std::path::PathBuf::from(db_path)).await?;
     let repo = SupervisorRepo::new(db.pool.clone());
@@ -86,6 +91,12 @@ pub async fn cmd_supervisor_start(
         cmd.env("HARNESS_FAILPOINT_ENABLE", "1");
     }
 
+    // Pipe stderr so the caller can read crash diagnostics if the child
+    // exits before becoming healthy. Null stdout — the supervisor's
+    // informational messages are not needed by the spawning parent.
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::piped());
+
     // On Windows, use CREATE_NEW_PROCESS_GROUP for detachment
     #[cfg(windows)]
     {
@@ -111,7 +122,7 @@ pub async fn cmd_supervisor_start(
     }
     println!("Use 'harness supervisor status' to check health");
 
-    Ok(())
+    Ok(child)
 }
 
 /// Show supervisor status — tries IPC first, falls back to direct DB read.
